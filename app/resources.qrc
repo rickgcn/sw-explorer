@@ -1,0 +1,12 @@
+<RCC>
+  <qresource prefix="/icons">
+    <file alias="open-folder.svg">resources/icons/open-folder.svg</file>
+    <file alias="open-file.svg">resources/icons/open-file.svg</file>
+    <file alias="scan.svg">resources/icons/scan.svg</file>
+    <file alias="up.svg">resources/icons/up.svg</file>
+    <file alias="extract-selected.svg">resources/icons/extract-selected.svg</file>
+    <file alias="extract-tree.svg">resources/icons/extract-tree.svg</file>
+    <file alias="stop.svg">resources/icons/stop.svg</file>
+    <file alias="refresh.svg">resources/icons/refresh.svg</file>
+  </qresource>
+</RCC>
