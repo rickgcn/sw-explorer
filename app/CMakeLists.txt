@@ -5,7 +5,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
-add_executable(sw-explorer
+set(APP_SOURCES
     main.cpp
     mainwindow.h
     mainwindow.cpp
@@ -15,8 +15,26 @@ add_executable(sw-explorer
 )
 
 if (WIN32)
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/version.rc.in
+        ${CMAKE_CURRENT_BINARY_DIR}/version.rc
+        @ONLY
+    )
+    list(APPEND APP_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/version.rc)
+endif()
+
+add_executable(sw-explorer
+    ${APP_SOURCES}
+)
+
+if (WIN32)
     set_target_properties(sw-explorer PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()
+
+target_compile_definitions(sw-explorer
+    PRIVATE
+        SW_EXPLORER_VERSION="${PROJECT_VERSION}"
+)
 
 target_link_libraries(sw-explorer
     PRIVATE

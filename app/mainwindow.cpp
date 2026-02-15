@@ -7,6 +7,7 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFileDialog>
@@ -46,10 +47,18 @@ QIcon toolbarIcon(QWidget *w, const QString &resourcePath, QStyle::StandardPixma
     return w->style()->standardIcon(fallback);
 }
 
+QString appDisplayName() {
+    const QString version = QCoreApplication::applicationVersion();
+    if (version.isEmpty()) {
+        return "sw-explorer";
+    }
+    return QString("sw-explorer %1").arg(version);
+}
+
 } // namespace
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
-    setWindowTitle("sw-explorer");
+    setWindowTitle(appDisplayName());
     resize(1200, 760);
     m_filterTimer = new QTimer(this);
     m_filterTimer->setSingleShot(true);
@@ -275,7 +284,11 @@ void MainWindow::openIdbFile() {
 
 void MainWindow::setDistDirectory(const QString &path) {
     m_distDirPath = path;
-    setWindowTitle(QString("sw-explorer - %1").arg(m_distDirPath));
+    if (m_distDirPath.isEmpty()) {
+        setWindowTitle(appDisplayName());
+    } else {
+        setWindowTitle(QString("%1 - %2").arg(appDisplayName(), m_distDirPath));
+    }
     refreshProducts();
 }
 
@@ -530,10 +543,11 @@ void MainWindow::requestStop() {
 }
 
 void MainWindow::showAboutDialog() {
+    QString about = appDisplayName();
+    about += "\nIRIX dist browser/extractor";
     QMessageBox::about(this,
                        "About",
-                       "sw-explorer\n"
-                       "IRIX dist browser/extractor");
+                       about);
 }
 
 void MainWindow::updatePathDisplay() {
