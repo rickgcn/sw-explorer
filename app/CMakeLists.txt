@@ -14,6 +14,10 @@ add_executable(sw-explorer
     resources.qrc
 )
 
+if (WIN32)
+    set_target_properties(sw-explorer PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
+
 target_link_libraries(sw-explorer
     PRIVATE
         Qt${QT_VERSION_MAJOR}::Widgets
