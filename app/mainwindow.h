@@ -45,8 +45,9 @@ private:
     void buildToolBar();
     void setDistDirectory(const QString &path);
     QVector<swcore::FileEntry> selectedEntries() const;
+    QString selectedRelativePathRoot() const;
     QString selectedRowPathsText() const;
-    void runExtraction(const QVector<swcore::FileEntry> &entries);
+    void runExtraction(const QVector<swcore::FileEntry> &entries, const QString &relativePathRoot);
     void updatePathDisplay();
     void refreshStatus();
 
@@ -70,6 +71,7 @@ private:
     QAction *m_extractAllAction = nullptr;
     QAction *m_stopAction = nullptr;
     QAction *m_refreshAction = nullptr;
+    QAction *m_preservePathsAction = nullptr;
     QAction *m_noDecompressAction = nullptr;
     QAction *m_keepZAction = nullptr;
     QAction *m_continueOnErrorAction = nullptr;

@@ -31,6 +31,9 @@ struct ParseResult {
 };
 
 struct ExtractOptions {
+    bool preservePaths = false;
+    bool keepRelativePaths = false;
+    QString relativePathRoot;
     bool noDecompress = false;
     bool keepZ = false;
     bool continueOnError = true;
@@ -49,4 +52,3 @@ struct ExtractResult {
 };
 
 } // namespace swcore
-

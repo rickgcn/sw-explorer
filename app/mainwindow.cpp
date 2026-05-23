@@ -55,6 +55,58 @@ QString appDisplayName() {
     return QString("sw-explorer %1").arg(version);
 }
 
+QString normalizedRelativePath(QString path) {
+    path.replace('\\', '/');
+    while (path.startsWith('/')) {
+        path.remove(0, 1);
+    }
+
+    QStringList out;
+    const QStringList segs = path.split('/', Qt::SkipEmptyParts);
+    for (const QString &seg : segs) {
+        if (seg == ".") {
+            continue;
+        }
+        if (seg == "..") {
+            if (!out.isEmpty()) {
+                out.removeLast();
+            }
+            continue;
+        }
+        out.push_back(seg);
+    }
+    return out.join('/');
+}
+
+QString parentPathOf(const QString &path) {
+    const QString normalized = normalizedRelativePath(path);
+    const int slash = normalized.lastIndexOf('/');
+    if (slash < 0) {
+        return {};
+    }
+    return normalized.left(slash);
+}
+
+QString commonPathPrefix(const QStringList &paths) {
+    if (paths.isEmpty()) {
+        return {};
+    }
+
+    QStringList prefix = normalizedRelativePath(paths.first()).split('/', Qt::SkipEmptyParts);
+    for (int i = 1; i < paths.size(); ++i) {
+        const QStringList parts = normalizedRelativePath(paths.at(i)).split('/', Qt::SkipEmptyParts);
+        int common = 0;
+        while (common < prefix.size() && common < parts.size() && prefix.at(common) == parts.at(common)) {
+            ++common;
+        }
+        prefix = prefix.mid(0, common);
+        if (prefix.isEmpty()) {
+            break;
+        }
+    }
+    return prefix.join('/');
+}
+
 } // namespace
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
@@ -193,6 +245,10 @@ void MainWindow::buildMenus() {
     m_refreshAction->setIcon(toolbarIcon(this, ":/icons/refresh.svg", QStyle::SP_BrowserReload));
     connect(m_refreshAction, &QAction::triggered, this, &MainWindow::refreshProducts);
 
+    m_preservePathsAction = new QAction("Preserve Full Paths", this);
+    m_preservePathsAction->setCheckable(true);
+    m_preservePathsAction->setStatusTip("Extract files under their original IRIX paths instead of the output directory root.");
+
     m_noDecompressAction = new QAction("No Decompress (.Z only)", this);
     m_noDecompressAction->setCheckable(true);
 
@@ -220,6 +276,8 @@ void MainWindow::buildMenus() {
     viewMenu->addAction(m_refreshAction);
 
     QMenu *toolsMenu = menuBar()->addMenu("Tools");
+    toolsMenu->addAction(m_preservePathsAction);
+    toolsMenu->addSeparator();
     toolsMenu->addAction(m_noDecompressAction);
     toolsMenu->addAction(m_keepZAction);
     toolsMenu->addAction(m_continueOnErrorAction);
@@ -382,6 +440,30 @@ QVector<swcore::FileEntry> MainWindow::selectedEntries() const {
     return m_tableModel->entriesForRows(rows);
 }
 
+QString MainWindow::selectedRelativePathRoot() const {
+    if (!m_tableView || !m_tableView->selectionModel()) {
+        return {};
+    }
+
+    const QModelIndexList rows = m_tableView->selectionModel()->selectedRows();
+    QStringList parentPaths;
+    parentPaths.reserve(rows.size());
+    for (const QModelIndex &idx : rows) {
+        if (!idx.isValid()) {
+            continue;
+        }
+        if (m_tableModel->rowKind(idx.row()) == FileTableModel::RowKind::Parent) {
+            continue;
+        }
+        const QString sourcePath = m_tableModel->rowSourcePath(idx.row());
+        if (sourcePath.isEmpty()) {
+            continue;
+        }
+        parentPaths.push_back(parentPathOf(sourcePath));
+    }
+    return commonPathPrefix(parentPaths);
+}
+
 QString MainWindow::selectedRowPathsText() const {
     if (!m_tableView || !m_tableView->selectionModel()) {
         return {};
@@ -446,14 +528,14 @@ void MainWindow::extractSelected() {
         QMessageBox::information(this, "Extract", "No file or directory selected.");
         return;
     }
-    runExtraction(entries);
+    runExtraction(entries, selectedRelativePathRoot());
 }
 
 void MainWindow::extractAll() {
-    runExtraction(m_tableModel->entriesInCurrentTree());
+    runExtraction(m_tableModel->entriesInCurrentTree(), m_tableModel->currentDirectory());
 }
 
-void MainWindow::runExtraction(const QVector<swcore::FileEntry> &entries) {
+void MainWindow::runExtraction(const QVector<swcore::FileEntry> &entries, const QString &relativePathRoot) {
     if (entries.isEmpty()) {
         QMessageBox::information(this, "Extract", "No entries available.");
         return;
@@ -471,6 +553,9 @@ void MainWindow::runExtraction(const QVector<swcore::FileEntry> &entries) {
     m_lastOutDirPath = outDir;
 
     swcore::ExtractOptions options;
+    options.preservePaths = m_preservePathsAction->isChecked();
+    options.keepRelativePaths = !options.preservePaths;
+    options.relativePathRoot = relativePathRoot;
     options.noDecompress = m_noDecompressAction->isChecked();
     options.keepZ = m_keepZAction->isChecked();
     options.continueOnError = m_continueOnErrorAction->isChecked();

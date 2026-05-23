@@ -6,6 +6,7 @@ It provides a Explorer-like workflow: menu bar, icon toolbar, directory-style fi
 ## Features
 
 - Parse IRIX `product.idb` files (Latin-1 safe parsing for offset consistency).
+- Resolve IRIX 6+ ABI subproducts such as `*.sw32` and `*.sw64`.
 - Open either:
   - a full dist directory, or
   - a single `.idb` file (auto-resolves product and dist path).
@@ -17,6 +18,7 @@ It provides a Explorer-like workflow: menu bar, icon toolbar, directory-style fi
   - supports name variants (`fname`, `./fname`, `/fname`).
 - Built-in `.Z` (Unix compress/LZW) decompression with ncompress-compatible code-width transitions.
 - Extraction controls:
+  - `Preserve Full Paths`
   - `No Decompress (.Z only)`
   - `Keep .Z files`
   - `Continue on error`
@@ -71,6 +73,8 @@ build/app/Release/sw-explorer.exe
 ## Notes on Extraction Behavior
 
 - For file entries, compressed payload is first materialized as `target.Z`.
+- By default, extraction keeps the selected/current subtree layout without forcing the full IRIX path prefix.
+- Enable `Preserve Full Paths` to always recreate full IRIX-relative paths such as `usr/lib64/...`.
 - If decompression is enabled and payload is a valid `.Z` stream, output file is written as decompressed content.
 - If `Keep .Z files` is unchecked, temporary `.Z` files are removed after successful extraction.
 - On systems where symlink creation is unavailable, link targets are saved as `*.link.txt` fallback files.

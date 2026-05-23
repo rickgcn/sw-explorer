@@ -227,6 +227,30 @@ QString sanitizeRelativePath(QString p) {
     return clean.join('/');
 }
 
+QString outputRelativePath(const FileEntry &entry, const ExtractOptions &options) {
+    const QString safeRel = sanitizeRelativePath(entry.fname);
+    if (options.preservePaths || safeRel.isEmpty()) {
+        return safeRel;
+    }
+
+    if (options.keepRelativePaths) {
+        const QString root = sanitizeRelativePath(options.relativePathRoot);
+        if (root.isEmpty()) {
+            return safeRel;
+        }
+        if (safeRel == root) {
+            return {};
+        }
+        if (safeRel.startsWith(root + "/")) {
+            return safeRel.mid(root.size() + 1);
+        }
+        return safeRel;
+    }
+
+    const QString fileName = QFileInfo(safeRel).fileName();
+    return sanitizeRelativePath(fileName);
+}
+
 bool ensureParentDir(const QString &path) {
     return QDir().mkpath(QFileInfo(path).path());
 }
@@ -544,7 +568,7 @@ bool extractOne(const QString &distDirPath,
                 const ExtractOptions &options,
                 std::map<QString, std::unique_ptr<SubRuntime>> *subStates,
                 QString *error) {
-    const QString safeRel = sanitizeRelativePath(entry.fname);
+    const QString safeRel = outputRelativePath(entry, options);
     const QString dstPath = safeRel.isEmpty() ? outDirPath : QDir(outDirPath).filePath(safeRel);
 
     if (entry.ftype == 'd') {

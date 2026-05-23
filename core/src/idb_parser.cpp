@@ -32,6 +32,26 @@ QString subproductBase(const QString &subgroup) {
     return parts.at(0) + "." + parts.at(1);
 }
 
+QString existingSubproductBase(const QString &token, const QString &distDirPath) {
+    const QStringList parts = token.split('.', Qt::SkipEmptyParts);
+    if (parts.size() < 2) {
+        return {};
+    }
+
+    for (int n = parts.size(); n >= 2; --n) {
+        const QString candidate = parts.mid(0, n).join('.');
+        if (QFileInfo::exists(QDir(distDirPath).filePath(candidate))) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
+struct SubgroupMatch {
+    int index = -1;
+    QString subproductBase;
+};
+
 QStringList splitMax(const QString &line, int maxParts) {
     QStringList out;
     out.reserve(maxParts);
@@ -70,27 +90,23 @@ bool looksLikeSubgroupToken(const QString &token) {
     return re.match(token).hasMatch();
 }
 
-int findSubgroupTokenIndex(const QStringList &tailTokens, const QString &distDirPath) {
-    // Prefer a token whose subproduct base exists as a file in dist dir.
+SubgroupMatch findSubgroupToken(const QStringList &tailTokens, const QString &distDirPath) {
+    // Prefer a token whose longest subproduct prefix exists as a file in dist dir.
     for (int i = 0; i < tailTokens.size(); ++i) {
         const QString tok = tailTokens.at(i);
-        const QString base = subproductBase(tok);
-        if (base.isEmpty()) {
-            continue;
-        }
-        const QString subPath = QDir(distDirPath).filePath(base);
-        if (QFileInfo::exists(subPath)) {
-            return i;
+        const QString base = existingSubproductBase(tok, distDirPath);
+        if (!base.isEmpty()) {
+            return {i, base};
         }
     }
 
     // Fallback for unusual dist layouts.
     for (int i = 0; i < tailTokens.size(); ++i) {
         if (looksLikeSubgroupToken(tailTokens.at(i))) {
-            return i;
+            return {i, subproductBase(tailTokens.at(i))};
         }
     }
-    return -1;
+    return {};
 }
 
 void parseAttrs(const QString &attrs, AttrInfo *info) {
@@ -218,15 +234,15 @@ ParseResult IdbParser::parse(const QString &distDirPath, const QString &product,
         entry.sourcePath = tokens.at(5);
 
         QStringList tailTokens = tokens.mid(6);
-        const int subgroupIdx = findSubgroupTokenIndex(tailTokens, distDirPath);
-        if (subgroupIdx < 0) {
+        const SubgroupMatch subgroup = findSubgroupToken(tailTokens, distDirPath);
+        if (subgroup.index < 0) {
             result.warnings.push_back(QString("Line %1 ignored: cannot locate subgroup token").arg(lineNo));
             continue;
         }
-        entry.subgroup = tailTokens.at(subgroupIdx);
-        tailTokens.removeAt(subgroupIdx);
+        entry.subgroup = tailTokens.at(subgroup.index);
+        tailTokens.removeAt(subgroup.index);
         entry.attrsRaw = tailTokens.join(' ');
-        entry.subproductBase = subproductBase(entry.subgroup);
+        entry.subproductBase = subgroup.subproductBase.isEmpty() ? subproductBase(entry.subgroup) : subgroup.subproductBase;
 
         if (entry.subproductBase.isEmpty()) {
             result.warnings.push_back(QString("Line %1 ignored: bad subgroup '%2'").arg(lineNo).arg(entry.subgroup));

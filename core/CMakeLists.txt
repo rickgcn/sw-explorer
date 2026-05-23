@@ -13,3 +13,16 @@ target_include_directories(swcore
 
 target_link_libraries(swcore PUBLIC Qt${QT_VERSION_MAJOR}::Core)
 
+if (BUILD_TESTING)
+    add_executable(swcore_tests
+        tests/swcore_tests.cpp
+    )
+
+    target_link_libraries(swcore_tests
+        PRIVATE
+            swcore
+            Qt${QT_VERSION_MAJOR}::Core
+    )
+
+    add_test(NAME swcore_tests COMMAND swcore_tests)
+endif()
