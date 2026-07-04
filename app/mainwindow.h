@@ -58,6 +58,7 @@ private:
 
     QComboBox *m_productCombo = nullptr;
     QLineEdit *m_maskEdit = nullptr;
+    QLineEdit *m_machEdit = nullptr;
     QLineEdit *m_searchEdit = nullptr;
     QLineEdit *m_pathEdit = nullptr;
     QTableView *m_tableView = nullptr;

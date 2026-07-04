@@ -154,17 +154,19 @@ void FileTableModel::setEntries(QVector<swcore::FileEntry> entries) {
         m_cachedPaths.push_back(std::move(c));
     }
     m_currentDir.clear();
-    rebuildSubgroupFiltered();
+    rebuildFiltered();
     rebuildRows();
     endResetModel();
 }
 
-void FileTableModel::setFilters(const QString &mask, const QString &filter) {
+void FileTableModel::setFilters(const QString &mask, const QString &filter, const QString &machTarget) {
     const QString normalized = mask.trimmed().isEmpty() ? "*" : mask.trimmed();
     const QString normalizedFilter = filter.trimmed();
+    const QString normalizedMach = machTarget.trimmed().isEmpty() ? "*" : machTarget.trimmed();
     const bool subgroupChanged = normalized != m_subgroupMask;
     const bool nameChanged = normalizedFilter != m_nameFilter;
-    if (!subgroupChanged && !nameChanged) {
+    const bool machChanged = normalizedMach != m_machFilter;
+    if (!subgroupChanged && !nameChanged && !machChanged) {
         return;
     }
 
@@ -172,22 +174,32 @@ void FileTableModel::setFilters(const QString &mask, const QString &filter) {
     if (subgroupChanged) {
         m_subgroupMask = normalized;
         m_subgroupRegex = QRegularExpression(QRegularExpression::wildcardToRegularExpression(m_subgroupMask));
-        rebuildSubgroupFiltered();
     }
     if (nameChanged) {
         m_nameFilter = normalizedFilter;
         m_nameFilterLower = normalizedFilter.toLower();
+    }
+    if (machChanged) {
+        m_machFilter = normalizedMach;
+        parseMachTargets(m_machFilter, &m_machIncludeTargets, &m_machExcludeTargets);
+    }
+    if (subgroupChanged || machChanged) {
+        rebuildFiltered();
     }
     rebuildRows();
     endResetModel();
 }
 
 void FileTableModel::setSubgroupMask(const QString &mask) {
-    setFilters(mask, m_nameFilter);
+    setFilters(mask, m_nameFilter, m_machFilter);
 }
 
 void FileTableModel::setNameFilter(const QString &filter) {
-    setFilters(m_subgroupMask, filter);
+    setFilters(m_subgroupMask, filter, m_machFilter);
+}
+
+void FileTableModel::setMachFilter(const QString &machTarget) {
+    setFilters(m_subgroupMask, m_nameFilter, machTarget);
 }
 
 void FileTableModel::setCurrentDirectory(const QString &relPath) {
@@ -264,7 +276,7 @@ QVector<swcore::FileEntry> FileTableModel::entriesForRows(const QModelIndexList 
             continue;
         }
 
-        for (int entryIndex : m_subgroupFilteredIndexes) {
+        for (int entryIndex : m_filteredIndexes) {
             const CachedEntryPath &path = m_cachedPaths.at(entryIndex);
             if (isUnderOrEqual(path.fullPath, row.relPath)) {
                 indexes.insert(entryIndex);
@@ -277,7 +289,7 @@ QVector<swcore::FileEntry> FileTableModel::entriesForRows(const QModelIndexList 
 
 QVector<swcore::FileEntry> FileTableModel::entriesInCurrentTree() const {
     QSet<int> indexes;
-    for (int entryIndex : m_subgroupFilteredIndexes) {
+    for (int entryIndex : m_filteredIndexes) {
         const CachedEntryPath &path = m_cachedPaths.at(entryIndex);
         if (m_currentDir.isEmpty() || isUnderOrEqual(path.fullPath, m_currentDir)) {
             indexes.insert(entryIndex);
@@ -287,7 +299,39 @@ QVector<swcore::FileEntry> FileTableModel::entriesInCurrentTree() const {
 }
 
 int FileTableModel::totalFilteredEntryCount() const {
-    return m_subgroupFilteredIndexes.size();
+    return m_filteredIndexes.size();
+}
+
+QStringList FileTableModel::machConflictSummaries(const QVector<swcore::FileEntry> &entries) {
+    QMap<QString, int> countByPath;
+    QMap<QString, QStringList> machValuesByPath;
+
+    for (const swcore::FileEntry &entry : entries) {
+        const QString mach = entry.machExpr.trimmed();
+        if (mach.isEmpty()) {
+            continue;
+        }
+
+        const QString path = normalizedPath(entry.fname);
+        if (path.isEmpty()) {
+            continue;
+        }
+
+        countByPath[path] += 1;
+        QStringList &machValues = machValuesByPath[path];
+        if (!machValues.contains(mach)) {
+            machValues.push_back(mach);
+        }
+    }
+
+    QStringList summaries;
+    for (auto it = countByPath.cbegin(); it != countByPath.cend(); ++it) {
+        if (it.value() < 2) {
+            continue;
+        }
+        summaries.push_back(QString("/%1: %2").arg(it.key(), machValuesByPath.value(it.key()).join(", ")));
+    }
+    return summaries;
 }
 
 QString FileTableModel::normalizedPath(const QString &path) {
@@ -312,6 +356,17 @@ QString FileTableModel::normalizedPath(const QString &path) {
         out.push_back(seg);
     }
     return out.join('/');
+}
+
+QString FileTableModel::compactWhitespace(const QString &text) {
+    QString compact;
+    compact.reserve(text.size());
+    for (const QChar ch : text) {
+        if (!ch.isSpace()) {
+            compact.push_back(ch);
+        }
+    }
+    return compact;
 }
 
 QString FileTableModel::parentOf(const QString &path) {
@@ -359,6 +414,66 @@ bool FileTableModel::isUnder(const QString &path, const QString &dir) {
     return path.startsWith(dir + "/");
 }
 
+FileTableModel::MachTarget FileTableModel::parseMachTarget(const QString &text) {
+    MachTarget target;
+    target.text = text;
+    target.compactText = compactWhitespace(text);
+    target.hasWildcard = text.contains('*') || text.contains('?');
+
+    const QStringList termTexts = text.split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
+    target.terms.reserve(termTexts.size());
+    for (const QString &termText : termTexts) {
+        MachTerm term;
+        term.text = termText;
+        term.compactText = compactWhitespace(termText);
+        term.hasWildcard = termText.contains('*') || termText.contains('?');
+        term.regex = QRegularExpression(QRegularExpression::wildcardToRegularExpression(termText));
+        target.terms.push_back(std::move(term));
+    }
+    return target;
+}
+
+void FileTableModel::parseMachTargets(const QString &filter,
+                                      QVector<MachTarget> *includeTargets,
+                                      QVector<MachTarget> *excludeTargets) {
+    if (includeTargets) {
+        includeTargets->clear();
+    }
+    if (excludeTargets) {
+        excludeTargets->clear();
+    }
+
+    const QString normalized = filter.trimmed();
+    if (normalized.isEmpty() || normalized == "*") {
+        return;
+    }
+
+    const QStringList parts = normalized.split(',');
+    for (const QString &part : parts) {
+        QString text = part.trimmed();
+        if (text.isEmpty()) {
+            continue;
+        }
+
+        const bool excluded = text.startsWith('!');
+        if (excluded) {
+            text.remove(0, 1);
+            text = text.trimmed();
+            if (text.isEmpty()) {
+                continue;
+            }
+        }
+
+        if (excluded) {
+            if (excludeTargets) {
+                excludeTargets->push_back(parseMachTarget(text));
+            }
+        } else if (includeTargets) {
+            includeTargets->push_back(parseMachTarget(text));
+        }
+    }
+}
+
 QVector<swcore::FileEntry> FileTableModel::entriesByIndexes(const QSet<int> &indexes) const {
     QList<int> sorted = indexes.values();
     std::sort(sorted.begin(), sorted.end());
@@ -371,15 +486,139 @@ QVector<swcore::FileEntry> FileTableModel::entriesByIndexes(const QSet<int> &ind
     return out;
 }
 
-void FileTableModel::rebuildSubgroupFiltered() {
-    m_subgroupFilteredIndexes.clear();
-    m_subgroupFilteredIndexes.reserve(m_entries.size());
+bool FileTableModel::isMachFilterActive() const {
+    return !m_machIncludeTargets.isEmpty() || !m_machExcludeTargets.isEmpty();
+}
+
+bool FileTableModel::machExprMatchesTargets(const QVector<MachTarget> &targets, const QString &machExpr) const {
+    const QString mach = machExpr.trimmed();
+    if (mach.isEmpty() || targets.isEmpty()) {
+        return false;
+    }
+
+    const QString compactMach = compactWhitespace(mach);
+    const QStringList machTokens = mach.split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
+
+    for (const MachTarget &target : targets) {
+        if (target.terms.isEmpty()) {
+            continue;
+        }
+
+        bool allTermsMatch = true;
+        for (const MachTerm &term : target.terms) {
+            if (!machTermMatches(term, mach, compactMach, machTokens)) {
+                allTermsMatch = false;
+                break;
+            }
+        }
+        if (allTermsMatch) {
+            return true;
+        }
+
+        if (!target.hasWildcard && !target.compactText.isEmpty() &&
+            compactMach.contains(target.compactText, Qt::CaseInsensitive)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool FileTableModel::machTermMatches(const MachTerm &term,
+                                     const QString &machExpr,
+                                     const QString &compactMachExpr,
+                                     const QStringList &machTokens) const {
+    if (term.text.isEmpty()) {
+        return true;
+    }
+
+    if (term.hasWildcard) {
+        if (!term.regex.isValid()) {
+            return machExpr.contains(term.text, Qt::CaseInsensitive);
+        }
+
+        if (term.regex.match(machExpr).hasMatch()) {
+            return true;
+        }
+        for (const QString &token : machTokens) {
+            if (term.regex.match(token).hasMatch()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (machExpr.contains(term.text, Qt::CaseInsensitive)) {
+        return true;
+    }
+
+    return !term.compactText.isEmpty() &&
+           compactMachExpr.contains(term.compactText, Qt::CaseInsensitive);
+}
+
+bool FileTableModel::matchesMachFilter(const swcore::FileEntry &entry) const {
+    if (!isMachFilterActive()) {
+        return true;
+    }
+
+    if (entry.machExpr.trimmed().isEmpty()) {
+        return true;
+    }
+
+    if (machExprMatchesTargets(m_machExcludeTargets, entry.machExpr)) {
+        return false;
+    }
+
+    if (m_machIncludeTargets.isEmpty()) {
+        return true;
+    }
+
+    return machExprMatchesTargets(m_machIncludeTargets, entry.machExpr);
+}
+
+void FileTableModel::rebuildFiltered() {
+    QVector<int> candidates;
+    candidates.reserve(m_entries.size());
     for (int i = 0; i < m_entries.size(); ++i) {
         const swcore::FileEntry &e = m_entries.at(i);
         if (m_subgroupRegex.isValid() && !m_subgroupRegex.match(e.subgroup).hasMatch()) {
             continue;
         }
-        m_subgroupFilteredIndexes.push_back(i);
+        if (!matchesMachFilter(e)) {
+            continue;
+        }
+        candidates.push_back(i);
+    }
+
+    if (!isMachFilterActive()) {
+        m_filteredIndexes = std::move(candidates);
+        return;
+    }
+
+    QSet<QString> pathsWithMachSpecificMatch;
+    for (int idx : candidates) {
+        const QString key = m_cachedPaths.at(idx).fullPath;
+        if (key.isEmpty()) {
+            continue;
+        }
+        if (!m_entries.at(idx).machExpr.trimmed().isEmpty()) {
+            pathsWithMachSpecificMatch.insert(key);
+        }
+    }
+
+    m_filteredIndexes.clear();
+    m_filteredIndexes.reserve(candidates.size());
+    for (int idx : candidates) {
+        const QString key = m_cachedPaths.at(idx).fullPath;
+        if (key.isEmpty()) {
+            m_filteredIndexes.push_back(idx);
+            continue;
+        }
+
+        const bool isCommon = m_entries.at(idx).machExpr.trimmed().isEmpty();
+        if (!isCommon || !pathsWithMachSpecificMatch.contains(key)) {
+            m_filteredIndexes.push_back(idx);
+        }
     }
 }
 
@@ -395,7 +634,7 @@ void FileTableModel::rebuildRows() {
 
     QSet<QString> dirsFromNameMatches;
     if (!m_nameFilterLower.isEmpty()) {
-        for (int idx : m_subgroupFilteredIndexes) {
+        for (int idx : m_filteredIndexes) {
             const CachedEntryPath &path = m_cachedPaths.at(idx);
             if (!path.baseNameLower.contains(m_nameFilterLower)) {
                 continue;
@@ -412,7 +651,7 @@ void FileTableModel::rebuildRows() {
     QVector<RowItem> fileRows;
     QSet<QString> knownDirs;
 
-    for (int idx : m_subgroupFilteredIndexes) {
+    for (int idx : m_filteredIndexes) {
         const CachedEntryPath &path = m_cachedPaths.at(idx);
         if (path.fullPath.isEmpty()) {
             continue;
@@ -427,7 +666,7 @@ void FileTableModel::rebuildRows() {
         }
     }
 
-    for (int idx : m_subgroupFilteredIndexes) {
+    for (int idx : m_filteredIndexes) {
         const swcore::FileEntry &entry = m_entries.at(idx);
         const CachedEntryPath &path = m_cachedPaths.at(idx);
         const QString &fullPath = path.fullPath;

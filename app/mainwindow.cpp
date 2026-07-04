@@ -107,6 +107,21 @@ QString commonPathPrefix(const QStringList &paths) {
     return prefix.join('/');
 }
 
+bool machFilterInputActive(const QString &filter) {
+    const QString normalized = filter.trimmed();
+    if (normalized.isEmpty() || normalized == "*") {
+        return false;
+    }
+
+    const QStringList parts = normalized.split(',');
+    for (const QString &part : parts) {
+        if (!part.trimmed().isEmpty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
@@ -158,6 +173,9 @@ void MainWindow::buildUi() {
     m_productCombo->setMinimumWidth(180);
     m_maskEdit = new QLineEdit("*", this);
     m_maskEdit->setMinimumWidth(160);
+    m_machEdit = new QLineEdit("*", this);
+    m_machEdit->setMinimumWidth(140);
+    m_machEdit->setPlaceholderText("Mach target...");
     m_searchEdit = new QLineEdit(this);
     m_searchEdit->setMinimumWidth(180);
     m_searchEdit->setPlaceholderText("Name contains...");
@@ -200,6 +218,7 @@ void MainWindow::buildUi() {
 
     connect(m_productCombo, &QComboBox::currentTextChanged, this, &MainWindow::scanCurrentProduct);
     connect(m_maskEdit, &QLineEdit::textChanged, this, [this]() { m_filterTimer->start(); });
+    connect(m_machEdit, &QLineEdit::textChanged, this, [this]() { m_filterTimer->start(); });
     connect(m_searchEdit, &QLineEdit::textChanged, this, [this]() { m_filterTimer->start(); });
     connect(m_tableView->selectionModel(), &QItemSelectionModel::selectionChanged, this, &MainWindow::refreshStatus);
     connect(m_tableView, &QTableView::doubleClicked, this, &MainWindow::activateRow);
@@ -305,6 +324,8 @@ void MainWindow::buildToolBar() {
     tb->addWidget(m_productCombo);
     tb->addWidget(new QLabel("Mask:", tb));
     tb->addWidget(m_maskEdit);
+    tb->addWidget(new QLabel("Mach:", tb));
+    tb->addWidget(m_machEdit);
     tb->addWidget(new QLabel("Filter:", tb));
     tb->addWidget(m_searchEdit);
 }
@@ -404,7 +425,7 @@ void MainWindow::scanCurrentProduct() {
 }
 
 void MainWindow::updateFilters() {
-    m_tableModel->setFilters(m_maskEdit->text(), m_searchEdit->text());
+    m_tableModel->setFilters(m_maskEdit->text(), m_searchEdit->text(), m_machEdit->text());
     updatePathDisplay();
     refreshStatus();
 }
@@ -543,6 +564,23 @@ void MainWindow::runExtraction(const QVector<swcore::FileEntry> &entries, const 
     if (m_distDirPath.isEmpty()) {
         QMessageBox::warning(this, "Extract", "Please open a dist directory first.");
         return;
+    }
+
+    if (m_machEdit && machFilterInputActive(m_machEdit->text())) {
+        const QStringList conflicts = FileTableModel::machConflictSummaries(entries);
+        if (!conflicts.isEmpty()) {
+            QString message = "Multiple Mach-specific entries would extract to the same path.\n"
+                              "Narrow the Mach filter or select one specific entry before extracting.\n\n";
+            const int shown = std::min(8, int(conflicts.size()));
+            for (int i = 0; i < shown; ++i) {
+                message += conflicts.at(i) + "\n";
+            }
+            if (conflicts.size() > shown) {
+                message += QString("...and %1 more conflict(s).").arg(conflicts.size() - shown);
+            }
+            QMessageBox::warning(this, "Mach conflict", message);
+            return;
+        }
     }
 
     const QString start = m_lastOutDirPath.isEmpty() ? m_distDirPath : m_lastOutDirPath;

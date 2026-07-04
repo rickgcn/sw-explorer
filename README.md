@@ -11,7 +11,7 @@ It provides a Explorer-like workflow: menu bar, icon toolbar, directory-style fi
   - a full dist directory, or
   - a single `.idb` file (auto-resolves product and dist path).
 - File-manager style browsing (directory tree view behavior, not flat listing).
-- Wildcard subgroup mask filtering and filename contains filtering.
+- Wildcard subgroup mask filtering, Mach target filtering, and filename contains filtering.
 - Symbolic link awareness in browser and extraction.
 - Robust payload re-sync when offsets drift:
   - scans around expected offsets,
@@ -64,6 +64,7 @@ build/app/Release/sw-explorer.exe
 3. Choose a **Product** in toolbar.
 4. Use:
    - **Mask** for subgroup wildcard filtering (default `*`),
+   - **Mach** for one or more comma-separated Mach text/wildcard targets (default `*`; target matches keep common no-Mach files),
    - **Filter** for filename contains filtering.
 5. Browse folders in the table (double-click folder or symlinked folder).
 6. Extract using:
@@ -73,6 +74,10 @@ build/app/Release/sw-explorer.exe
 ## Notes on Extraction Behavior
 
 - For file entries, compressed payload is first materialized as `target.Z`.
+- When **Mach** is set to one or more targets, entries without `mach(...)` are treated as common files and kept as fallbacks. If the same package path has both a common entry and matching Mach-specific entries, only the matching Mach-specific entries are used.
+- Mach targets are matched as condition terms, so `CPUBOARD=IP12 GFXBOARD=LIGHT` matches a space-separated `mach(...)` expression without requiring exact spacing. Plain text matching also ignores whitespace, so compact input such as `CPUBOARD=IP12GFXBOARD=LIGHT` works.
+- Prefix a Mach target with `!` to exclude it, such as `CPUBOARD=IP12,!GFXBOARD=ECLIPSE`. If only excluded targets are provided, all non-excluded Mach entries are kept.
+- If multiple matching Mach-specific entries would extract to the same path, extraction is canceled before choosing an output directory so the Mach filter can be narrowed.
 - By default, extraction keeps the selected/current subtree layout without forcing the full IRIX path prefix.
 - Enable `Preserve Full Paths` to always recreate full IRIX-relative paths such as `usr/lib64/...`.
 - If decompression is enabled and payload is a valid `.Z` stream, output file is written as decompressed content.

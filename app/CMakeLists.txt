@@ -43,3 +43,21 @@ target_link_libraries(sw-explorer
         Qt${QT_VERSION_MAJOR}::Concurrent
         swcore
 )
+
+if (BUILD_TESTING)
+    add_executable(file_table_model_tests
+        tests/file_table_model_tests.cpp
+        file_table_model.h
+        file_table_model.cpp
+    )
+
+    target_link_libraries(file_table_model_tests
+        PRIVATE
+            Qt${QT_VERSION_MAJOR}::Widgets
+            Qt${QT_VERSION_MAJOR}::Core
+            swcore
+    )
+
+    add_test(NAME file_table_model_tests COMMAND file_table_model_tests)
+    set_tests_properties(file_table_model_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+endif()
