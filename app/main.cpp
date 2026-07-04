@@ -5,7 +5,7 @@
 #include <QStyleFactory>
 
 #ifndef SW_EXPLORER_VERSION
-#define SW_EXPLORER_VERSION "0.2.0"
+#define SW_EXPLORER_VERSION "0.2.1"
 #endif
 
 int main(int argc, char *argv[]) {
