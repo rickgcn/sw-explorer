@@ -1,11 +1,83 @@
 //! Deterministic end-to-end tests against a tiny synthetic distribution
 //! built in a temporary directory: descriptor + IDB + one image archive.
 use std::path::PathBuf;
+use sw_core::descriptor::model::{SubsystemPresence, Version};
 use sw_core::distribution::Distribution;
 use sw_core::extract::{self, DecodeMode, ExtractOptions, PathMode};
 use sw_core::image::PayloadResolution;
 use sw_core::mach::eval::HardwareProfile;
 use sw_core::path::IrixPath;
+
+/// Builds a minimal but complete level-9 descriptor for a product with
+/// one `sw` image and one `unix` subsystem, plus — with `ghost` — a
+/// second subsystem that no IDB entry references.
+fn descriptor_bytes(product: &str, ghost: bool) -> Vec<u8> {
+    fn lp16(bytes: &mut Vec<u8>, s: &str) {
+        bytes.extend_from_slice(&(s.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(s.as_bytes());
+    }
+    fn range(bytes: &mut Vec<u8>, target: (&str, &str, &str), low: u32, high: u32) {
+        lp16(bytes, target.0);
+        lp16(bytes, target.1);
+        lp16(bytes, target.2);
+        bytes.extend_from_slice(&low.to_be_bytes());
+        bytes.extend_from_slice(&high.to_be_bytes());
+    }
+
+    let mut bytes = b"pd001V999P00\0".to_vec();
+    for word in [0x07c4u16, 0x0001, 0x07c3, 9] {
+        bytes.extend_from_slice(&word.to_be_bytes());
+    }
+    lp16(&mut bytes, product);
+    lp16(&mut bytes, "Synthetic Test Product");
+    bytes.extend_from_slice(&0x0850u16.to_be_bytes()); // product flags
+    bytes.extend_from_slice(&0x0102_0304u32.to_be_bytes()); // stamp
+    bytes.extend_from_slice(&0u32.to_be_bytes()); // reserved
+    bytes.extend_from_slice(&1u16.to_be_bytes()); // metadata count
+    lp16(&mut bytes, "P16909060_42"); // unknown metadata, kept raw
+    bytes.extend_from_slice(&1u16.to_be_bytes()); // image count
+
+    bytes.extend_from_slice(&0x0858u16.to_be_bytes()); // image flags
+    lp16(&mut bytes, "sw");
+    lp16(&mut bytes, "System Software");
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // unknown a
+    bytes.extend_from_slice(&9999u16.to_be_bytes()); // order candidate
+    bytes.extend_from_slice(&0x0102_0305u32.to_be_bytes()); // version
+    bytes.extend_from_slice(&0u32.to_be_bytes()); // reserved
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // metadata count
+    bytes.extend_from_slice(&if ghost { 2u16 } else { 1u16 }.to_be_bytes());
+
+    // `unix`, with one range in slot 2, one prerequisite clause in
+    // slot 3 and one string in slot 7.
+    bytes.extend_from_slice(&0x0852u16.to_be_bytes());
+    lp16(&mut bytes, "unix");
+    lp16(&mut bytes, "UNIX Kernel");
+    lp16(&mut bytes, "EOE");
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // slot 0
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // slot 1
+    bytes.extend_from_slice(&1u16.to_be_bytes()); // slot 2: one range
+    range(&mut bytes, ("patch*", "sw", "unix"), 0, 0x0102_0304);
+    bytes.extend_from_slice(&1u16.to_be_bytes()); // slot 3: one clause
+    bytes.extend_from_slice(&1u16.to_be_bytes()); // ... with one range
+    range(&mut bytes, ("other", "sw", "base"), 0, 0x7fff_ffff);
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // slot 4
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // slot 5
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // slot 6
+    bytes.extend_from_slice(&1u16.to_be_bytes()); // slot 7: one string
+    lp16(&mut bytes, "DMODE=64bit");
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // slot 8
+
+    if ghost {
+        bytes.extend_from_slice(&0x4050u16.to_be_bytes());
+        lp16(&mut bytes, "ghost");
+        lp16(&mut bytes, "Unshipped Support");
+        lp16(&mut bytes, "!noship && test.sw.ghost");
+        for _ in 0..9 {
+            bytes.extend_from_slice(&0u16.to_be_bytes());
+        }
+    }
+    bytes
+}
 
 /// Builds a synthetic `test` product.
 ///
@@ -52,7 +124,7 @@ fn build_dist() -> PathBuf {
     }
     std::fs::write(root.join("test.sw"), archive).unwrap();
 
-    std::fs::write(root.join("test"), b"pd001V999P00\0").unwrap();
+    std::fs::write(root.join("test"), descriptor_bytes("test", true)).unwrap();
 
     // Assembled as bytes because the IDB is Latin-1: the café.txt line
     // contains a raw 0xE9 byte.
@@ -97,6 +169,64 @@ fn parses_old_and_new_field_orders() {
         .expect("old-order entry");
     assert_eq!(old.subsystem.to_string(), "test.sw.unix");
     assert_eq!(old.size(), Some(4));
+}
+
+#[test]
+fn descriptor_is_the_hierarchy_authority() {
+    let (_root, dist) = open();
+    let product = dist.product("test").unwrap();
+    let descriptor = product.descriptor.as_ref().expect("descriptor");
+    assert_eq!(descriptor.layout_level, 9);
+    assert_eq!(descriptor.name, "test");
+    assert_eq!(descriptor.stamp, 0x0102_0304);
+    assert_eq!(product.title.as_deref(), Some("Synthetic Test Product"));
+    // Unknown metadata is preserved raw, not interpreted.
+    assert_eq!(descriptor.metadata.len(), 1);
+    assert!(descriptor.metadata[0].mach().is_none());
+
+    let image = product
+        .images
+        .iter()
+        .find(|i| i.name.image() == "sw")
+        .expect("image sw");
+    assert_eq!(image.title.as_deref(), Some("System Software"));
+    assert_eq!(image.version, Some(Version(0x0102_0305)));
+
+    let unix = image
+        .subsystems
+        .iter()
+        .find(|s| s.name.subsystem() == "unix")
+        .expect("subsystem unix");
+    assert_eq!(
+        unix.presence,
+        SubsystemPresence {
+            descriptor: true,
+            idb: true
+        }
+    );
+    assert_eq!(unix.title.as_deref(), Some("UNIX Kernel"));
+    assert_eq!(unix.mapping.as_deref(), Some("EOE"));
+    let rules = unix.rules.as_ref().expect("descriptor-decoded rules");
+    assert_eq!(rules.prerequisites.len(), 1);
+    assert_eq!(rules.prerequisites[0].all_of[0].target(), "other.sw.base");
+    assert!(rules.replaces.is_none());
+    assert!(!unix.entry_ids.is_empty());
+
+    // Declared in the descriptor but absent from the IDB: legal, kept,
+    // and distinguishable from a shipped subsystem.
+    let ghost = image
+        .subsystems
+        .iter()
+        .find(|s| s.name.subsystem() == "ghost")
+        .expect("subsystem ghost");
+    assert_eq!(
+        ghost.presence,
+        SubsystemPresence {
+            descriptor: true,
+            idb: false
+        }
+    );
+    assert!(ghost.entry_ids.is_empty());
 }
 
 #[test]
@@ -228,7 +358,7 @@ fn regular_entry_without_payload_is_a_failure() {
     let root = std::env::temp_dir().join(format!("sw-core-nopayload-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("t"), b"pd001V999P00\0").unwrap();
+    std::fs::write(root.join("t"), descriptor_bytes("t", false)).unwrap();
     // No cmpsize at all: no payload record exists for this file.
     std::fs::write(
         root.join("t.idb"),

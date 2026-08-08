@@ -207,3 +207,51 @@ fn no_error_diagnostics_on_real_media() {
     }
     assert!(errors.is_empty(), "{} error diagnostics", errors.len());
 }
+
+/// The descriptor is the hierarchy authority: every product on real
+/// media must parse byte-exactly, and its declared tree must reconcile
+/// with the IDB. The single known corpus anomaly is IRIX 6.3 declaring
+/// `eoe.sw.cdsio` ("Multiport Serial Board Support") in the descriptor
+/// without shipping any of its entries in the IDB; anything else is a
+/// regression.
+#[test]
+fn descriptors_parse_and_reconcile_with_idb() {
+    let Some(path) = dist_path() else {
+        eprintln!("SW_EXPLORER_TEST_DIST not set; skipping");
+        return;
+    };
+    let dist = Distribution::open(&path).expect("open distribution");
+    assert!(!dist.products().is_empty());
+
+    let mut descriptor_only = Vec::new();
+    let mut idb_only = Vec::new();
+    let mut subsystems = 0usize;
+    for product in dist.products() {
+        let descriptor = product
+            .descriptor
+            .as_ref()
+            .unwrap_or_else(|| panic!("{}: descriptor did not parse", product.name));
+        assert_eq!(descriptor.name, product.name.as_str());
+        assert_eq!(descriptor.images.len(), product.images.len());
+        for image in &product.images {
+            for subsystem in &image.subsystems {
+                subsystems += 1;
+                match (subsystem.presence.descriptor, subsystem.presence.idb) {
+                    (true, false) => descriptor_only.push(subsystem.name.to_string()),
+                    (false, true) => idb_only.push(subsystem.name.to_string()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(subsystems > 0);
+    eprintln!(
+        "{subsystems} subsystems reconciled; descriptor-only: {descriptor_only:?}, \
+         idb-only: {idb_only:?}"
+    );
+    assert!(
+        descriptor_only.is_empty() || descriptor_only == ["eoe.sw.cdsio".to_string()],
+        "unexpected descriptor-only subsystems: {descriptor_only:?}"
+    );
+    assert!(idb_only.is_empty(), "IDB-only subsystems: {idb_only:?}");
+}
