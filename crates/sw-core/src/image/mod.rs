@@ -7,6 +7,7 @@
 //! logical model (product / image / subsystem / entry) does not depend on
 //! it.
 pub(crate) mod layout;
+pub mod reader;
 pub(crate) mod resync;
 
 use crate::compress;
