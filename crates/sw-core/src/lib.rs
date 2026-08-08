@@ -1,6 +1,9 @@
 pub mod compress;
+pub mod descriptor;
 pub mod diagnostic;
 pub mod error;
+pub mod idb;
+pub mod image;
 pub mod mach;
 pub mod names;
 pub mod path;
