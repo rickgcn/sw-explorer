@@ -38,8 +38,9 @@ pub struct Image {
     pub version: Option<Version>,
     /// Installation order hint.
     pub order: Option<i32>,
-    /// Hardware applicability expressions (OR-ed).
-    pub mach: Vec<HardwareExpr>,
+    /// Hardware applicability expressions (OR-ed) from the descriptor's
+    /// `mach` metadata blobs; `None` when there is no parsed descriptor.
+    pub mach: Option<Vec<HardwareExpr>>,
     /// The physical archive file.
     pub archive: ImageArchive,
     /// Subsystems grouped in this image.

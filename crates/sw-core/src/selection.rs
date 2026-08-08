@@ -7,9 +7,12 @@
 //! Product MACH && Image MACH && Subsystem MACH && Entry MACH
 //! ```
 //!
-//! (multiple expressions on the same level are OR-ed). Within one
-//! subsystem, several entries may share a path: a matching mach-specific
-//! entry wins over the mach-less fallback.
+//! (multiple expressions on the same level are OR-ed). The descriptor is
+//! the source of product- and image-level expressions; a level whose
+//! expressions are not decoded (`None`) is *unknown*, not "no
+//! restriction", and is therefore not used to exclude anything. Within
+//! one subsystem, several entries may share a path: a matching
+//! mach-specific entry wins over the mach-less fallback.
 //!
 //! Ambiguities are reported through [`SelectionConflict`] *and* the
 //! candidates stay in `selected`, so nothing silently disappears; it is
@@ -45,22 +48,34 @@ pub struct EntrySelection<'a> {
 /// Selects the applicable entries of one product for a target.
 pub fn select_product<'a>(product: &'a Product, profile: &HardwareProfile) -> EntrySelection<'a> {
     let mut selection = EntrySelection::default();
-    if !matches_any(&product.mach, profile) {
+    if !mach_matches(&product.mach, profile) {
         return selection;
     }
 
     for image in &product.images {
-        if !matches_any(&image.mach, profile) {
+        if !mach_matches(&image.mach, profile) {
             continue;
         }
         for subsystem in &image.subsystems {
-            if !matches_any(&subsystem.mach, profile) {
+            if !mach_matches(&subsystem.mach, profile) {
                 continue;
             }
             select_subsystem_entries(product, &subsystem.entry_ids, profile, &mut selection);
         }
     }
     selection
+}
+
+/// Whether a hierarchy level's hardware expressions match the target.
+///
+/// `None` means the expressions are not decoded (unknown), which never
+/// excludes anything; `Some` applies the OR-ed expressions, with an
+/// empty list matching everything.
+fn mach_matches(mach: &Option<Vec<crate::mach::HardwareExpr>>, profile: &HardwareProfile) -> bool {
+    match mach {
+        Some(expressions) => matches_any(expressions, profile),
+        None => true,
+    }
 }
 
 fn select_subsystem_entries<'a>(

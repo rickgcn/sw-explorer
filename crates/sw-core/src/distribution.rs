@@ -5,11 +5,14 @@
 //! `eoe.sw32`, ...). It may also carry the miniroot support files `sa`
 //! and `mr`.
 //!
-//! The logical tree (product → image → subsystem → entry) is built from
-//! the IDB alone, because SGI names are self-describing
-//! (`eoe.sw.unix` lives in image `eoe.sw`); the binary descriptor enriches
-//! it with titles, versions, flags and rules once its grammar is decoded.
-use crate::descriptor::model::{ProductDescriptor, Subsystem};
+//! The logical tree (product → image → subsystem) is built from the
+//! binary descriptor, which is the hierarchy authority; IDB entries are
+//! then attached to the subsystems they name. A product whose descriptor
+//! is missing or unreadable falls back to a tree derived from the IDB
+//! alone, with every subsystem marked accordingly.
+use crate::descriptor::model::{
+    DescriptorMetadata, ProductDescriptor, Subsystem, SubsystemPresence,
+};
 use crate::descriptor::parser as descriptor_parser;
 use crate::diagnostic::Diagnostic;
 use crate::error::{Error, Result};
@@ -162,21 +165,19 @@ pub struct Product {
     pub name: ProductName,
     /// Path of the descriptor file (e.g. `dist/eoe`); may not exist.
     pub descriptor_file: PathBuf,
-    /// The parsed descriptor, if the file exists and its header is valid.
-    ///
-    /// Only the header is decoded so far; once the binary body grammar is
-    /// reverse engineered, this is where titles, versions, flags and rules
-    /// will surface.
+    /// The parsed descriptor, if the file exists and parses exactly.
     pub descriptor: Option<ProductDescriptor>,
     /// Path of the IDB file (e.g. `dist/eoe.idb`).
     pub idb_file: PathBuf,
     /// Product title from the descriptor.
     pub title: Option<String>,
-    /// Hardware applicability expressions (OR-ed).
-    pub mach: Vec<HardwareExpr>,
+    /// Hardware applicability expressions (OR-ed) from the descriptor's
+    /// `mach` metadata blobs; `None` when there is no parsed descriptor.
+    pub mach: Option<Vec<HardwareExpr>>,
     /// Cut points recorded in the descriptor.
     pub cutpoints: Vec<IrixPath>,
-    /// Images, in first-appearance order in the IDB.
+    /// Images, in descriptor order (or first-appearance order in the IDB
+    /// when the product has no parsed descriptor).
     pub images: Vec<Image>,
     /// All entries, in IDB order.
     pub entries: Vec<Entry>,
@@ -231,16 +232,51 @@ fn build_product(root: &Path, idb_file: &Path) -> Result<Product> {
     let idb_bytes = std::fs::read(idb_file).map_err(|e| Error::io(idb_file, e))?;
     let mut entries = idb_parser::parse(&idb_bytes, idb_file, &mut diagnostics)?;
 
-    let mut images = build_tree(root, &entries, &mut diagnostics);
+    if let Some(descriptor) = &descriptor
+        && descriptor.name != name.as_str()
+    {
+        diagnostics.push(Diagnostic::warning(
+            format!(
+                "descriptor product name {:?} does not match file name {:?}",
+                descriptor.name,
+                name.as_str()
+            ),
+            Some(descriptor_file.display().to_string()),
+        ));
+    }
+
+    let mut images = match &descriptor {
+        Some(descriptor) => tree_from_descriptor(root, &name, descriptor, &mut diagnostics),
+        None => Vec::new(),
+    };
+    attach_entries(
+        root,
+        &mut images,
+        &entries,
+        descriptor.is_some(),
+        &mut diagnostics,
+    );
     compute_layouts(&mut images, &mut entries);
+
+    let (title, mach) = match &descriptor {
+        Some(descriptor) => (
+            (!descriptor.description.is_empty()).then(|| descriptor.description.clone()),
+            Some(metadata_mach(
+                &descriptor.metadata,
+                &descriptor_file.display().to_string(),
+                &mut diagnostics,
+            )),
+        ),
+        None => (None, None),
+    };
 
     Ok(Product {
         name,
         descriptor_file,
         descriptor,
         idb_file: idb_file.to_path_buf(),
-        title: None,
-        mach: Vec::new(),
+        title,
+        mach,
         cutpoints: Vec::new(),
         images,
         entries,
@@ -248,49 +284,119 @@ fn build_product(root: &Path, idb_file: &Path) -> Result<Product> {
     })
 }
 
-/// Assembles the image/subsystem tree from entry subsystem names.
-fn build_tree(root: &Path, entries: &[Entry], diagnostics: &mut Vec<Diagnostic>) -> Vec<Image> {
-    let mut images: Vec<Image> = Vec::new();
+/// Builds the image/subsystem tree from the descriptor, the hierarchy
+/// authority. Entries are attached later by [`attach_entries`].
+fn tree_from_descriptor(
+    root: &Path,
+    product: &ProductName,
+    descriptor: &ProductDescriptor,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<Image> {
+    let mut images = Vec::new();
+    for image_record in &descriptor.images {
+        let image_name = match ImageName::from_parts(product.clone(), image_record.name.clone()) {
+            Ok(name) => name,
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(
+                    format!("skipping descriptor image record: {error}"),
+                    None,
+                ));
+                continue;
+            }
+        };
+        let mut subsystems = Vec::new();
+        for subsystem_record in &image_record.subsystems {
+            let qualified = format!("{product}.{}.{}", image_record.name, subsystem_record.name);
+            let name = match crate::names::SubsystemName::parse(&qualified) {
+                Ok(name) => name,
+                Err(error) => {
+                    diagnostics.push(Diagnostic::error(
+                        format!("skipping descriptor subsystem record: {error}"),
+                        None,
+                    ));
+                    continue;
+                }
+            };
+            subsystems.push(Subsystem {
+                name,
+                title: (!subsystem_record.description.is_empty())
+                    .then(|| subsystem_record.description.clone()),
+                mapping: (!subsystem_record.mapping.is_empty())
+                    .then(|| subsystem_record.mapping.clone()),
+                presence: SubsystemPresence {
+                    descriptor: true,
+                    idb: false,
+                },
+                // The subsystem record carries no metadata blobs, so
+                // subsystem-level mach is not decoded; the raw flag word
+                // and the non-prerequisite rule slots are not decoded
+                // either. `None` means unknown — it must not be read as
+                // "no restriction" or "no rules".
+                mach: None,
+                flags: None,
+                autominiroot: None,
+                rules: Some(crate::descriptor::model::SubsystemRules {
+                    prerequisites: subsystem_record.prerequisites.clone(),
+                    ..Default::default()
+                }),
+                entry_ids: Vec::new(),
+            });
+        }
+        images.push(Image {
+            title: (!image_record.description.is_empty()).then(|| image_record.description.clone()),
+            version: Some(image_record.version),
+            order: None,
+            mach: Some(metadata_mach(
+                &image_record.metadata,
+                &image_name.file_name(),
+                &mut *diagnostics,
+            )),
+            archive: open_image_archive(root, &image_name, diagnostics),
+            name: image_name,
+            subsystems,
+        });
+    }
+    images
+}
 
+/// Attaches every IDB entry to the subsystem it names.
+///
+/// An entry naming a subsystem the descriptor does not declare creates a
+/// synthetic IDB-only subsystem (with a warning); such entries must not
+/// be dropped. When there is no descriptor at all, the whole tree is
+/// derived from the IDB instead, as the only available authority.
+fn attach_entries(
+    root: &Path,
+    images: &mut Vec<Image>,
+    entries: &[Entry],
+    has_descriptor: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     for entry in entries {
         let image_name: ImageName = entry.subsystem.image_name();
         let image_index = match images.iter().position(|i| i.name == image_name) {
             Some(index) => index,
             None => {
-                let path = root.join(image_name.file_name());
-                let file_size = match std::fs::metadata(&path) {
-                    Ok(metadata) => match validate_archive_header(&path) {
-                        Ok(()) => metadata.len(),
-                        Err(error) => {
-                            diagnostics.push(Diagnostic::error(
-                                format!("ignoring image archive: {error}"),
-                                Some(path.display().to_string()),
-                            ));
-                            0
-                        }
-                    },
-                    Err(_) => {
-                        diagnostics.push(Diagnostic::warning(
-                            format!("image archive {} is missing", image_name.file_name()),
-                            Some(path.display().to_string()),
-                        ));
-                        0
-                    }
-                };
+                if has_descriptor {
+                    diagnostics.push(Diagnostic::warning(
+                        format!(
+                            "IDB entry {} names image {} which the descriptor does not declare",
+                            entry.path, entry.subsystem
+                        ),
+                        Some(format!(
+                            "{}:{}",
+                            entry.origin.idb_path.display(),
+                            entry.origin.line_number
+                        )),
+                    ));
+                }
                 images.push(Image {
+                    archive: open_image_archive(root, &image_name, diagnostics),
                     name: image_name,
                     title: None,
                     version: None,
                     order: None,
-                    mach: Vec::new(),
-                    archive: ImageArchive {
-                        path,
-                        file_size,
-                        layout: ImageLayout {
-                            header_size: IMAGE_HEADER_SIZE,
-                            payloads: Vec::new(),
-                        },
-                    },
+                    mach: None,
                     subsystems: Vec::new(),
                 });
                 images.len() - 1
@@ -305,22 +411,102 @@ fn build_tree(root: &Path, entries: &[Entry], diagnostics: &mut Vec<Diagnostic>)
         {
             Some(index) => index,
             None => {
+                if has_descriptor {
+                    diagnostics.push(Diagnostic::warning(
+                        format!(
+                            "IDB entry {} names subsystem {} which the descriptor \
+                             does not declare",
+                            entry.path, entry.subsystem
+                        ),
+                        Some(format!(
+                            "{}:{}",
+                            entry.origin.idb_path.display(),
+                            entry.origin.line_number
+                        )),
+                    ));
+                }
                 image.subsystems.push(Subsystem {
                     name: entry.subsystem.clone(),
                     title: None,
-                    mach: Vec::new(),
-                    flags: Default::default(),
-                    autominiroot: Vec::new(),
-                    rules: Default::default(),
+                    mapping: None,
+                    presence: SubsystemPresence {
+                        descriptor: false,
+                        idb: true,
+                    },
+                    // IDB-only subsystem: there is no descriptor record,
+                    // so nothing descriptor-derived is known.
+                    mach: None,
+                    flags: None,
+                    autominiroot: None,
+                    rules: None,
                     entry_ids: Vec::new(),
                 });
                 image.subsystems.len() - 1
             }
         };
-        image.subsystems[subsystem_index].entry_ids.push(entry.id);
+        let subsystem = &mut image.subsystems[subsystem_index];
+        subsystem.presence.idb = true;
+        subsystem.entry_ids.push(entry.id);
     }
+}
 
-    images
+/// Opens the archive file of one image, reporting problems as
+/// diagnostics and yielding an empty layout.
+fn open_image_archive(
+    root: &Path,
+    image_name: &ImageName,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> ImageArchive {
+    let path = root.join(image_name.file_name());
+    let file_size = match std::fs::metadata(&path) {
+        Ok(metadata) => match validate_archive_header(&path) {
+            Ok(()) => metadata.len(),
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(
+                    format!("ignoring image archive: {error}"),
+                    Some(path.display().to_string()),
+                ));
+                0
+            }
+        },
+        Err(_) => {
+            diagnostics.push(Diagnostic::warning(
+                format!("image archive {} is missing", image_name.file_name()),
+                Some(path.display().to_string()),
+            ));
+            0
+        }
+    };
+    ImageArchive {
+        path,
+        file_size,
+        layout: ImageLayout {
+            header_size: IMAGE_HEADER_SIZE,
+            payloads: Vec::new(),
+        },
+    }
+}
+
+/// Collects the hardware expressions of `mach` metadata blobs (`m`
+/// prefix), reporting unparsable expressions as warnings.
+fn metadata_mach(
+    metadata: &[DescriptorMetadata],
+    origin: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<HardwareExpr> {
+    let mut expressions = Vec::new();
+    for blob in metadata {
+        if let Some(result) = blob.mach() {
+            match result {
+                Ok(expression) => expressions.push(expression),
+                Err(error) => diagnostics.push(Diagnostic::warning(
+                    format!("unparsable descriptor mach blob: {error}"),
+                    Some(origin.to_string()),
+                )),
+            }
+        }
+    }
+    expressions
 }
 
 /// Computes the layout of every image and attaches payload locators to
