@@ -20,6 +20,12 @@ private slots:
     void failedOpenEmitsErrorOnly();
     void failedOpenKeepsPendingCandidate();
     void commitAndDiscardWithoutCandidateAreHarmless();
+    void commitEmitsCandidateCommitted();
+    void detailQueriesRoundTripSnapshots();
+    void detailQueryWithoutDistributionFails();
+    void detailQueryWithBadIdFails();
+    void detailQueryWithWrongKindFails();
+    void candidateIsNotQueryable();
 };
 
 namespace {
@@ -42,7 +48,11 @@ bool writeSyntheticDist(QTemporaryDir &dir)
 
 void BackendWorkerTest::initTestCase()
 {
+    qRegisterMetaType<HierarchyKind>("HierarchyKind");
     qRegisterMetaType<HierarchySnapshot>("HierarchySnapshot");
+    qRegisterMetaType<ProductDetailSnapshot>("ProductDetailSnapshot");
+    qRegisterMetaType<ImageDetailSnapshot>("ImageDetailSnapshot");
+    qRegisterMetaType<SubsystemDetailSnapshot>("SubsystemDetailSnapshot");
 }
 
 void BackendWorkerTest::candidateCarriesHierarchySnapshot()
@@ -152,6 +162,160 @@ void BackendWorkerTest::commitAndDiscardWithoutCandidateAreHarmless()
 
     worker.openDistribution(dir.path());
     QCOMPARE(readySpy.count(), 2);
+}
+
+void BackendWorkerTest::commitEmitsCandidateCommitted()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeSyntheticDist(dir));
+
+    BackendWorker worker;
+    QSignalSpy committedSpy(&worker, &BackendWorker::candidateCommitted);
+
+    // No candidate pending: no commit, no signal.
+    worker.commitCandidate();
+    QCOMPARE(committedSpy.count(), 0);
+
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+    QCOMPARE(committedSpy.count(), 1);
+}
+
+void BackendWorkerTest::detailQueriesRoundTripSnapshots()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeSyntheticDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy productSpy(&worker, &BackendWorker::productDetailReady);
+    QSignalSpy imageSpy(&worker, &BackendWorker::imageDetailReady);
+    QSignalSpy subsystemSpy(&worker, &BackendWorker::subsystemDetailReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::detailFailed);
+
+    // Object ids from the synthetic tree: 1 = product, 2 = test.sw,
+    // 3 = unix, 4 = test.man, 5 = man.
+    worker.detailRequested(10, 1, HierarchyKind::Product);
+    QCOMPARE(failSpy.count(), 0);
+    QCOMPARE(productSpy.count(), 1);
+    QCOMPARE(productSpy.first().at(0).toULongLong(), 10);
+    const auto product = qvariant_cast<ProductDetailSnapshot>(productSpy.first().at(1));
+    QCOMPARE(product.id, 1);
+    QCOMPARE(product.name, QStringLiteral("test"));
+    QCOMPARE(product.descriptorPresent, false);
+    QCOMPARE(product.idbPresent, true);
+    QCOMPARE(product.imageCount, 2);
+    QCOMPARE(product.subsystemCount, 2);
+    QCOMPARE(product.entryCount, 3);
+    // No descriptor: MACH is unknown, not "unrestricted".
+    QCOMPARE(product.mach.known, false);
+
+    worker.detailRequested(11, 2, HierarchyKind::Image);
+    QCOMPARE(imageSpy.count(), 1);
+    QCOMPARE(imageSpy.first().at(0).toULongLong(), 11);
+    const auto image = qvariant_cast<ImageDetailSnapshot>(imageSpy.first().at(1));
+    QCOMPARE(image.name, QStringLiteral("test.sw"));
+    QCOMPARE(image.productName, QStringLiteral("test"));
+    QCOMPARE(image.versionKnown, false);
+    QCOMPARE(image.orderKnown, false);
+    QCOMPARE(image.subsystemCount, 1);
+    QCOMPARE(image.entryCount, 2);
+
+    worker.detailRequested(12, 3, HierarchyKind::Subsystem);
+    QCOMPARE(subsystemSpy.count(), 1);
+    QCOMPARE(subsystemSpy.first().at(0).toULongLong(), 12);
+    const auto subsystem = qvariant_cast<SubsystemDetailSnapshot>(subsystemSpy.first().at(1));
+    QCOMPARE(subsystem.identity, QStringLiteral("test.sw.unix"));
+    QCOMPARE(subsystem.shortName, QStringLiteral("unix"));
+    QCOMPARE(subsystem.productName, QStringLiteral("test"));
+    QCOMPARE(subsystem.imageName, QStringLiteral("test.sw"));
+    QCOMPARE(subsystem.entryCount, 2);
+    // IDB-only subsystem: every descriptor-derived field is unknown.
+    QCOMPARE(subsystem.descriptorPresent, false);
+    QCOMPARE(subsystem.idbPresent, true);
+    QCOMPARE(subsystem.mappingKnown, false);
+    QCOMPARE(subsystem.mach.known, false);
+    QCOMPARE(subsystem.flags.known, false);
+    QCOMPARE(subsystem.rules.known, false);
+    QCOMPARE(subsystem.autominirootKnown, false);
+}
+
+void BackendWorkerTest::detailQueryWithoutDistributionFails()
+{
+    BackendWorker worker;
+    QSignalSpy failSpy(&worker, &BackendWorker::detailFailed);
+
+    worker.detailRequested(7, 1, HierarchyKind::Product);
+    QCOMPARE(failSpy.count(), 1);
+    QCOMPARE(failSpy.first().at(0).toULongLong(), 7);
+    QCOMPARE(failSpy.first().at(1).toString(), QStringLiteral("no distribution loaded"));
+}
+
+void BackendWorkerTest::detailQueryWithBadIdFails()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeSyntheticDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy failSpy(&worker, &BackendWorker::detailFailed);
+
+    worker.detailRequested(8, 0, HierarchyKind::Product);
+    QCOMPARE(failSpy.count(), 1);
+    QVERIFY(failSpy.first().at(1).toString().contains(QStringLiteral("object id 0")));
+
+    worker.detailRequested(9, 999, HierarchyKind::Subsystem);
+    QCOMPARE(failSpy.count(), 2);
+    QVERIFY(failSpy.at(1).at(1).toString().contains(QStringLiteral("does not exist")));
+}
+
+void BackendWorkerTest::detailQueryWithWrongKindFails()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeSyntheticDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy failSpy(&worker, &BackendWorker::detailFailed);
+
+    // Object 2 is an image; asking for it as a product must fail
+    // with a clear message instead of returning wrong data.
+    worker.detailRequested(13, 2, HierarchyKind::Product);
+    QCOMPARE(failSpy.count(), 1);
+    QCOMPARE(failSpy.first().at(1).toString(),
+             QStringLiteral("object 2 is an image, not a product"));
+}
+
+void BackendWorkerTest::candidateIsNotQueryable()
+{
+    // While a candidate awaits validation, detail queries must still
+    // be answered by the previously committed backend — or fail when
+    // there is none.
+    QTemporaryDir dir;
+    QVERIFY(writeSyntheticDist(dir));
+
+    BackendWorker worker;
+    QSignalSpy failSpy(&worker, &BackendWorker::detailFailed);
+
+    worker.openDistribution(dir.path());
+    // The candidate is pending; the committed backend is empty.
+    worker.detailRequested(14, 1, HierarchyKind::Product);
+    QCOMPARE(failSpy.count(), 1);
+    QCOMPARE(failSpy.first().at(1).toString(), QStringLiteral("no distribution loaded"));
+
+    // After the commit the same query succeeds.
+    QSignalSpy productSpy(&worker, &BackendWorker::productDetailReady);
+    worker.commitCandidate();
+    worker.detailRequested(15, 1, HierarchyKind::Product);
+    QCOMPARE(productSpy.count(), 1);
+    QCOMPARE(qvariant_cast<ProductDetailSnapshot>(productSpy.first().at(1)).name,
+             QStringLiteral("test"));
 }
 
 QTEST_GUILESS_MAIN(BackendWorkerTest)

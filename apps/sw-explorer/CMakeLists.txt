@@ -286,6 +286,7 @@ add_test(NAME DistributionTreeModelTest COMMAND DistributionTreeModelTest)
 add_executable(BackendWorkerTest
     tests/BackendWorkerTest.cpp
     src/HierarchySnapshot.h
+    src/InspectorSnapshot.h
     src/BackendWorker.h
     src/BackendWorker.cpp
     "${SW_GENERATED_SOURCE}"
@@ -307,3 +308,24 @@ if(SW_NATIVE_LIB_DIRS)
 endif()
 
 add_test(NAME BackendWorkerTest COMMAND BackendWorkerTest)
+
+# The inspector tests are QWidget tests (QTEST_MAIN); the offscreen
+# platform keeps them headless on every CI platform.
+add_executable(InspectorWidgetTest
+    tests/InspectorWidgetTest.cpp
+    src/InspectorSnapshot.h
+    src/InspectorWidget.h
+    src/InspectorWidget.cpp
+)
+
+target_include_directories(InspectorWidgetTest PRIVATE src)
+
+target_link_libraries(InspectorWidgetTest PRIVATE
+    Qt6::Widgets
+    Qt6::Test
+)
+
+add_test(NAME InspectorWidgetTest COMMAND InspectorWidgetTest)
+set_tests_properties(InspectorWidgetTest PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+)
