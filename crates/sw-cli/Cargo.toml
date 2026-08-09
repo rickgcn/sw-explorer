@@ -6,7 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "sw"
+path = "src/main.rs"
+
 [dependencies]
 sw-core.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
