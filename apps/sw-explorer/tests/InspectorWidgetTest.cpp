@@ -22,6 +22,12 @@ private slots:
     void imageRendering();
     void subsystemRendering();
     void idbOnlySubsystemShowsUnknownNotEmpty();
+    void entryRegularFileRendering();
+    void entrySymlinkAndDeviceRendering();
+    void entryUnknownTypeKeepsRawLetter();
+    void entryUnresolvedMachStaysVisible();
+    void entryOptionalSectionsStayHidden();
+    void entryMediaTextStaysPlainText();
 };
 
 namespace {
@@ -68,6 +74,35 @@ RangeSnapshot range(const QString &target, quint64 min, quint64 max, bool unboun
     out.maxVersion = max;
     out.maxIsUnbounded = unbounded;
     return out;
+}
+
+// A plain regular-file entry with every general field known and no
+// optional attributes; individual tests layer their specifics on
+// top.
+EntryDetailSnapshot makeEntryDetail()
+{
+    EntryDetailSnapshot detail;
+    detail.productId = 1;
+    detail.entryId = 41;
+    detail.fileType = EntryFileType::Regular;
+    detail.fileTypeRaw = QStringLiteral("f");
+    detail.mode = 0755;
+    detail.owner = QStringLiteral("root");
+    detail.group = QStringLiteral("sys");
+    detail.path = QStringLiteral("usr/bin/Xsgi");
+    detail.rawPath = QStringLiteral("usr/bin/Xsgi");
+    detail.sourcePath = QStringLiteral("work/irix/bin/Xsgi");
+    detail.subsystem = QStringLiteral("eoe.sw.unix");
+    detail.sizeKnown = true;
+    detail.size = 1363148; // 1.3 MiB
+    detail.storedSizeKnown = true;
+    detail.storedSize = 831488; // exactly 812 KiB
+    detail.checksumKnown = true;
+    detail.checksum = 424242;
+    detail.originIdbPath = QStringLiteral("/media/irix/dist/eoe.idb");
+    detail.originLine = 1234;
+    detail.rawIdbLine = QStringLiteral("f 0755 root sys usr/bin/Xsgi work/irix/bin/Xsgi eoe.sw.unix");
+    return detail;
 }
 
 } // namespace
@@ -323,6 +358,179 @@ void InspectorWidgetTest::idbOnlySubsystemShowsUnknownNotEmpty()
     QVERIFY(texts.contains(QStringLiteral("No"))); // Descriptor: No
     QVERIFY(texts.contains(QStringLiteral("Yes"))); // IDB: Yes
     QVERIFY(texts.contains(QStringLiteral("3")));
+}
+
+void InspectorWidgetTest::entryRegularFileRendering()
+{
+    EntryDetailSnapshot detail = makeEntryDetail();
+    // Compressed file with payload metadata.
+    detail.compressedSizeKnown = true;
+    detail.compressedSize = 831488;
+    detail.payloadPresent = true;
+    detail.payloadImage = QStringLiteral("eoe.sw");
+    detail.payloadEncodedSizeKnown = true;
+    detail.payloadEncodedSize = 831488;
+    detail.expectedRecordOffsetKnown = true;
+    detail.expectedRecordOffset = 0x00123456;
+    detail.mach = {QStringLiteral("CPUBOARD=IP22")};
+
+    InspectorWidget inspector;
+    inspector.showEntry(detail);
+
+    QCOMPARE(contentPageName(inspector), QStringLiteral("entryPage"));
+    QVERIFY(inspector.findChild<QWidget *>(QStringLiteral("generalSection")) != nullptr);
+    QVERIFY(inspector.findChild<QWidget *>(QStringLiteral("pathsSection")) != nullptr);
+    QVERIFY(inspector.findChild<QWidget *>(QStringLiteral("hardwareSection")) != nullptr);
+    QVERIFY(inspector.findChild<QWidget *>(QStringLiteral("payloadSection")) != nullptr);
+    QVERIFY(inspector.findChild<QWidget *>(QStringLiteral("idbSourceSection")) != nullptr);
+    QVERIFY(inspector.findChild<QWidget *>(QStringLiteral("rawIdbSection")) != nullptr);
+
+    const QStringList texts = allLabelTexts(&inspector);
+    QVERIFY(texts.contains(QStringLiteral("usr/bin/Xsgi")));
+    QVERIFY(texts.contains(QStringLiteral("Regular file")));
+    // The mode keeps the familiar octal spelling.
+    QVERIFY(texts.contains(QStringLiteral("0755")));
+    QVERIFY(texts.contains(QStringLiteral("root")));
+    QVERIFY(texts.contains(QStringLiteral("sys")));
+    QVERIFY(texts.contains(QStringLiteral("eoe.sw.unix")));
+    QVERIFY(texts.contains(QStringLiteral("1.3 MiB")));
+    QVERIFY(texts.contains(QStringLiteral("812 KiB")));
+    QVERIFY(texts.contains(QStringLiteral("424242")));
+    QVERIFY(texts.contains(QStringLiteral("work/irix/bin/Xsgi")));
+    QVERIFY(texts.contains(QStringLiteral("CPUBOARD=IP22")));
+    QVERIFY(texts.contains(QStringLiteral("eoe.sw")));
+    // Expected, never "actual": the label names it precisely.
+    QVERIFY(texts.contains(QStringLiteral("Expected record offset")));
+    QVERIFY(texts.contains(QStringLiteral("0x00123456")));
+    QVERIFY(!texts.contains(QStringLiteral("Actual offset")));
+    QVERIFY(texts.contains(QStringLiteral("eoe.idb")));
+    QVERIFY(texts.contains(QStringLiteral("1234")));
+    // The raw IDB record is the lossless fallback.
+    auto *rawLine = inspector.findChild<QLabel *>(QStringLiteral("rawIdbLine"));
+    QVERIFY(rawLine != nullptr);
+    QVERIFY(rawLine->text().startsWith(QStringLiteral("f 0755 root sys usr/bin/Xsgi")));
+    QCOMPARE(rawLine->textFormat(), Qt::PlainText);
+}
+
+void InspectorWidgetTest::entrySymlinkAndDeviceRendering()
+{
+    EntryDetailSnapshot link = makeEntryDetail();
+    link.fileType = EntryFileType::SymbolicLink;
+    link.fileTypeRaw = QStringLiteral("l");
+    link.path = QStringLiteral("usr/lib/libGL.so");
+    link.symlinkTargetKnown = true;
+    link.symlinkTarget = QStringLiteral("libGL.so.1");
+
+    InspectorWidget inspector;
+    inspector.showEntry(link);
+
+    QStringList texts = allLabelTexts(&inspector);
+    QVERIFY(texts.contains(QStringLiteral("Symbolic link")));
+    QVERIFY(texts.contains(QStringLiteral("Link target")));
+    QVERIFY(texts.contains(QStringLiteral("libGL.so.1")));
+    // A symlink carries no device numbers: the row stays hidden.
+    QVERIFY(!texts.contains(QStringLiteral("Device")));
+
+    EntryDetailSnapshot device = makeEntryDetail();
+    device.fileType = EntryFileType::CharacterDevice;
+    device.fileTypeRaw = QStringLiteral("c");
+    device.path = QStringLiteral("dev/ttyd1");
+    device.deviceKnown = true;
+    device.deviceMajor = 34;
+    device.deviceMinor = 12;
+    inspector.showEntry(device);
+
+    texts = allLabelTexts(&inspector);
+    QVERIFY(texts.contains(QStringLiteral("Character device")));
+    QVERIFY(texts.contains(QStringLiteral("Device")));
+    QVERIFY(texts.contains(QStringLiteral("34, 12")));
+    QVERIFY(!texts.contains(QStringLiteral("Link target")));
+}
+
+void InspectorWidgetTest::entryUnknownTypeKeepsRawLetter()
+{
+    EntryDetailSnapshot detail = makeEntryDetail();
+    detail.fileType = EntryFileType::Other;
+    detail.fileTypeRaw = QStringLiteral("z");
+
+    InspectorWidget inspector;
+    inspector.showEntry(detail);
+
+    const QStringList texts = allLabelTexts(&inspector);
+    QVERIFY(texts.contains(QStringLiteral("Unknown ('z')")));
+}
+
+void InspectorWidgetTest::entryUnresolvedMachStaysVisible()
+{
+    EntryDetailSnapshot detail = makeEntryDetail();
+    detail.mach = {QStringLiteral("CPUBOARD=IP22")};
+    detail.unresolvedMach = {QStringLiteral("=GARBAGE")};
+
+    InspectorWidget inspector;
+    inspector.showEntry(detail);
+
+    QVERIFY(inspector.findChild<QWidget *>(QStringLiteral("hardwareSection")) != nullptr);
+    QVERIFY(inspector.findChild<QWidget *>(QStringLiteral("unresolvedMachSection")) != nullptr);
+    const QStringList texts = allLabelTexts(&inspector);
+    QVERIFY(texts.contains(QStringLiteral("CPUBOARD=IP22")));
+    QVERIFY(texts.contains(QStringLiteral("=GARBAGE")));
+}
+
+void InspectorWidgetTest::entryOptionalSectionsStayHidden()
+{
+    // No payload, no config/symlink/device attributes, no MACH,
+    // unknown sizes: everything optional stays hidden and unknown
+    // sizes render as "-", never as a fake 0.
+    EntryDetailSnapshot detail = makeEntryDetail();
+    detail.sizeKnown = false;
+    detail.storedSizeKnown = false;
+    detail.checksumKnown = false;
+
+    InspectorWidget inspector;
+    inspector.showEntry(detail);
+
+    QVERIFY(inspector.findChild<QWidget *>(QStringLiteral("generalSection")) != nullptr);
+    QVERIFY(inspector.findChild<QWidget *>(QStringLiteral("payloadSection")) == nullptr);
+    QVERIFY(inspector.findChild<QWidget *>(QStringLiteral("hardwareSection")) == nullptr);
+
+    const QStringList texts = allLabelTexts(&inspector);
+    QVERIFY(!texts.contains(QStringLiteral("Compressed")));
+    QVERIFY(!texts.contains(QStringLiteral("Checksum")));
+    QVERIFY(!texts.contains(QStringLiteral("Config")));
+    QVERIFY(!texts.contains(QStringLiteral("Link target")));
+    QVERIFY(!texts.contains(QStringLiteral("Device")));
+    QVERIFY(texts.contains(QStringLiteral("-")));
+
+    // The IDB source and raw record always remain as the fallback.
+    QVERIFY(inspector.findChild<QWidget *>(QStringLiteral("idbSourceSection")) != nullptr);
+    QVERIFY(inspector.findChild<QWidget *>(QStringLiteral("rawIdbSection")) != nullptr);
+
+    // A config attribute with an unknown mode keeps its raw value.
+    detail.configKnown = true;
+    detail.configMode = QStringLiteral("weirdmode");
+    inspector.showEntry(detail);
+    QVERIFY(allLabelTexts(&inspector).contains(QStringLiteral("weirdmode")));
+}
+
+void InspectorWidgetTest::entryMediaTextStaysPlainText()
+{
+    // Media data must never be reinterpreted as rich text.
+    EntryDetailSnapshot detail = makeEntryDetail();
+    detail.path = QStringLiteral("usr/<foo>/bar");
+    detail.rawIdbLine = QStringLiteral("f 0755 root sys usr/<foo>/bar <b>not-bold</b> eoe.sw.unix");
+
+    InspectorWidget inspector;
+    inspector.showEntry(detail);
+
+    auto *name = inspector.findChild<QLabel *>(QStringLiteral("nameLabel"));
+    QVERIFY(name != nullptr);
+    QCOMPARE(name->text(), QStringLiteral("usr/<foo>/bar"));
+    QCOMPARE(name->textFormat(), Qt::PlainText);
+
+    auto *rawLine = inspector.findChild<QLabel *>(QStringLiteral("rawIdbLine"));
+    QVERIFY(rawLine != nullptr);
+    QVERIFY(rawLine->text().contains(QStringLiteral("<b>not-bold</b>")));
+    QCOMPARE(rawLine->textFormat(), Qt::PlainText);
 }
 
 QTEST_MAIN(InspectorWidgetTest)

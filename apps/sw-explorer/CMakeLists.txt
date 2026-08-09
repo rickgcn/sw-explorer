@@ -287,12 +287,31 @@ target_link_libraries(DistributionTreeModelTest PRIVATE
 
 add_test(NAME DistributionTreeModelTest COMMAND DistributionTreeModelTest)
 
+# The entry table model tests are GUI-free as well.
+add_executable(EntryTableModelTest
+    tests/EntryTableModelTest.cpp
+    src/EntrySnapshot.h
+    src/ByteFormat.h
+    src/models/EntryTableModel.h
+    src/models/EntryTableModel.cpp
+)
+
+target_include_directories(EntryTableModelTest PRIVATE src)
+
+target_link_libraries(EntryTableModelTest PRIVATE
+    Qt6::Core
+    Qt6::Test
+)
+
+add_test(NAME EntryTableModelTest COMMAND EntryTableModelTest)
+
 # The worker test drives the real Rust backend through the CXX
 # bridge, so it links the staticlib exactly like the application.
 add_executable(BackendWorkerTest
     tests/BackendWorkerTest.cpp
     src/HierarchySnapshot.h
     src/InspectorSnapshot.h
+    src/EntrySnapshot.h
     src/BackendWorker.h
     src/BackendWorker.cpp
     "${SW_GENERATED_SOURCE}"
@@ -320,6 +339,8 @@ add_test(NAME BackendWorkerTest COMMAND BackendWorkerTest)
 add_executable(InspectorWidgetTest
     tests/InspectorWidgetTest.cpp
     src/InspectorSnapshot.h
+    src/EntrySnapshot.h
+    src/ByteFormat.h
     src/InspectorWidget.h
     src/InspectorWidget.cpp
 )
@@ -333,5 +354,29 @@ target_link_libraries(InspectorWidgetTest PRIVATE
 
 add_test(NAME InspectorWidgetTest COMMAND InspectorWidgetTest)
 set_tests_properties(InspectorWidgetTest PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+)
+
+# The entry browser tests are QWidget tests (QTEST_MAIN); the
+# offscreen platform keeps them headless on every CI platform.
+add_executable(EntryBrowserWidgetTest
+    tests/EntryBrowserWidgetTest.cpp
+    src/EntrySnapshot.h
+    src/ByteFormat.h
+    src/EntryBrowserWidget.h
+    src/EntryBrowserWidget.cpp
+    src/models/EntryTableModel.h
+    src/models/EntryTableModel.cpp
+)
+
+target_include_directories(EntryBrowserWidgetTest PRIVATE src)
+
+target_link_libraries(EntryBrowserWidgetTest PRIVATE
+    Qt6::Widgets
+    Qt6::Test
+)
+
+add_test(NAME EntryBrowserWidgetTest COMMAND EntryBrowserWidgetTest)
+set_tests_properties(EntryBrowserWidgetTest PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
 )

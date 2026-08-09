@@ -26,6 +26,12 @@ private slots:
     void detailQueryWithBadIdFails();
     void detailQueryWithWrongKindFails();
     void candidateIsNotQueryable();
+    void entriesRoundTripSnapshots();
+    void entryDetailRoundTripsSnapshot();
+    void entriesWithoutDistributionFail();
+    void entriesWithBadScopeFail();
+    void entryDetailWithBadKeyFails();
+    void candidateEntriesAreNotQueryable();
 };
 
 namespace {
@@ -53,6 +59,8 @@ void BackendWorkerTest::initTestCase()
     qRegisterMetaType<ProductDetailSnapshot>("ProductDetailSnapshot");
     qRegisterMetaType<ImageDetailSnapshot>("ImageDetailSnapshot");
     qRegisterMetaType<SubsystemDetailSnapshot>("SubsystemDetailSnapshot");
+    qRegisterMetaType<EntryListSnapshot>("EntryListSnapshot");
+    qRegisterMetaType<EntryDetailSnapshot>("EntryDetailSnapshot");
 }
 
 void BackendWorkerTest::candidateCarriesHierarchySnapshot()
@@ -316,6 +324,221 @@ void BackendWorkerTest::candidateIsNotQueryable()
     QCOMPARE(productSpy.count(), 1);
     QCOMPARE(qvariant_cast<ProductDetailSnapshot>(productSpy.first().at(1)).name,
              QStringLiteral("test"));
+}
+
+void BackendWorkerTest::entriesRoundTripSnapshots()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeSyntheticDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy entriesSpy(&worker, &BackendWorker::entriesReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::entriesFailed);
+
+    // Object ids from the synthetic tree: 1 = product, 2 = test.sw,
+    // 3 = unix, 4 = test.man, 5 = man.
+
+    // Product scope: every entry, in exact IDB order.
+    worker.entriesRequested(30, 1);
+    QCOMPARE(failSpy.count(), 0);
+    QCOMPARE(entriesSpy.count(), 1);
+    QCOMPARE(entriesSpy.first().at(0).toULongLong(), 30);
+    const auto productEntries = qvariant_cast<EntryListSnapshot>(entriesSpy.first().at(1));
+    QCOMPARE(productEntries.size(), 3);
+    QCOMPARE(productEntries.at(0).path, QStringLiteral("a"));
+    QCOMPARE(productEntries.at(1).path, QStringLiteral("b"));
+    QCOMPARE(productEntries.at(2).path, QStringLiteral("c"));
+    for (qsizetype i = 0; i < productEntries.size(); ++i) {
+        QCOMPARE(productEntries.at(i).productId, 1);
+        QCOMPARE(productEntries.at(i).entryId, static_cast<quint64>(i));
+    }
+    // size(5) cmpsize(0): stored uncompressed, so the stored size is
+    // the plain size — never "stored size 0".
+    QCOMPARE(productEntries.at(0).sizeKnown, true);
+    QCOMPARE(productEntries.at(0).size, 5);
+    QCOMPARE(productEntries.at(0).storedSizeKnown, true);
+    QCOMPARE(productEntries.at(0).storedSize, 5);
+    QCOMPARE(productEntries.at(0).fileType, EntryFileType::Regular);
+
+    // Image scope filters the product entries, keeping their order.
+    worker.entriesRequested(31, 2);
+    QCOMPARE(entriesSpy.count(), 2);
+    const auto imageEntries = qvariant_cast<EntryListSnapshot>(entriesSpy.at(1).at(1));
+    QCOMPARE(imageEntries.size(), 2);
+    QCOMPARE(imageEntries.at(0).path, QStringLiteral("a"));
+    QCOMPARE(imageEntries.at(1).path, QStringLiteral("b"));
+    QCOMPARE(imageEntries.at(0).subsystem, QStringLiteral("test.sw.unix"));
+
+    // Subsystem scope.
+    worker.entriesRequested(32, 3);
+    QCOMPARE(entriesSpy.count(), 3);
+    const auto unixEntries = qvariant_cast<EntryListSnapshot>(entriesSpy.at(2).at(1));
+    QCOMPARE(unixEntries.size(), 2);
+
+    worker.entriesRequested(33, 5);
+    QCOMPARE(entriesSpy.count(), 4);
+    const auto manEntries = qvariant_cast<EntryListSnapshot>(entriesSpy.at(3).at(1));
+    QCOMPARE(manEntries.size(), 1);
+    QCOMPARE(manEntries.at(0).path, QStringLiteral("c"));
+    QCOMPARE(manEntries.at(0).entryId, 2);
+    QCOMPARE(manEntries.at(0).subsystem, QStringLiteral("test.man.man"));
+
+    QCOMPARE(failSpy.count(), 0);
+}
+
+void BackendWorkerTest::entryDetailRoundTripsSnapshot()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeSyntheticDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy detailSpy(&worker, &BackendWorker::entryDetailReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::detailFailed);
+
+    // EntryId 0 is a perfectly valid first entry.
+    worker.entryDetailRequested(40, 1, 0);
+    QCOMPARE(failSpy.count(), 0);
+    QCOMPARE(detailSpy.count(), 1);
+    QCOMPARE(detailSpy.first().at(0).toULongLong(), 40);
+    const auto detail = qvariant_cast<EntryDetailSnapshot>(detailSpy.first().at(1));
+    QCOMPARE(detail.productId, 1);
+    QCOMPARE(detail.entryId, 0);
+    QCOMPARE(detail.fileType, EntryFileType::Regular);
+    QCOMPARE(detail.fileTypeRaw, QStringLiteral("f"));
+    QCOMPARE(detail.mode, 0644);
+    QCOMPARE(detail.owner, QStringLiteral("root"));
+    QCOMPARE(detail.group, QStringLiteral("sys"));
+    QCOMPARE(detail.path, QStringLiteral("a"));
+    QCOMPARE(detail.rawPath, QStringLiteral("a"));
+    QCOMPARE(detail.sourcePath, QStringLiteral("src/a"));
+    QCOMPARE(detail.subsystem, QStringLiteral("test.sw.unix"));
+    QCOMPARE(detail.sizeKnown, true);
+    QCOMPARE(detail.size, 5);
+    QCOMPARE(detail.compressedSizeKnown, true);
+    QCOMPARE(detail.compressedSize, 0);
+    QCOMPARE(detail.storedSizeKnown, true);
+    QCOMPARE(detail.storedSize, 5);
+    QCOMPARE(detail.checksumKnown, true);
+    QCOMPARE(detail.checksum, 1);
+    // No optional attributes: unknown, not empty fakes.
+    QCOMPARE(detail.configKnown, false);
+    QCOMPARE(detail.symlinkTargetKnown, false);
+    QCOMPARE(detail.deviceKnown, false);
+    // The payload locator is layout metadata computed from the IDB
+    // alone; no archive was read for it. This entry is the first
+    // payload record of test.sw, stored uncompressed.
+    QCOMPARE(detail.payloadPresent, true);
+    QCOMPARE(detail.payloadImage, QStringLiteral("test.sw"));
+    QCOMPARE(detail.payloadEncodedSizeKnown, true);
+    QCOMPARE(detail.payloadEncodedSize, 5);
+    QCOMPARE(detail.expectedRecordOffsetKnown, true);
+    QCOMPARE(detail.expectedRecordOffset, 13);
+    // The raw IDB record round-trips as the lossless fallback.
+    QVERIFY(detail.originIdbPath.contains(QStringLiteral("test.idb")));
+    QCOMPARE(detail.originLine, 1);
+    QVERIFY(detail.rawIdbLine.startsWith(QStringLiteral("f 0644 root sys a")));
+}
+
+void BackendWorkerTest::entriesWithoutDistributionFail()
+{
+    BackendWorker worker;
+    QSignalSpy entriesFailSpy(&worker, &BackendWorker::entriesFailed);
+    QSignalSpy detailFailSpy(&worker, &BackendWorker::detailFailed);
+
+    worker.entriesRequested(50, 1);
+    QCOMPARE(entriesFailSpy.count(), 1);
+    QCOMPARE(entriesFailSpy.first().at(0).toULongLong(), 50);
+    QCOMPARE(entriesFailSpy.first().at(1).toString(),
+             QStringLiteral("no distribution loaded"));
+
+    worker.entryDetailRequested(51, 1, 0);
+    QCOMPARE(detailFailSpy.count(), 1);
+    QCOMPARE(detailFailSpy.first().at(0).toULongLong(), 51);
+    QCOMPARE(detailFailSpy.first().at(1).toString(),
+             QStringLiteral("no distribution loaded"));
+}
+
+void BackendWorkerTest::entriesWithBadScopeFail()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeSyntheticDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy failSpy(&worker, &BackendWorker::entriesFailed);
+
+    worker.entriesRequested(60, 0);
+    QCOMPARE(failSpy.count(), 1);
+    QVERIFY(failSpy.first().at(1).toString().contains(QStringLiteral("object id 0")));
+
+    worker.entriesRequested(61, 999);
+    QCOMPARE(failSpy.count(), 2);
+    QVERIFY(failSpy.at(1).at(1).toString().contains(QStringLiteral("does not exist")));
+}
+
+void BackendWorkerTest::entryDetailWithBadKeyFails()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeSyntheticDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy failSpy(&worker, &BackendWorker::detailFailed);
+
+    // The product id must identify a product, not any other object.
+    worker.entryDetailRequested(70, 2, 0);
+    QCOMPARE(failSpy.count(), 1);
+    QCOMPARE(failSpy.first().at(1).toString(),
+             QStringLiteral("object 2 is an image, not a product"));
+
+    // An out-of-range entry id names the product it was sought in.
+    worker.entryDetailRequested(71, 1, 99);
+    QCOMPARE(failSpy.count(), 2);
+    QCOMPARE(failSpy.at(1).at(1).toString(),
+             QStringLiteral("entry 99 does not exist in product test"));
+}
+
+void BackendWorkerTest::candidateEntriesAreNotQueryable()
+{
+    // Like every other query, entry queries only ever talk to the
+    // committed backend; a pending candidate is not queryable.
+    QTemporaryDir dir;
+    QVERIFY(writeSyntheticDist(dir));
+
+    BackendWorker worker;
+    QSignalSpy entriesFailSpy(&worker, &BackendWorker::entriesFailed);
+    QSignalSpy detailFailSpy(&worker, &BackendWorker::detailFailed);
+
+    worker.openDistribution(dir.path());
+    // The candidate is pending; the committed backend is empty.
+    worker.entriesRequested(80, 1);
+    QCOMPARE(entriesFailSpy.count(), 1);
+    QCOMPARE(entriesFailSpy.first().at(1).toString(),
+             QStringLiteral("no distribution loaded"));
+    worker.entryDetailRequested(81, 1, 0);
+    QCOMPARE(detailFailSpy.count(), 1);
+
+    // After the commit the same queries succeed.
+    QSignalSpy entriesSpy(&worker, &BackendWorker::entriesReady);
+    QSignalSpy detailSpy(&worker, &BackendWorker::entryDetailReady);
+    worker.commitCandidate();
+    worker.entriesRequested(82, 1);
+    QCOMPARE(entriesSpy.count(), 1);
+    QCOMPARE(qvariant_cast<EntryListSnapshot>(entriesSpy.first().at(1)).size(), 3);
+    worker.entryDetailRequested(83, 1, 0);
+    QCOMPARE(detailSpy.count(), 1);
+    QCOMPARE(qvariant_cast<EntryDetailSnapshot>(detailSpy.first().at(1)).path,
+             QStringLiteral("a"));
 }
 
 QTEST_GUILESS_MAIN(BackendWorkerTest)
