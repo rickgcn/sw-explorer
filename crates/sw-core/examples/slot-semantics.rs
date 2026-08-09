@@ -1,5 +1,5 @@
-//! Corpus statistics for the subsystem rule slots whose semantics are
-//! not yet confirmed (slots 2, 5, 7 and 8).
+//! Corpus statistics for the subsystem rule regions (replaces, incompat,
+//! attribute blobs and updates).
 //!
 //! For every non-empty instance the report records the full context
 //! (distribution, product, image, subsystem, layout level, raw subsystem
@@ -21,7 +21,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use sw_core::descriptor::model::{DescriptorRange, RuleSlot};
+use sw_core::descriptor::model::{DescriptorRange, DescriptorSubsystem};
 use sw_core::distribution::Distribution;
 use sw_core::mach::HardwareExpr;
 
@@ -179,6 +179,48 @@ fn range_out(range: &DescriptorRange) -> RangeOut {
     }
 }
 
+/// The non-empty rule regions of one subsystem, keyed by their
+/// historical slot index (2 = replaces, 5 = incompat, 7 = attribute
+/// blobs, 8 = updates).
+fn rule_regions(
+    subsystem: &DescriptorSubsystem,
+) -> Vec<(u8, &'static str, Vec<RangeOut>, Vec<String>)> {
+    let mut regions = Vec::new();
+    if !subsystem.replaces.is_empty() {
+        regions.push((
+            2,
+            "ranges",
+            subsystem.replaces.iter().map(range_out).collect(),
+            Vec::new(),
+        ));
+    }
+    if !subsystem.incompatibilities.is_empty() {
+        regions.push((
+            5,
+            "ranges",
+            subsystem.incompatibilities.iter().map(range_out).collect(),
+            Vec::new(),
+        ));
+    }
+    if !subsystem.attributes.is_empty() {
+        let strings = subsystem
+            .attributes
+            .iter()
+            .map(|attribute| format!("{}{}", attribute.tag as char, attribute.text))
+            .collect();
+        regions.push((7, "strings", Vec::new(), strings));
+    }
+    if !subsystem.updates.is_empty() {
+        regions.push((
+            8,
+            "ranges",
+            subsystem.updates.iter().map(range_out).collect(),
+            Vec::new(),
+        ));
+    }
+    regions
+}
+
 fn main() -> ExitCode {
     let mut json: Option<PathBuf> = None;
     let mut dists: Vec<PathBuf> = Vec::new();
@@ -227,15 +269,7 @@ fn main() -> ExitCode {
                     *baseline_flags
                         .entry(format!("{:#06x}", subsystem.flags_raw))
                         .or_default() += 1;
-                    for slot in &subsystem.unassigned_slots {
-                        let (kind, ranges, strings) = match slot {
-                            RuleSlot::Ranges { values, .. } => {
-                                ("ranges", values.iter().map(range_out).collect(), Vec::new())
-                            }
-                            RuleSlot::Strings { values, .. } => {
-                                ("strings", Vec::new(), values.clone())
-                            }
-                        };
+                    for (slot, kind, ranges, strings) in rule_regions(subsystem) {
                         let instance = SlotInstance {
                             dist: path.display().to_string(),
                             product: descriptor.name.clone(),
@@ -244,13 +278,13 @@ fn main() -> ExitCode {
                             layout_level: descriptor.layout_level,
                             flags_raw: subsystem.flags_raw,
                             image_version: image.version.0,
-                            slot: slot.slot(),
+                            slot,
                             kind: kind.to_string(),
                             ranges,
                             strings,
                         };
                         stats
-                            .entry(slot.slot().to_string())
+                            .entry(slot.to_string())
                             .or_default()
                             .observe(&instance);
                         instances.push(instance);

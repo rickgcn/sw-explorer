@@ -1,21 +1,20 @@
 //! Research probe for the binary product descriptor (`pd001`) body.
 //!
-//! This is a reverse-engineering workbench, kept deliberately separate
-//! from the library's descriptor parser. The grammar it implements was
-//! established against the whole descriptor corpus:
+//! This is an independent regression oracle, kept deliberately separate
+//! from the library's descriptor parser. The grammar it implements is
+//! the writer-aligned `pd001` grammar:
 //!
-//! * stream header `07c4 0001 07c3` + layout level (5/6 vs 8/9 family);
+//! * stream header `07c4 0001 07c3` + layout level (5 to 9);
 //! * big-endian u16/u32 and length-prefixed (`BE16` + bytes) strings;
-//! * product record: name, description, flags, stamp, metadata blobs
-//!   (level 8/9), image count;
-//! * image record: flags, short name, description, two unknown u16
-//!   fields, version, then a level-dependent tail (level 5 has two
-//!   extra unknown u16 fields, level 6 has neither metadata nor
-//!   reserved fields), metadata blobs, subsystem count;
-//! * subsystem record: flags, short name, description, mapping string;
-//! * rules region: exactly as many `BE16 count + records` slots as the
-//!   layout level number, with a fixed shape per slot (flat range
-//!   records, clause-of-ranges, or plain blob lists).
+//! * product record: name, id, flags, stamp, `desc` (level 5+),
+//!   attribute blobs with a BE32 count (level 7+), BE16 image count;
+//! * image record: flags, short name, id, legacy field, order, version,
+//!   two reserved BE32 words (level 5 only), `desc` (level 5+),
+//!   attribute blobs (level 8+), BE16 subsystem count;
+//! * subsystem record: flags, short name, id, mapping string, a BE32
+//!   legacy ordinal, replaces ranges, prerequisite clauses, `desc`
+//!   (level 5+), incompat ranges (level 6+), attribute blobs with a
+//!   BE32 count (level 8+), updates ranges (level 9+).
 //!
 //! Validation: parsed product/image/subsystem names and counts are
 //! compared against the IDB-derived hierarchy of the same product, and
@@ -122,29 +121,6 @@ impl<'a> Cursor<'a> {
         Ok(text)
     }
 
-    /// Reads an LP16 blob with an upper length bound.
-    fn lp16_max(&mut self, what: &str, max: usize) -> Result<String, Stop> {
-        let len = self.be16(what)? as usize;
-        if len > max {
-            return Err(stop(
-                self.pos - 2,
-                format!("{what} length {len} exceeds limit {max}"),
-            ));
-        }
-        if self.remaining() < len {
-            return Err(stop(
-                self.pos - 2,
-                format!(
-                    "{what} length {len} exceeds {} remaining bytes",
-                    self.remaining()
-                ),
-            ));
-        }
-        let text = latin1_string(&self.bytes[self.pos..self.pos + len]);
-        self.pos += len;
-        Ok(text)
-    }
-
     /// Bytes at `offset`, for boundary checks.
     fn at(&self, offset: usize) -> &[u8] {
         &self.bytes[offset.min(self.bytes.len())..]
@@ -181,10 +157,11 @@ struct RangeRecordProbe {
 #[derive(Serialize)]
 struct SectionProbe {
     offset: usize,
-    count: u16,
-    /// `ranges` for flat range records, `clauses` for the nested
-    /// clause-of-ranges shape, `strings` for a plain LP16 blob list,
-    /// `empty` for a zero count.
+    count: u32,
+    /// `ordinal` for the BE32 legacy ordinal, `ranges` for flat range
+    /// records, `clauses` for the nested clause-of-ranges shape,
+    /// `strings` for a plain LP16 blob list, `desc` for the long
+    /// description string.
     kind: String,
     records: Vec<RangeRecordProbe>,
     /// Blob contents when `kind` is `strings`.
@@ -220,14 +197,14 @@ struct ImageProbe {
     name: String,
     name_matches_idb: bool,
     description: String,
-    /// Unknown u16 between description and order candidate.
-    field_a: u16,
-    /// Strong installation-order candidate.
-    order_candidate: u16,
+    /// Legacy field between the id and the order (always 2).
+    legacy_field: u16,
+    /// Installation order.
+    order: u16,
     version: u32,
-    /// Unknown u16 fields in the image tail (layout level 5 only).
-    tail_unknowns: Vec<u16>,
-    metadata: Vec<String>,
+    /// Reserved BE32 words (layout level 5 only).
+    reserved: Vec<u32>,
+    attributes: Vec<String>,
     subsystem_count: u32,
     subsystems: Vec<SubsystemProbe>,
 }
@@ -244,7 +221,8 @@ struct ProductProbe {
     parsed_name: Option<String>,
     name_matches_idb: bool,
     description: Option<String>,
-    metadata: Vec<String>,
+    description_long: Option<String>,
+    attributes: Vec<String>,
     image_count: Option<u32>,
     image_count_matches_idb: bool,
     images: Vec<ImageProbe>,
@@ -313,32 +291,25 @@ fn valid_record_start(
         } else if name != candidate.name {
             return Err(stop(pos, "name mismatch"));
         }
-        trial.lp16("description")?;
+        trial.lp16("id")?;
         if candidate.is_image {
-            trial.be16("field a")?;
+            trial.be16("legacy field")?;
             trial.be16("order")?;
             trial.be32("version")?;
-            if level == 6 {
-                trial.be32("subsystem count")?;
-            } else {
-                if trial.be32("reserved")? != 0 {
-                    return Err(stop(pos, "reserved nonzero"));
-                }
-                if level == 5 {
-                    trial.be16("tail unknown")?;
-                }
-                let metadata_count = trial.be16("metadata count")?;
-                if metadata_count > MAX_SECTION_COUNT {
-                    return Err(stop(pos, "metadata count"));
-                }
-                for _ in 0..metadata_count {
-                    trial.lp16("metadata blob")?;
-                }
-                if level == 5 {
-                    trial.be16("tail unknown")?;
-                }
-                trial.be16("subsystem count")?;
+            if level == 5 && (trial.be32("reserved")? != 0 || trial.be32("reserved")? != 0) {
+                return Err(stop(pos, "reserved nonzero"));
             }
+            trial.lp16("desc")?;
+            if level >= 8 {
+                let attribute_count = trial.be32("attribute count")?;
+                if attribute_count > 4096 {
+                    return Err(stop(pos, "attribute count"));
+                }
+                for _ in 0..attribute_count {
+                    trial.lp16("attribute blob")?;
+                }
+            }
+            trial.be16("subsystem count")?;
         } else {
             trial.lp16("mapping")?;
         }
@@ -394,6 +365,7 @@ fn parse_ranges_section(
     cursor: &mut Cursor,
     offset: usize,
     count: u16,
+    kind: &str,
 ) -> Result<SectionProbe, Stop> {
     let mut records = Vec::new();
     for _ in 0..count {
@@ -401,14 +373,14 @@ fn parse_ranges_section(
     }
     Ok(SectionProbe {
         offset,
-        count,
-        kind: "ranges".to_string(),
+        count: u32::from(count),
+        kind: kind.to_string(),
         records,
         blobs: Vec::new(),
     })
 }
 
-/// Parses a clause-shaped section: `count` clauses, each a
+/// Parses the prerequisite section: `count` clauses, each a
 /// `BE16 range_count + range records` group.
 fn parse_clauses_section(
     cursor: &mut Cursor,
@@ -423,28 +395,28 @@ fn parse_clauses_section(
         }
         for _ in 0..range_count {
             let mut record = parse_range_record(cursor)?;
-            record.clause_index = Some(clause_index as u32);
+            record.clause_index = Some(u32::from(clause_index));
             records.push(record);
         }
     }
     Ok(SectionProbe {
         offset,
-        count,
+        count: u32::from(count),
         kind: "clauses".to_string(),
         records,
         blobs: Vec::new(),
     })
 }
 
-/// Parses a section of plain LP16 blobs.
+/// Parses the attribute section: a BE32 count of LP16 blobs.
 fn parse_strings_section(
     cursor: &mut Cursor,
     offset: usize,
-    count: u16,
+    count: u32,
 ) -> Result<SectionProbe, Stop> {
     let mut blobs = Vec::new();
     for _ in 0..count {
-        blobs.push(cursor.lp16_max("blob", 256)?);
+        blobs.push(cursor.lp16("attribute blob")?);
     }
     Ok(SectionProbe {
         offset,
@@ -455,75 +427,175 @@ fn parse_strings_section(
     })
 }
 
-/// Which record shape a rules slot holds, by index. Corpus-consistent
-/// across all cleanly walked subsystems: slots 2 and 5 (and 8 on layout
-/// level 9) are flat range records, slot 3 is clause-shaped, slot 7
-/// (level 8/9) is a blob list, and every other slot is always zero.
-fn slot_shape(slot: usize, level: u16) -> &'static str {
-    match slot {
-        2 | 5 => "ranges",
-        3 => "clauses",
-        7 if level >= 8 => "strings",
-        8 if level >= 9 => "ranges",
-        _ => "empty",
-    }
+/// One step of the rules walk: a fixed field of the subsystem rules
+/// region, present only from a certain layout level on.
+struct RuleStep {
+    /// Historical slot name, for the report.
+    name: &'static str,
+    /// Present from this layout level on.
+    since_level: u16,
+    /// Field shape.
+    shape: StepShape,
 }
 
-/// The rules region has exactly as many slots as the layout level
-/// number, each parsed in its fixed shape (see `slot_shape`).
+/// The field shapes of the rules region.
+enum StepShape {
+    /// The BE32 legacy ordinal.
+    Ordinal,
+    /// BE16 count + range records.
+    Ranges,
+    /// BE16 clause count + BE16 range count + range records.
+    Clauses,
+    /// One LP16 string (the `desc` text).
+    Desc,
+    /// BE32 count + LP16 blobs.
+    Attributes,
+}
+
+/// The rules region, exactly as the descriptor writer emits it.
+fn rule_steps() -> Vec<RuleStep> {
+    vec![
+        RuleStep {
+            name: "ordinal",
+            since_level: 5,
+            shape: StepShape::Ordinal,
+        },
+        RuleStep {
+            name: "replaces",
+            since_level: 5,
+            shape: StepShape::Ranges,
+        },
+        RuleStep {
+            name: "prerequisites",
+            since_level: 5,
+            shape: StepShape::Clauses,
+        },
+        RuleStep {
+            name: "desc",
+            since_level: 5,
+            shape: StepShape::Desc,
+        },
+        RuleStep {
+            name: "incompat",
+            since_level: 6,
+            shape: StepShape::Ranges,
+        },
+        RuleStep {
+            name: "attributes",
+            since_level: 8,
+            shape: StepShape::Attributes,
+        },
+        RuleStep {
+            name: "updates",
+            since_level: 9,
+            shape: StepShape::Ranges,
+        },
+    ]
+}
+
+/// Walks the rules region field by field.
 fn parse_rules(
     cursor: &mut Cursor,
     boundary: &[BoundaryCandidate],
     level: u16,
 ) -> (Vec<SectionProbe>, Option<Failure>) {
     let mut sections = Vec::new();
-    for slot in 0..level as usize {
+    for step in rule_steps() {
+        if level < step.since_level {
+            continue;
+        }
         let offset = cursor.pos;
-        let count = match cursor.be16("section count") {
-            Ok(count) => count,
-            Err(e) => {
-                return (
-                    sections,
-                    Some(Failure {
-                        offset: e.offset,
-                        message: e.message,
-                        context_hex: cursor.context(e.offset, 32),
-                    }),
-                );
+        let parsed = match step.shape {
+            StepShape::Ordinal => match cursor.be32("legacy ordinal") {
+                Ok(value) => Ok(SectionProbe {
+                    offset,
+                    count: value,
+                    kind: "ordinal".to_string(),
+                    records: Vec::new(),
+                    blobs: Vec::new(),
+                }),
+                Err(e) => Err(e),
+            },
+            StepShape::Ranges | StepShape::Clauses | StepShape::Attributes => {
+                let wide = matches!(step.shape, StepShape::Attributes);
+                let count = if wide {
+                    match cursor.be32("attribute count") {
+                        Ok(count) if count <= 4096 => count,
+                        Ok(count) => {
+                            return (
+                                sections,
+                                Some(Failure {
+                                    offset,
+                                    message: format!(
+                                        "{}: implausible attribute count {count}",
+                                        step.name
+                                    ),
+                                    context_hex: cursor.context(offset, 32),
+                                }),
+                            );
+                        }
+                        Err(e) => {
+                            return (
+                                sections,
+                                Some(Failure {
+                                    offset: e.offset,
+                                    message: e.message,
+                                    context_hex: cursor.context(e.offset, 32),
+                                }),
+                            );
+                        }
+                    }
+                } else {
+                    match cursor.be16("section count") {
+                        Ok(count) if count <= MAX_SECTION_COUNT => u32::from(count),
+                        Ok(count) => {
+                            return (
+                                sections,
+                                Some(Failure {
+                                    offset,
+                                    message: format!(
+                                        "{}: implausible section count {count}",
+                                        step.name
+                                    ),
+                                    context_hex: cursor.context(offset, 32),
+                                }),
+                            );
+                        }
+                        Err(e) => {
+                            return (
+                                sections,
+                                Some(Failure {
+                                    offset: e.offset,
+                                    message: e.message,
+                                    context_hex: cursor.context(e.offset, 32),
+                                }),
+                            );
+                        }
+                    }
+                };
+                match step.shape {
+                    StepShape::Ranges => {
+                        parse_ranges_section(cursor, offset, count as u16, step.name)
+                    }
+                    StepShape::Clauses => parse_clauses_section(cursor, offset, count as u16),
+                    StepShape::Attributes => parse_strings_section(cursor, offset, count),
+                    _ => unreachable!(),
+                }
             }
-        };
-        if count > MAX_SECTION_COUNT {
-            return (
-                sections,
-                Some(Failure {
+            StepShape::Desc => match cursor.lp16("desc") {
+                Ok(text) => Ok(SectionProbe {
                     offset,
-                    message: format!("slot {slot}: implausible section count {count}"),
-                    context_hex: cursor.context(offset, 32),
+                    count: u32::from(!text.is_empty()),
+                    kind: "desc".to_string(),
+                    records: Vec::new(),
+                    blobs: if text.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![text]
+                    },
                 }),
-            );
-        }
-        let shape = slot_shape(slot, level);
-        if shape == "empty" && count != 0 {
-            return (
-                sections,
-                Some(Failure {
-                    offset,
-                    message: format!("slot {slot}: expected empty, count is {count}"),
-                    context_hex: cursor.context(offset, 32),
-                }),
-            );
-        }
-        let parsed = match shape {
-            "ranges" => parse_ranges_section(cursor, offset, count),
-            "clauses" => parse_clauses_section(cursor, offset, count),
-            "strings" => parse_strings_section(cursor, offset, count),
-            _ => Ok(SectionProbe {
-                offset,
-                count,
-                kind: "empty".to_string(),
-                records: Vec::new(),
-                blobs: Vec::new(),
-            }),
+                Err(e) => Err(e),
+            },
         };
         match parsed {
             Ok(section) => sections.push(section),
@@ -532,7 +604,7 @@ fn parse_rules(
                     sections,
                     Some(Failure {
                         offset: e.offset,
-                        message: format!("slot {slot}: {}", e.message),
+                        message: format!("{}: {}", step.name, e.message),
                         context_hex: cursor.context(e.offset, 32),
                     }),
                 );
@@ -546,7 +618,7 @@ fn parse_rules(
             sections,
             Some(Failure {
                 offset: cursor.pos,
-                message: "trailing bytes after all rule slots".to_string(),
+                message: "trailing bytes after the rules region".to_string(),
                 context_hex: cursor.context(cursor.pos, 32),
             }),
         )
@@ -591,7 +663,8 @@ fn probe_product(
         parsed_name: None,
         name_matches_idb: false,
         description: None,
-        metadata: Vec::new(),
+        description_long: None,
+        attributes: Vec::new(),
         image_count: None,
         image_count_matches_idb: false,
         images: Vec::new(),
@@ -619,25 +692,25 @@ fn probe_product(
         let name = cursor.lp16("product name")?;
         probe.name_matches_idb = name == expected.name;
         probe.parsed_name = Some(name);
-        probe.description = Some(cursor.lp16("product description")?);
+        probe.description = Some(cursor.lp16("product id")?);
         probe.flags = Some(cursor.be16("product flags")?);
         probe.stamp = Some(cursor.be32("product stamp")?);
-        let image_count = if level >= 8 {
-            let reserved = cursor.be32("product reserved")?;
-            if reserved != 0 {
+        probe.description_long = Some(cursor.lp16("product desc")?);
+        if level >= 7 {
+            let attribute_count = cursor.be32("product attribute count")?;
+            if attribute_count > 4096 {
                 return Err(stop(
                     cursor.pos - 4,
-                    format!("product reserved field is {reserved:#x}, expected 0"),
+                    format!("implausible product attribute count {attribute_count}"),
                 ));
             }
-            let metadata_count = cursor.be16("product metadata count")?;
-            for _ in 0..metadata_count {
-                probe.metadata.push(cursor.lp16("product metadata blob")?);
+            for _ in 0..attribute_count {
+                probe
+                    .attributes
+                    .push(cursor.lp16("product attribute blob")?);
             }
-            cursor.be16("image count")? as u32
-        } else {
-            cursor.be32("image count")?
-        };
+        }
+        let image_count = u32::from(cursor.be16("image count")?);
         probe.image_count = Some(image_count);
         probe.image_count_matches_idb = image_count as usize == expected.images.len();
         Ok(())
@@ -665,45 +738,38 @@ fn probe_product(
         let parsed = (|| -> Result<ImageProbe, Stop> {
             let flags = cursor.be16("image flags")?;
             let name = cursor.lp16("image name")?;
-            let description = cursor.lp16("image description")?;
-            let field_a = cursor.be16("image field a")?;
-            let order_candidate = cursor.be16("image order candidate")?;
+            let description = cursor.lp16("image id")?;
+            let legacy_field = cursor.be16("image legacy field")?;
+            let order = cursor.be16("image order")?;
             let version = cursor.be32("image version")?;
-            // The image tail framing depends on the layout level:
-            // level 5 carries two extra unknown u16 fields around the
-            // metadata blobs, level 6 is just the BE32 count, and level
-            // 8/9 have metadata blobs but no extra u16 fields.
-            let (tail_unknowns, metadata, subsystem_count) = if level == 6 {
-                (Vec::new(), Vec::new(), cursor.be32("subsystem count")?)
-            } else {
-                let reserved = cursor.be32("image reserved")?;
-                if reserved != 0 {
+            let mut reserved = Vec::new();
+            if level == 5 {
+                for _ in 0..2 {
+                    let word = cursor.be32("image reserved")?;
+                    if word != 0 {
+                        return Err(stop(
+                            cursor.pos - 4,
+                            format!("image reserved field is {word:#x}, expected 0"),
+                        ));
+                    }
+                    reserved.push(word);
+                }
+            }
+            let _desc = cursor.lp16("image desc")?;
+            let mut attributes = Vec::new();
+            if level >= 8 {
+                let attribute_count = cursor.be32("image attribute count")?;
+                if attribute_count > 4096 {
                     return Err(stop(
                         cursor.pos - 4,
-                        format!("image reserved field is {reserved:#x}, expected 0"),
+                        format!("implausible image attribute count {attribute_count}"),
                     ));
                 }
-                let mut tail_unknowns = Vec::new();
-                if level == 5 {
-                    tail_unknowns.push(cursor.be16("image tail unknown 1")?);
+                for _ in 0..attribute_count {
+                    attributes.push(cursor.lp16("image attribute blob")?);
                 }
-                let metadata_count = cursor.be16("image metadata count")?;
-                if metadata_count > MAX_SECTION_COUNT {
-                    return Err(stop(
-                        cursor.pos - 2,
-                        format!("implausible image metadata count {metadata_count}"),
-                    ));
-                }
-                let mut metadata = Vec::new();
-                for _ in 0..metadata_count {
-                    metadata.push(cursor.lp16("image metadata blob")?);
-                }
-                if level == 5 {
-                    tail_unknowns.push(cursor.be16("image tail unknown 2")?);
-                }
-                let subsystem_count = cursor.be16("subsystem count")?;
-                (tail_unknowns, metadata, subsystem_count as u32)
-            };
+            }
+            let subsystem_count = u32::from(cursor.be16("subsystem count")?);
             Ok(ImageProbe {
                 offset,
                 expected_name: None,
@@ -711,11 +777,11 @@ fn probe_product(
                 name_matches_idb: false,
                 name,
                 description,
-                field_a,
-                order_candidate,
+                legacy_field,
+                order,
                 version,
-                tail_unknowns,
-                metadata,
+                reserved,
+                attributes,
                 subsystem_count,
                 subsystems: Vec::new(),
             })
