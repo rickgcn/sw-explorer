@@ -298,6 +298,7 @@ add_test(NAME DistributionTreeModelTest COMMAND DistributionTreeModelTest)
 add_executable(EntryTableModelTest
     tests/EntryTableModelTest.cpp
     src/EntrySnapshot.h
+    src/HardwareSnapshot.h
     src/ByteFormat.h
     src/models/EntryTableModel.h
     src/models/EntryTableModel.cpp
@@ -312,6 +313,50 @@ target_link_libraries(EntryTableModelTest PRIVATE
 
 add_test(NAME EntryTableModelTest COMMAND EntryTableModelTest)
 
+# The hardware profile model tests are GUI-free too.
+add_executable(HardwareProfileModelTest
+    tests/HardwareProfileModelTest.cpp
+    src/EntrySnapshot.h
+    src/HardwareSnapshot.h
+    src/models/HardwareProfileModel.h
+    src/models/HardwareProfileModel.cpp
+)
+
+target_include_directories(HardwareProfileModelTest PRIVATE src)
+
+target_link_libraries(HardwareProfileModelTest PRIVATE
+    Qt6::Core
+    Qt6::Test
+)
+
+add_test(NAME HardwareProfileModelTest COMMAND HardwareProfileModelTest)
+
+# The hardware profile dialog tests are QWidget tests (QTEST_MAIN);
+# the offscreen platform keeps them headless on every CI platform.
+add_executable(HardwareProfileDialogTest
+    tests/HardwareProfileDialogTest.cpp
+    src/EntrySnapshot.h
+    src/HardwareSnapshot.h
+    src/HardwareProfileDelegate.h
+    src/HardwareProfileDelegate.cpp
+    src/HardwareProfileDialog.h
+    src/HardwareProfileDialog.cpp
+    src/models/HardwareProfileModel.h
+    src/models/HardwareProfileModel.cpp
+)
+
+target_include_directories(HardwareProfileDialogTest PRIVATE src)
+
+target_link_libraries(HardwareProfileDialogTest PRIVATE
+    Qt6::Widgets
+    Qt6::Test
+)
+
+add_test(NAME HardwareProfileDialogTest COMMAND HardwareProfileDialogTest)
+set_tests_properties(HardwareProfileDialogTest PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+)
+
 # The worker test drives the real Rust backend through the CXX
 # bridge, so it links the staticlib exactly like the application.
 add_executable(BackendWorkerTest
@@ -319,6 +364,7 @@ add_executable(BackendWorkerTest
     src/HierarchySnapshot.h
     src/InspectorSnapshot.h
     src/EntrySnapshot.h
+    src/HardwareSnapshot.h
     src/BackendWorker.h
     src/BackendWorker.cpp
     "${SW_GENERATED_SOURCE}"
@@ -369,6 +415,7 @@ set_tests_properties(InspectorWidgetTest PROPERTIES
 add_executable(EntryBrowserWidgetTest
     tests/EntryBrowserWidgetTest.cpp
     src/EntrySnapshot.h
+    src/HardwareSnapshot.h
     src/ByteFormat.h
     src/EntryBrowserWidget.h
     src/EntryBrowserWidget.cpp
@@ -397,11 +444,16 @@ add_executable(MainWindowSearchTest
     src/HierarchySnapshot.h
     src/InspectorSnapshot.h
     src/EntrySnapshot.h
+    src/HardwareSnapshot.h
     src/ByteFormat.h
     src/InspectorWidget.h
     src/InspectorWidget.cpp
     src/EntryBrowserWidget.h
     src/EntryBrowserWidget.cpp
+    src/HardwareProfileDelegate.h
+    src/HardwareProfileDelegate.cpp
+    src/HardwareProfileDialog.h
+    src/HardwareProfileDialog.cpp
     src/MainWindow.h
     src/MainWindow.cpp
     src/BackendWorker.h
@@ -410,6 +462,8 @@ add_executable(MainWindowSearchTest
     src/models/DistributionTreeModel.cpp
     src/models/EntryTableModel.h
     src/models/EntryTableModel.cpp
+    src/models/HardwareProfileModel.h
+    src/models/HardwareProfileModel.cpp
     "${SW_GENERATED_SOURCE}"
 )
 
@@ -430,5 +484,57 @@ endif()
 
 add_test(NAME MainWindowSearchTest COMMAND MainWindowSearchTest)
 set_tests_properties(MainWindowSearchTest PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+)
+
+# The main-window hardware tests are QWidget tests (QTEST_MAIN)
+# driving the real backend through the worker thread, so they link
+# the staticlib exactly like the application; the offscreen platform
+# keeps them headless on every CI platform.
+add_executable(MainWindowHardwareTest
+    tests/MainWindowHardwareTest.cpp
+    src/HierarchySnapshot.h
+    src/InspectorSnapshot.h
+    src/EntrySnapshot.h
+    src/HardwareSnapshot.h
+    src/ByteFormat.h
+    src/InspectorWidget.h
+    src/InspectorWidget.cpp
+    src/EntryBrowserWidget.h
+    src/EntryBrowserWidget.cpp
+    src/HardwareProfileDelegate.h
+    src/HardwareProfileDelegate.cpp
+    src/HardwareProfileDialog.h
+    src/HardwareProfileDialog.cpp
+    src/MainWindow.h
+    src/MainWindow.cpp
+    src/BackendWorker.h
+    src/BackendWorker.cpp
+    src/models/DistributionTreeModel.h
+    src/models/DistributionTreeModel.cpp
+    src/models/EntryTableModel.h
+    src/models/EntryTableModel.cpp
+    src/models/HardwareProfileModel.h
+    src/models/HardwareProfileModel.cpp
+    "${SW_GENERATED_SOURCE}"
+)
+
+target_include_directories(MainWindowHardwareTest PRIVATE src "${SW_GENERATED_DIR}")
+
+add_dependencies(MainWindowHardwareTest sw_gui_bridge_staticlib)
+
+target_link_libraries(MainWindowHardwareTest PRIVATE
+    Qt6::Widgets
+    Qt6::Test
+    sw_gui_bridge
+    ${SW_NATIVE_LIBS}
+)
+
+if(SW_NATIVE_LIB_DIRS)
+    target_link_directories(MainWindowHardwareTest PRIVATE ${SW_NATIVE_LIB_DIRS})
+endif()
+
+add_test(NAME MainWindowHardwareTest COMMAND MainWindowHardwareTest)
+set_tests_properties(MainWindowHardwareTest PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
 )

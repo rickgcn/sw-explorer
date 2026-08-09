@@ -39,6 +39,17 @@ private slots:
     void searchWithoutDistributionFails();
     void candidateSearchIsNotQueryable();
     void searchResultKeysResolveEntryDetail();
+    void hardwareCandidatesRoundTrip();
+    void hardwareCandidatesWithoutDistributionFail();
+    void candidateHardwareQueriesAreNotQueryable();
+    void pendingCandidateKeepsCommittedHardwareAnswers();
+    void selectionRoundTripsSnapshot();
+    void selectionMultiValuedProfileReachesRust();
+    void selectionUnknownAttributePassesThrough();
+    void selectionEmptyValuePassesThrough();
+    void selectionRejectsEmptyAttributeName();
+    void selectionWithoutDistributionFails();
+    void selectionKeysResolveEntryDetail();
 };
 
 namespace {
@@ -95,6 +106,55 @@ bool writeGammaDist(QTemporaryDir &dir)
     return true;
 }
 
+// One product `hw` whose records exercise mach-specific selection,
+// mach-less fallback, a multi-value CPUARCH conflict, an unknown
+// attribute and an unparseable payload. Object ids: 1 = product `hw`,
+// 2 = image `hw.sw`, 3 = `unix`.
+bool writeHardwareDist(QTemporaryDir &dir)
+{
+    QFile idb(dir.filePath(QStringLiteral("hw.idb")));
+    if (!idb.open(QIODevice::WriteOnly)) {
+        return false;
+    }
+    idb.write(
+        "f 0755 root sys usr/bin/plain src/plain hw.sw.unix sum(1) size(10) cmpsize(0)\n"
+        "f 0755 root sys usr/bin/board src/board hw.sw.unix sum(1) size(10) cmpsize(0) mach(CPUBOARD=IP22)\n"
+        "f 0644 root sys usr/lib/dup src/dup1 hw.sw.unix sum(1) size(10) cmpsize(0) mach(CPUBOARD=IP22)\n"
+        "f 0644 root sys usr/lib/dup src/dup2 hw.sw.unix sum(1) size(10) cmpsize(0)\n"
+        "f 0644 root sys usr/lib/conf src/conf4 hw.sw.unix sum(1) size(10) cmpsize(0) mach(CPUARCH=R4000)\n"
+        "f 0644 root sys usr/lib/conf src/conf5 hw.sw.unix sum(1) size(10) cmpsize(0) mach(CPUARCH=R5000)\n"
+        "f 0755 root sys usr/bin/frob src/frob hw.sw.unix sum(1) size(10) cmpsize(0) mach(FROBNICATE=YES)\n"
+        "f 0644 root sys usr/lib/broken src/broken hw.sw.unix sum(1) size(10) cmpsize(0) mach(=GARBAGE)\n");
+    return true;
+}
+
+// One product `gfx` with a mach-less record and one record restricted
+// to headless boards through `mach(GFXBOARD=)` — the empty right-hand
+// side real media carry. Object ids: 1 = product `gfx`, 2 = `gfx.sw`,
+// 3 = `unix`.
+bool writeEmptyValueHardwareDist(QTemporaryDir &dir)
+{
+    QFile idb(dir.filePath(QStringLiteral("gfx.idb")));
+    if (!idb.open(QIODevice::WriteOnly)) {
+        return false;
+    }
+    idb.write(
+        "f 0755 root sys usr/bin/any src/any gfx.sw.unix sum(1) size(10) cmpsize(0)\n"
+        "f 0755 root sys usr/bin/headless src/headless gfx.sw.unix sum(1) size(10) cmpsize(0) mach(GFXBOARD=)\n");
+    return true;
+}
+
+// "productId/entryId" per key, for readable QCOMPARE diffs.
+QStringList keyTexts(const QList<EntryKey> &keys)
+{
+    QStringList out;
+    out.reserve(keys.size());
+    for (const EntryKey &key : keys) {
+        out.append(QStringLiteral("%1/%2").arg(key.productId).arg(key.entryId));
+    }
+    return out;
+}
+
 } // namespace
 
 void BackendWorkerTest::initTestCase()
@@ -106,6 +166,9 @@ void BackendWorkerTest::initTestCase()
     qRegisterMetaType<SubsystemDetailSnapshot>("SubsystemDetailSnapshot");
     qRegisterMetaType<EntryListSnapshot>("EntryListSnapshot");
     qRegisterMetaType<EntryDetailSnapshot>("EntryDetailSnapshot");
+    qRegisterMetaType<HardwareProfileSnapshot>("HardwareProfileSnapshot");
+    qRegisterMetaType<HardwareCandidatesSnapshot>("HardwareCandidatesSnapshot");
+    qRegisterMetaType<SelectionSnapshot>("SelectionSnapshot");
 }
 
 void BackendWorkerTest::candidateCarriesHierarchySnapshot()
@@ -776,6 +839,283 @@ void BackendWorkerTest::searchResultKeysResolveEntryDetail()
     const auto second = qvariant_cast<EntryDetailSnapshot>(detailSpy.at(1).at(1));
     QCOMPARE(second.path, QStringLiteral("usr/bin/Xsgi"));
     QCOMPARE(second.subsystem, QStringLiteral("beta.sw.unix"));
+}
+
+void BackendWorkerTest::hardwareCandidatesRoundTrip()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeHardwareDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy readySpy(&worker, &BackendWorker::hardwareCandidatesReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::hardwareCandidatesFailed);
+
+    worker.hardwareCandidatesRequested(120);
+    QCOMPARE(failSpy.count(), 0);
+    QCOMPARE(readySpy.count(), 1);
+    QCOMPARE(readySpy.first().at(0).toULongLong(), 120);
+
+    const auto candidates =
+        qvariant_cast<HardwareCandidatesSnapshot>(readySpy.first().at(1));
+    QCOMPARE(candidates.size(), 3);
+    // Entry MACH candidates, in IDB first-appearance order; the
+    // unknown attribute is preserved verbatim; the unparseable
+    // payload contributes nothing.
+    QCOMPARE(candidates.at(0).attribute, QStringLiteral("CPUBOARD"));
+    QCOMPARE(candidates.at(0).values, QStringList{QStringLiteral("IP22")});
+    QCOMPARE(candidates.at(1).attribute, QStringLiteral("CPUARCH"));
+    QCOMPARE(candidates.at(1).values,
+             (QStringList{QStringLiteral("R4000"), QStringLiteral("R5000")}));
+    QCOMPARE(candidates.at(2).attribute, QStringLiteral("FROBNICATE"));
+    QCOMPARE(candidates.at(2).values, QStringList{QStringLiteral("YES")});
+}
+
+void BackendWorkerTest::hardwareCandidatesWithoutDistributionFail()
+{
+    BackendWorker worker;
+    QSignalSpy readySpy(&worker, &BackendWorker::hardwareCandidatesReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::hardwareCandidatesFailed);
+
+    worker.hardwareCandidatesRequested(121);
+    QCOMPARE(readySpy.count(), 0);
+    QCOMPARE(failSpy.count(), 1);
+    QCOMPARE(failSpy.first().at(0).toULongLong(), 121);
+    QCOMPARE(failSpy.first().at(1).toString(), QStringLiteral("no distribution loaded"));
+}
+
+void BackendWorkerTest::candidateHardwareQueriesAreNotQueryable()
+{
+    // A pending candidate is never queried: with no committed
+    // backend at all, hardware queries fail like any other query.
+    QTemporaryDir dir;
+    QVERIFY(writeHardwareDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+
+    QSignalSpy candidatesFailSpy(&worker, &BackendWorker::hardwareCandidatesFailed);
+    QSignalSpy selectionFailSpy(&worker, &BackendWorker::selectionFailed);
+
+    worker.hardwareCandidatesRequested(122);
+    QCOMPARE(candidatesFailSpy.count(), 1);
+    QCOMPARE(candidatesFailSpy.first().at(1).toString(),
+             QStringLiteral("no distribution loaded"));
+
+    worker.selectionRequested(123, {{QStringLiteral("CPUBOARD"), QStringLiteral("IP22")}});
+    QCOMPARE(selectionFailSpy.count(), 1);
+    QCOMPARE(selectionFailSpy.first().at(1).toString(),
+             QStringLiteral("no distribution loaded"));
+}
+
+void BackendWorkerTest::pendingCandidateKeepsCommittedHardwareAnswers()
+{
+    QTemporaryDir dirA;
+    QVERIFY(writeHardwareDist(dirA));
+    QTemporaryDir dirB;
+    QVERIFY(writeGammaDist(dirB));
+
+    BackendWorker worker;
+    worker.openDistribution(dirA.path());
+    worker.commitCandidate();
+
+    // A pending candidate B stays invisible: both hardware queries
+    // keep answering with the committed A.
+    worker.openDistribution(dirB.path());
+
+    QSignalSpy candidatesSpy(&worker, &BackendWorker::hardwareCandidatesReady);
+    QSignalSpy selectionSpy(&worker, &BackendWorker::selectionReady);
+
+    worker.hardwareCandidatesRequested(124);
+    QCOMPARE(candidatesSpy.count(), 1);
+    QCOMPARE(qvariant_cast<HardwareCandidatesSnapshot>(candidatesSpy.first().at(1)).size(), 3);
+
+    worker.selectionRequested(125, {{QStringLiteral("CPUBOARD"), QStringLiteral("IP22")}});
+    QCOMPARE(selectionSpy.count(), 1);
+    auto selection = qvariant_cast<SelectionSnapshot>(selectionSpy.first().at(1));
+    QCOMPARE(selection.selected.size(), 3);
+    QVERIFY(selection.selected.at(0).productId == 1);
+
+    // After the commit the same queries see B.
+    worker.commitCandidate();
+    worker.hardwareCandidatesRequested(126);
+    QCOMPARE(candidatesSpy.count(), 2);
+    QVERIFY(qvariant_cast<HardwareCandidatesSnapshot>(candidatesSpy.at(1).at(1)).isEmpty());
+
+    worker.selectionRequested(127, {{QStringLiteral("CPUBOARD"), QStringLiteral("IP22")}});
+    QCOMPARE(selectionSpy.count(), 2);
+    selection = qvariant_cast<SelectionSnapshot>(selectionSpy.at(1).at(1));
+    QCOMPARE(selection.selected.size(), 1);
+}
+
+void BackendWorkerTest::selectionRoundTripsSnapshot()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeHardwareDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy readySpy(&worker, &BackendWorker::selectionReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::selectionFailed);
+
+    worker.selectionRequested(130, {{QStringLiteral("CPUBOARD"), QStringLiteral("IP22")}});
+    QCOMPARE(failSpy.count(), 0);
+    QCOMPARE(readySpy.count(), 1);
+    QCOMPARE(readySpy.first().at(0).toULongLong(), 130);
+
+    const auto selection = qvariant_cast<SelectionSnapshot>(readySpy.first().at(1));
+    // The plain fallback, the IP22 entry and the IP22-specific
+    // duplicate; the unparsed record conflicts but is not selected.
+    QCOMPARE(keyTexts(selection.selected),
+             (QStringList{QStringLiteral("1/0"), QStringLiteral("1/1"), QStringLiteral("1/2")}));
+    QCOMPARE(selection.conflicts.size(), 1);
+    QCOMPARE(selection.conflicts.at(0).path, QStringLiteral("usr/lib/broken"));
+    QCOMPARE(keyTexts(selection.conflicts.at(0).candidates),
+             QStringList{QStringLiteral("1/7")});
+}
+
+void BackendWorkerTest::selectionMultiValuedProfileReachesRust()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeHardwareDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy readySpy(&worker, &BackendWorker::selectionReady);
+
+    // One attribute carried by two pairs: both CPUARCH-specific
+    // records match, so both are selected and the path conflicts.
+    worker.selectionRequested(131,
+                              {{QStringLiteral("CPUARCH"), QStringLiteral("R4000")},
+                               {QStringLiteral("CPUARCH"), QStringLiteral("R5000")}});
+    QCOMPARE(readySpy.count(), 1);
+    const auto selection = qvariant_cast<SelectionSnapshot>(readySpy.first().at(1));
+    QVERIFY(selection.selected.contains({1, 4}));
+    QVERIFY(selection.selected.contains({1, 5}));
+    QCOMPARE(selection.conflicts.size(), 2);
+    QCOMPARE(selection.conflicts.at(0).path, QStringLiteral("usr/lib/conf"));
+    QCOMPARE(keyTexts(selection.conflicts.at(0).candidates),
+             (QStringList{QStringLiteral("1/4"), QStringLiteral("1/5")}));
+}
+
+void BackendWorkerTest::selectionUnknownAttributePassesThrough()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeHardwareDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy readySpy(&worker, &BackendWorker::selectionReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::selectionFailed);
+
+    // An unknown attribute is not whitelisted away: it reaches the
+    // core profile and selects the FROBNICATE record.
+    worker.selectionRequested(132, {{QStringLiteral("FROBNICATE"), QStringLiteral("YES")}});
+    QCOMPARE(failSpy.count(), 0);
+    QCOMPARE(readySpy.count(), 1);
+    const auto selection = qvariant_cast<SelectionSnapshot>(readySpy.first().at(1));
+    QVERIFY(selection.selected.contains({1, 6}));
+    QVERIFY(!selection.selected.contains({1, 1}));
+}
+
+void BackendWorkerTest::selectionEmptyValuePassesThrough()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeEmptyValueHardwareDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy readySpy(&worker, &BackendWorker::selectionReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::selectionFailed);
+
+    // The empty value is a genuine hardware fact: it reaches the core
+    // profile untouched and selects the `GFXBOARD=` record.
+    worker.selectionRequested(136, {{QStringLiteral("GFXBOARD"), QString()}});
+    QCOMPARE(failSpy.count(), 0);
+    QCOMPARE(readySpy.count(), 1);
+    auto selection = qvariant_cast<SelectionSnapshot>(readySpy.first().at(1));
+    QVERIFY(selection.selected.contains({1, 0}));
+    QVERIFY(selection.selected.contains({1, 1}));
+
+    // A non-empty value rejects the headless record; the mach-less
+    // one is selected either way.
+    worker.selectionRequested(137, {{QStringLiteral("GFXBOARD"), QStringLiteral("EXPRESS")}});
+    QCOMPARE(readySpy.count(), 2);
+    selection = qvariant_cast<SelectionSnapshot>(readySpy.at(1).at(1));
+    QVERIFY(selection.selected.contains({1, 0}));
+    QVERIFY(!selection.selected.contains({1, 1}));
+}
+
+void BackendWorkerTest::selectionRejectsEmptyAttributeName()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeHardwareDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy readySpy(&worker, &BackendWorker::selectionReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::selectionFailed);
+
+    worker.selectionRequested(133, {{QString(), QStringLiteral("IP22")}});
+    QCOMPARE(failSpy.count(), 1);
+    QCOMPARE(failSpy.first().at(1).toString(),
+             QStringLiteral("hardware attribute name is empty"));
+    QCOMPARE(readySpy.count(), 0);
+}
+
+void BackendWorkerTest::selectionWithoutDistributionFails()
+{
+    BackendWorker worker;
+    QSignalSpy failSpy(&worker, &BackendWorker::selectionFailed);
+
+    worker.selectionRequested(135, {{QStringLiteral("CPUBOARD"), QStringLiteral("IP22")}});
+    QCOMPARE(failSpy.count(), 1);
+    QCOMPARE(failSpy.first().at(0).toULongLong(), 135);
+    QCOMPARE(failSpy.first().at(1).toString(), QStringLiteral("no distribution loaded"));
+}
+
+void BackendWorkerTest::selectionKeysResolveEntryDetail()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeHardwareDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy readySpy(&worker, &BackendWorker::selectionReady);
+    QSignalSpy detailSpy(&worker, &BackendWorker::entryDetailReady);
+    QSignalSpy detailFailSpy(&worker, &BackendWorker::detailFailed);
+
+    worker.selectionRequested(140, {{QStringLiteral("CPUBOARD"), QStringLiteral("IP22")}});
+    QCOMPARE(readySpy.count(), 1);
+    const auto selection = qvariant_cast<SelectionSnapshot>(readySpy.first().at(1));
+
+    // Every selected and conflicted key feeds the inspector query
+    // directly, including entry id 0.
+    QList<EntryKey> keys = selection.selected;
+    for (const SelectionConflictSnapshot &conflict : selection.conflicts) {
+        keys.append(conflict.candidates);
+    }
+    for (qsizetype i = 0; i < keys.size(); ++i) {
+        worker.entryDetailRequested(141 + i, keys.at(i).productId, keys.at(i).entryId);
+    }
+    QCOMPARE(detailFailSpy.count(), 0);
+    QCOMPARE(detailSpy.count(), keys.size());
+    QCOMPARE(qvariant_cast<EntryDetailSnapshot>(detailSpy.first().at(1)).path,
+             QStringLiteral("usr/bin/plain"));
 }
 
 QTEST_GUILESS_MAIN(BackendWorkerTest)

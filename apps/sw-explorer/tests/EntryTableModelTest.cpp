@@ -20,6 +20,15 @@ private slots:
     void duplicatePathsStaySeparateRows();
     void resetReplacesRows();
     void duplicateEntryKeysRejectTheSnapshot();
+    void statusColumnHeader();
+    void inactiveOverlayReportsNoStatus();
+    void fourSelectionStates();
+    void selectionStatusToolTips();
+    void overlayNeverResetsRowsOrOrder();
+    void replacingOverlayChangesOnlyStatuses();
+    void clearedOverlayReportsNoStatus();
+    void entriesReloadPicksUpCurrentOverlay();
+    void duplicatePathsKeepIndividualStatuses();
 };
 
 namespace {
@@ -261,6 +270,236 @@ void EntryTableModelTest::duplicateEntryKeysRejectTheSnapshot()
              QStringLiteral("a"));
 }
 
+void EntryTableModelTest::statusColumnHeader()
+{
+    EntryTableModel model;
+    QCOMPARE(model.headerData(EntryTableModel::StatusColumn, Qt::Horizontal).toString(),
+             QStringLiteral("Status"));
+    QCOMPARE(model.columnCount(), 7);
+}
+
+void EntryTableModelTest::inactiveOverlayReportsNoStatus()
+{
+    EntryTableModel model;
+    QVERIFY(model.setEntries({makeEntry(1, 0, QStringLiteral("a"), QStringLiteral("p.sw.s"))}));
+
+    QVERIFY(!model.hasSelectionOverlay());
+    QCOMPARE(model.statusForKey({1, 0}), EntrySelectionStatus::NotSelected);
+    // Without an overlay the Status column displays nothing at all.
+    QVERIFY(!model.data(model.index(0, EntryTableModel::StatusColumn)).isValid());
+    QVERIFY(
+        !model.data(model.index(0, EntryTableModel::StatusColumn), Qt::ToolTipRole).isValid());
+    QCOMPARE(model.selectedRowCount(), 0);
+    QCOMPARE(model.conflictedRowCount(), 0);
+}
+
+void EntryTableModelTest::fourSelectionStates()
+{
+    // The four states are pure set membership: selected = {A, B},
+    // conflict candidates = {B, C}.
+    EntryTableModel model;
+    QVERIFY(model.setEntries({makeEntry(1, 0, QStringLiteral("a"), QStringLiteral("p.sw.s")),
+                              makeEntry(1, 1, QStringLiteral("b"), QStringLiteral("p.sw.s")),
+                              makeEntry(1, 2, QStringLiteral("c"), QStringLiteral("p.sw.s")),
+                              makeEntry(1, 3, QStringLiteral("d"), QStringLiteral("p.sw.s"))}));
+
+    SelectionSnapshot selection;
+    selection.selected = {{1, 0}, {1, 1}};
+    selection.conflicts = {{QStringLiteral("usr/lib/foo.so"), {{1, 1}, {1, 2}}}};
+    model.setSelectionOverlay(selection);
+
+    QVERIFY(model.hasSelectionOverlay());
+    QCOMPARE(model.statusForKey({1, 0}), EntrySelectionStatus::Selected);
+    QCOMPARE(model.statusForKey({1, 1}), EntrySelectionStatus::SelectedConflict);
+    QCOMPARE(model.statusForKey({1, 2}), EntrySelectionStatus::Unresolved);
+    QCOMPARE(model.statusForKey({1, 3}), EntrySelectionStatus::NotSelected);
+
+    QCOMPARE(model.data(model.index(0, EntryTableModel::StatusColumn)).toString(),
+             QStringLiteral("Selected"));
+    QCOMPARE(model.data(model.index(1, EntryTableModel::StatusColumn)).toString(),
+             QStringLiteral("Selected / conflict"));
+    QCOMPARE(model.data(model.index(2, EntryTableModel::StatusColumn)).toString(),
+             QStringLiteral("Unresolved"));
+    QCOMPARE(model.data(model.index(3, EntryTableModel::StatusColumn)).toString(),
+             QStringLiteral("Not selected"));
+
+    QCOMPARE(model
+                 .data(model.index(1, EntryTableModel::StatusColumn),
+                       EntryTableModel::SelectionStatusRole)
+                 .toInt(),
+             static_cast<int>(EntrySelectionStatus::SelectedConflict));
+
+    // Footer counters: rows in the selected set, rows in any
+    // conflict's candidate set.
+    QCOMPARE(model.selectedRowCount(), 2);
+    QCOMPARE(model.conflictedRowCount(), 2);
+}
+
+void EntryTableModelTest::selectionStatusToolTips()
+{
+    EntryTableModel model;
+    QVERIFY(model.setEntries({makeEntry(1, 0, QStringLiteral("a"), QStringLiteral("p.sw.s")),
+                              makeEntry(1, 1, QStringLiteral("b"), QStringLiteral("p.sw.s")),
+                              makeEntry(1, 2, QStringLiteral("c"), QStringLiteral("p.sw.s"))}));
+
+    SelectionSnapshot selection;
+    selection.selected = {{1, 0}, {1, 1}};
+    selection.conflicts = {{QStringLiteral("usr/lib/foo.so"), {{1, 1}, {1, 2}}}};
+    model.setSelectionOverlay(selection);
+
+    const auto tip = [&model](int row) {
+        return model.data(model.index(row, EntryTableModel::StatusColumn), Qt::ToolTipRole)
+            .toString();
+    };
+    QVERIFY(tip(0).contains(QStringLiteral("is selected for the current hardware profile")));
+    QVERIFY(!tip(0).contains(QStringLiteral("conflict")));
+    QVERIFY(tip(1).contains(QStringLiteral("usr/lib/foo.so")));
+    QVERIFY(tip(1).contains(QStringLiteral("is selected")));
+    QVERIFY(tip(2).contains(QStringLiteral("usr/lib/foo.so")));
+    QVERIFY(tip(2).contains(QStringLiteral("not selected")));
+}
+
+void EntryTableModelTest::overlayNeverResetsRowsOrOrder()
+{
+    EntryTableModel model;
+    QVERIFY(model.setEntries({makeEntry(1, 0, QStringLiteral("a"), QStringLiteral("p.sw.s")),
+                              makeEntry(1, 1, QStringLiteral("b"), QStringLiteral("p.sw.s")),
+                              makeEntry(1, 2, QStringLiteral("c"), QStringLiteral("p.sw.s"))}));
+
+    const auto shape = [&model] {
+        QStringList rows;
+        for (int row = 0; row < model.rowCount(); ++row) {
+            const EntryKey key = model.entryKey(model.index(row, 0));
+            rows.append(QStringLiteral("%1/%2:%3")
+                            .arg(key.productId)
+                            .arg(key.entryId)
+                            .arg(model.data(model.index(row, EntryTableModel::PathColumn))
+                                     .toString()));
+        }
+        return rows;
+    };
+    const QStringList before = shape();
+
+    // Applying the overlay emits no reset and changes nothing but
+    // the Status column.
+    QSignalSpy resetSpy(&model, &QAbstractItemModel::modelReset);
+    QSignalSpy changedSpy(&model, &QAbstractItemModel::dataChanged);
+    SelectionSnapshot selection;
+    selection.selected = {{1, 0}, {1, 1}, {1, 2}};
+    model.setSelectionOverlay(selection);
+    QCOMPARE(resetSpy.count(), 0);
+    QCOMPARE(changedSpy.count(), 1);
+    QCOMPARE(changedSpy.first().at(0).toModelIndex().column(), EntryTableModel::StatusColumn);
+    QCOMPARE(changedSpy.first().at(1).toModelIndex().column(), EntryTableModel::StatusColumn);
+    QCOMPARE(shape(), before);
+
+    // Selected rows are never moved up and unselected rows are never
+    // hidden.
+    selection.selected = {{1, 2}};
+    model.setSelectionOverlay(selection);
+    QCOMPARE(resetSpy.count(), 0);
+    QCOMPARE(shape(), before);
+    QCOMPARE(model.data(model.index(2, EntryTableModel::StatusColumn)).toString(),
+             QStringLiteral("Selected"));
+    QCOMPARE(model.data(model.index(0, EntryTableModel::StatusColumn)).toString(),
+             QStringLiteral("Not selected"));
+
+    model.clearSelectionOverlay();
+    QCOMPARE(resetSpy.count(), 0);
+    QCOMPARE(shape(), before);
+}
+
+void EntryTableModelTest::replacingOverlayChangesOnlyStatuses()
+{
+    EntryTableModel model;
+    QVERIFY(model.setEntries({makeEntry(1, 0, QStringLiteral("a"), QStringLiteral("p.sw.s")),
+                              makeEntry(1, 1, QStringLiteral("b"), QStringLiteral("p.sw.s"))}));
+
+    SelectionSnapshot first;
+    first.selected = {{1, 0}};
+    model.setSelectionOverlay(first);
+    QCOMPARE(model.statusForKey({1, 0}), EntrySelectionStatus::Selected);
+    QCOMPARE(model.statusForKey({1, 1}), EntrySelectionStatus::NotSelected);
+
+    SelectionSnapshot second;
+    second.selected = {{1, 1}};
+    model.setSelectionOverlay(second);
+    QCOMPARE(model.statusForKey({1, 0}), EntrySelectionStatus::NotSelected);
+    QCOMPARE(model.statusForKey({1, 1}), EntrySelectionStatus::Selected);
+    QCOMPARE(model.rowCount(), 2);
+    QCOMPARE(model.selectedRowCount(), 1);
+}
+
+void EntryTableModelTest::clearedOverlayReportsNoStatus()
+{
+    EntryTableModel model;
+    QVERIFY(model.setEntries({makeEntry(1, 0, QStringLiteral("a"), QStringLiteral("p.sw.s"))}));
+
+    SelectionSnapshot selection;
+    selection.selected = {{1, 0}};
+    model.setSelectionOverlay(selection);
+    QVERIFY(model.hasSelectionOverlay());
+
+    model.clearSelectionOverlay();
+    QVERIFY(!model.hasSelectionOverlay());
+    QVERIFY(!model.data(model.index(0, EntryTableModel::StatusColumn)).isValid());
+    QCOMPARE(model.selectedRowCount(), 0);
+    QCOMPARE(model.conflictedRowCount(), 0);
+}
+
+void EntryTableModelTest::entriesReloadPicksUpCurrentOverlay()
+{
+    EntryTableModel model;
+    QVERIFY(model.setEntries({makeEntry(1, 0, QStringLiteral("a"), QStringLiteral("p.sw.s"))}));
+
+    SelectionSnapshot selection;
+    selection.selected = {{1, 0}, {1, 7}};
+    selection.conflicts = {{QStringLiteral("c"), {{1, 3}}}};
+    model.setSelectionOverlay(selection);
+
+    // A new entry list (another scope, a search result) picks the
+    // current overlay up by entry key, with no extra work.
+    QVERIFY(model.setEntries({makeEntry(1, 7, QStringLiteral("x"), QStringLiteral("p.sw.s")),
+                              makeEntry(1, 3, QStringLiteral("y"), QStringLiteral("p.sw.s")),
+                              makeEntry(1, 0, QStringLiteral("z"), QStringLiteral("p.sw.s"))}));
+    QVERIFY(model.hasSelectionOverlay());
+    QCOMPARE(model.statusForKey({1, 7}), EntrySelectionStatus::Selected);
+    QCOMPARE(model.statusForKey({1, 3}), EntrySelectionStatus::Unresolved);
+    QCOMPARE(model.statusForKey({1, 0}), EntrySelectionStatus::Selected);
+    QCOMPARE(model.data(model.index(0, EntryTableModel::StatusColumn)).toString(),
+             QStringLiteral("Selected"));
+    QCOMPARE(model.data(model.index(1, EntryTableModel::StatusColumn)).toString(),
+             QStringLiteral("Unresolved"));
+    QCOMPARE(model.selectedRowCount(), 2);
+    QCOMPARE(model.conflictedRowCount(), 1);
+}
+
+void EntryTableModelTest::duplicatePathsKeepIndividualStatuses()
+{
+    EntryTableModel model;
+    // Two IDB records share one path: each carries its own status.
+    QVERIFY(model.setEntries({makeEntry(1, 0, QStringLiteral("usr/lib/foo.so"),
+                                        QStringLiteral("p.sw.s")),
+                              makeEntry(1, 1, QStringLiteral("usr/lib/foo.so"),
+                                        QStringLiteral("p.sw.s"))}));
+
+    SelectionSnapshot selection;
+    selection.selected = {{1, 0}};
+    model.setSelectionOverlay(selection);
+
+    QCOMPARE(model.rowCount(), 2);
+    QCOMPARE(model.data(model.index(0, EntryTableModel::StatusColumn)).toString(),
+             QStringLiteral("Selected"));
+    QCOMPARE(model.data(model.index(1, EntryTableModel::StatusColumn)).toString(),
+             QStringLiteral("Not selected"));
+    QCOMPARE(model.data(model.index(0, EntryTableModel::PathColumn)).toString(),
+             QStringLiteral("usr/lib/foo.so"));
+    QCOMPARE(model.data(model.index(1, EntryTableModel::PathColumn)).toString(),
+             QStringLiteral("usr/lib/foo.so"));
+}
+
 QTEST_GUILESS_MAIN(EntryTableModelTest)
 
 #include "EntryTableModelTest.moc"
+
+

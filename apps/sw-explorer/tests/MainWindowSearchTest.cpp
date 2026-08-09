@@ -18,6 +18,7 @@
 
 #include "EntryBrowserWidget.h"
 #include "InspectorWidget.h"
+#include "models/EntryTableModel.h"
 
 // Drives the real MainWindow against the real Rust backend (through
 // BackendWorker on its thread) with a synthetic two-product
@@ -342,8 +343,11 @@ void MainWindowSearchTest::differentRowClickExitsSearch()
     QCOMPARE(search->text(), QString());
     QCOMPARE(entriesSpy.count(), 1);
     QCOMPARE(entriesSpy.first().at(1).toULongLong(), 5);
-    QTRY_COMPARE(entryTableOf(window)->model()->index(0, 0).data().toString(),
-                 QStringLiteral("usr/bin/Xsgi"));
+    QTRY_COMPARE(entryTableOf(window)->model()
+                      ->index(0, EntryTableModel::PathColumn)
+                      .data()
+                      .toString(),
+             QStringLiteral("usr/bin/Xsgi"));
     QCOMPARE(entryTableOf(window)->model()->rowCount(), 1);
     QCOMPARE(labelOf(window, QStringLiteral("scopeLabel"))->text(), QStringLiteral("beta"));
 }
@@ -409,7 +413,10 @@ void MainWindowSearchTest::staleEntriesResponseIsDropped()
     QVERIFY(invoked);
 
     QCOMPARE(entryTableOf(window)->model()->rowCount(), 1);
-    QCOMPARE(entryTableOf(window)->model()->index(0, 0).data().toString(),
+    QCOMPARE(entryTableOf(window)->model()
+                      ->index(0, EntryTableModel::PathColumn)
+                      .data()
+                      .toString(),
              QStringLiteral("usr/lib/libGL.so"));
     QCOMPARE(labelOf(window, QStringLiteral("countLabel"))->text(),
              QStringLiteral("1 entries"));
@@ -432,7 +439,8 @@ void MainWindowSearchTest::searchResultClickShowsInspector()
     // as a hierarchy scope row.
     QTableView *table = entryTableOf(window);
     QTest::mouseClick(table->viewport(), Qt::LeftButton, Qt::NoModifier,
-                      table->visualRect(table->model()->index(0, 0)).center());
+                      table->visualRect(table->model()->index(0, EntryTableModel::PathColumn))
+                          .center());
 
     auto *inspector = window.findChild<InspectorWidget *>();
     QTRY_VERIFY(inspector->findChild<QScrollArea *>(QStringLiteral("entryPage")) != nullptr);
@@ -455,7 +463,8 @@ void MainWindowSearchTest::queryChangeInvalidatesInspector()
 
     QTableView *table = entryTableOf(window);
     QTest::mouseClick(table->viewport(), Qt::LeftButton, Qt::NoModifier,
-                      table->visualRect(table->model()->index(0, 0)).center());
+                      table->visualRect(table->model()->index(0, EntryTableModel::PathColumn))
+                          .center());
     auto *inspector = window.findChild<InspectorWidget *>();
     QTRY_VERIFY(inspector->findChild<QScrollArea *>(QStringLiteral("entryPage")) != nullptr);
 
@@ -482,7 +491,8 @@ void MainWindowSearchTest::failedOpenKeepsSearchState()
     QTRY_COMPARE(entryTableOf(window)->model()->rowCount(), 1);
     QTableView *table = entryTableOf(window);
     QTest::mouseClick(table->viewport(), Qt::LeftButton, Qt::NoModifier,
-                      table->visualRect(table->model()->index(0, 0)).center());
+                      table->visualRect(table->model()->index(0, EntryTableModel::PathColumn))
+                          .center());
     auto *inspector = window.findChild<InspectorWidget *>();
     QTRY_VERIFY(inspector->findChild<QScrollArea *>(QStringLiteral("entryPage")) != nullptr);
 
@@ -511,7 +521,10 @@ void MainWindowSearchTest::failedOpenKeepsSearchState()
     QCOMPARE(search->text(), QStringLiteral("libGL"));
     QVERIFY(search->isEnabled());
     QCOMPARE(table->model()->rowCount(), 1);
-    QCOMPARE(table->model()->index(0, 0).data().toString(),
+    QCOMPARE(table->model()
+                      ->index(0, EntryTableModel::PathColumn)
+                      .data()
+                      .toString(),
              QStringLiteral("usr/lib/libGL.so"));
     QCOMPARE(labelOf(window, QStringLiteral("scopeLabel"))->text(),
              QStringLiteral("Search: libGL"));
@@ -552,8 +565,11 @@ void MainWindowSearchTest::successfulReopenClearsSearchState()
 
     // The committed backend serves the new distribution.
     search->setText(QStringLiteral("gamma"));
-    QTRY_COMPARE(entryTableOf(window)->model()->index(0, 0).data().toString(),
-                 QStringLiteral("usr/bin/gamma"));
+    QTRY_COMPARE(entryTableOf(window)->model()
+                      ->index(0, EntryTableModel::PathColumn)
+                      .data()
+                      .toString(),
+             QStringLiteral("usr/bin/gamma"));
     QCOMPARE(entryTableOf(window)->model()->rowCount(), 1);
 }
 

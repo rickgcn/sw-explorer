@@ -24,6 +24,10 @@ private slots:
     void reloadDoesNotEmitSelection();
     void invalidSnapshotShowsError();
     void successfulReloadRecoversFromError();
+    void statusColumnStaysHiddenWithoutOverlay();
+    void overlayShowsStatusColumnAndFooterCounts();
+    void clearedOverlayHidesStatusColumn();
+    void reloadKeepsOverlayAndSelection();
 };
 
 namespace {
@@ -187,6 +191,96 @@ void EntryBrowserWidgetTest::successfulReloadRecoversFromError()
     QCOMPARE(currentPageName(widget), QStringLiteral("tablePage"));
     QCOMPARE(widget.findChild<QLabel *>(QStringLiteral("countLabel"))->text(),
              QStringLiteral("2 entries"));
+}
+
+void EntryBrowserWidgetTest::statusColumnStaysHiddenWithoutOverlay()
+{
+    EntryBrowserWidget widget;
+    auto *table = widget.findChild<QTableView *>(QStringLiteral("entryTable"));
+    QVERIFY(table->isColumnHidden(EntryTableModel::StatusColumn));
+
+    widget.showEntries(twoEntries());
+    // No hardware profile: rows carry no status and the column stays
+    // hidden.
+    QVERIFY(table->isColumnHidden(EntryTableModel::StatusColumn));
+    QCOMPARE(widget.findChild<QLabel *>(QStringLiteral("countLabel"))->text(),
+             QStringLiteral("2 entries"));
+}
+
+void EntryBrowserWidgetTest::overlayShowsStatusColumnAndFooterCounts()
+{
+    EntryBrowserWidget widget;
+    widget.showEntries(twoEntries());
+
+    // One selected row, one selected-and-conflicted row.
+    SelectionSnapshot selection;
+    selection.selected = {{1, 0}, {1, 1}};
+    selection.conflicts = {{QStringLiteral("usr/lib/libGL.so"), {{1, 1}}}};
+    widget.setSelectionOverlay(selection);
+
+    auto *table = widget.findChild<QTableView *>(QStringLiteral("entryTable"));
+    QVERIFY(!table->isColumnHidden(EntryTableModel::StatusColumn));
+    QCOMPARE(table->model()->rowCount(), 2);
+    QCOMPARE(table->model()->index(0, EntryTableModel::StatusColumn).data().toString(),
+             QStringLiteral("Selected"));
+    QCOMPARE(table->model()->index(1, EntryTableModel::StatusColumn).data().toString(),
+             QStringLiteral("Selected / conflict"));
+    QCOMPARE(widget.findChild<QLabel *>(QStringLiteral("countLabel"))->text(),
+             QStringLiteral("2 entries · 2 selected · 1 conflicted records"));
+}
+
+void EntryBrowserWidgetTest::clearedOverlayHidesStatusColumn()
+{
+    EntryBrowserWidget widget;
+    widget.showEntries(twoEntries());
+
+    SelectionSnapshot selection;
+    selection.selected = {{1, 0}};
+    widget.setSelectionOverlay(selection);
+    auto *table = widget.findChild<QTableView *>(QStringLiteral("entryTable"));
+    QVERIFY(!table->isColumnHidden(EntryTableModel::StatusColumn));
+
+    widget.clearSelectionOverlay();
+    QVERIFY(table->isColumnHidden(EntryTableModel::StatusColumn));
+    QCOMPARE(table->model()->rowCount(), 2);
+    QCOMPARE(widget.findChild<QLabel *>(QStringLiteral("countLabel"))->text(),
+             QStringLiteral("2 entries"));
+}
+
+void EntryBrowserWidgetTest::reloadKeepsOverlayAndSelection()
+{
+    EntryBrowserWidget widget;
+    widget.showEntries(twoEntries());
+
+    SelectionSnapshot selection;
+    selection.selected = {{1, 0}, {1, 1}};
+    selection.conflicts = {{QStringLiteral("usr/lib/libGL.so"), {{1, 1}}}};
+    widget.setSelectionOverlay(selection);
+
+    auto *table = widget.findChild<QTableView *>(QStringLiteral("entryTable"));
+    qRegisterMetaType<quint64>("quint64");
+    QSignalSpy spy(&widget, &EntryBrowserWidget::entrySelected);
+    table->setCurrentIndex(table->model()->index(0, 0));
+    QCOMPARE(spy.count(), 1);
+
+    // Reapplying the overlay is a data change, not a reset: the row
+    // selection survives.
+    widget.setSelectionOverlay(selection);
+    QVERIFY(table->selectionModel()->currentIndex().isValid());
+    QCOMPARE(table->selectionModel()->currentIndex().row(), 0);
+    QCOMPARE(spy.count(), 1);
+
+    // A files reload keeps the overlay: the new rows pick their
+    // status up by entry key, and the footer stays in selection mode.
+    widget.showEntries({makeEntry(1, 1, QStringLiteral("usr/lib/libGL.so")),
+                        makeEntry(1, 2, QStringLiteral("usr/lib/other.so"))});
+    QVERIFY(!table->isColumnHidden(EntryTableModel::StatusColumn));
+    QCOMPARE(table->model()->index(0, EntryTableModel::StatusColumn).data().toString(),
+             QStringLiteral("Selected / conflict"));
+    QCOMPARE(table->model()->index(1, EntryTableModel::StatusColumn).data().toString(),
+             QStringLiteral("Not selected"));
+    QCOMPARE(widget.findChild<QLabel *>(QStringLiteral("countLabel"))->text(),
+             QStringLiteral("2 entries · 1 selected · 1 conflicted records"));
 }
 
 QTEST_MAIN(EntryBrowserWidgetTest)
