@@ -7,6 +7,7 @@
 //! file names meet Windows).
 use crate::error::{Error, Result};
 use crate::idb::{Entry, FileType};
+use crate::image::PayloadResolution;
 use crate::image::reader::ImageReader;
 use crate::path::IrixPath;
 use std::path::{Path, PathBuf};
@@ -75,6 +76,23 @@ pub struct ExtractFailure {
     pub message: String,
 }
 
+/// A payload that was not found exactly at its expected offset.
+///
+/// Recoveries are honest successes — the bytes were located and written —
+/// but the reader had to deviate from the computed layout to find them,
+/// which callers must surface instead of silently accepting.
+#[derive(Debug, Clone)]
+pub struct ExtractRecovery {
+    /// Entry path.
+    pub path: String,
+    /// Expected record offset, if the layout provided one.
+    pub expected_record_offset: Option<u64>,
+    /// Offset the record was actually found at.
+    pub actual_record_offset: u64,
+    /// How the record was located.
+    pub resolution: PayloadResolution,
+}
+
 /// Outcome of an extraction run.
 #[derive(Debug, Clone, Default)]
 pub struct ExtractReport {
@@ -84,6 +102,8 @@ pub struct ExtractReport {
     pub skipped: usize,
     /// Entries that failed.
     pub failures: Vec<ExtractFailure>,
+    /// Payloads that needed recovery to be located.
+    pub recoveries: Vec<ExtractRecovery>,
 }
 
 /// Extracts entries below `out_dir`.
@@ -102,7 +122,12 @@ pub fn extract(
 
     for entry in entries {
         match extract_one(reader, entry, out_dir, options) {
-            Ok(ExtractOutcome::Written) => report.extracted += 1,
+            Ok(ExtractOutcome::Written(recovery)) => {
+                report.extracted += 1;
+                if let Some(recovery) = recovery {
+                    report.recoveries.push(recovery);
+                }
+            }
             Ok(ExtractOutcome::Skipped) => report.skipped += 1,
             Err(error) => {
                 report.failures.push(ExtractFailure {
@@ -120,7 +145,7 @@ pub fn extract(
 }
 
 enum ExtractOutcome {
-    Written,
+    Written(Option<ExtractRecovery>),
     Skipped,
 }
 
@@ -139,6 +164,74 @@ fn resolve_relative(entry: &Entry, mode: &PathMode) -> Option<IrixPath> {
     }
 }
 
+/// Projects an entry to the host-relative paths [`extract`] would write
+/// for it under `options`, without writing anything.
+///
+/// An empty list means [`extract`] would deliberately skip the entry:
+/// excluded by the path mode, a device or FIFO, or a symbolic link
+/// without a recorded target. Failures that are already known
+/// statically — a host path that cannot be represented, a regular file
+/// without a payload — are returned as errors, so a caller preflighting
+/// with this projection fails before any bytes hit the disk instead of
+/// silently dropping the entry.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsafePath`] or [`Error::PayloadNotFound`] for
+/// entries [`extract`] is statically known to fail on.
+pub fn output_paths(entry: &Entry, options: &ExtractOptions) -> Result<Vec<PathBuf>> {
+    let Some(relative) = resolve_relative(entry, &options.path_mode) else {
+        return Ok(Vec::new());
+    };
+    let target = host_path(&relative)?;
+    Ok(match entry.file_type {
+        FileType::Directory => vec![target],
+        FileType::Regular => {
+            let stored_compressed = entry.compressed_size().is_some_and(|size| size > 0);
+            if entry.payload.is_some() {
+                match options.decode {
+                    DecodeMode::Auto => {
+                        let mut paths = vec![target];
+                        if options.keep_stored && stored_compressed {
+                            paths.push(stored_target(&paths[0]));
+                        }
+                        paths
+                    }
+                    DecodeMode::Never => {
+                        if stored_compressed {
+                            vec![stored_target(&target)]
+                        } else {
+                            vec![target]
+                        }
+                    }
+                }
+            } else if entry.size() == Some(0) && entry.compressed_size().is_none() {
+                vec![target]
+            } else {
+                return Err(Error::PayloadNotFound {
+                    entry: entry.path.to_string(),
+                });
+            }
+        }
+        FileType::SymbolicLink => {
+            if entry.symlink_target().is_none() {
+                return Ok(Vec::new());
+            }
+            #[cfg(unix)]
+            {
+                vec![target]
+            }
+            // Without symlink support a breadcrumb file is written
+            // instead.
+            #[cfg(not(unix))]
+            {
+                vec![link_breadcrumb(&target)]
+            }
+        }
+        _ => Vec::new(),
+    })
+}
+
 fn extract_one(
     reader: &mut ImageReader<'_>,
     entry: &Entry,
@@ -154,14 +247,23 @@ fn extract_one(
         FileType::Directory => {
             std::fs::create_dir_all(&target).map_err(|source| Error::io(&target, source))?;
             apply_mode(&target, entry.mode)?;
-            Ok(ExtractOutcome::Written)
+            Ok(ExtractOutcome::Written(None))
         }
         FileType::Regular => {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|source| Error::io(parent, source))?;
             }
-            if entry.payload.is_some() {
+            let recovery = if entry.payload.is_some() {
                 let payload = reader.read(entry)?;
+                let recovery =
+                    (payload.location.resolution != PayloadResolution::Exact).then(|| {
+                        ExtractRecovery {
+                            path: entry.path.to_string(),
+                            expected_record_offset: payload.location.expected_record_offset,
+                            actual_record_offset: payload.location.actual_record_offset,
+                            resolution: payload.location.resolution,
+                        }
+                    });
                 match options.decode {
                     DecodeMode::Auto => {
                         write_file(&target, &payload.decode()?, entry.mode)?;
@@ -177,15 +279,17 @@ fn extract_one(
                         }
                     }
                 }
+                recovery
             } else if entry.size() == Some(0) && entry.compressed_size().is_none() {
                 // A regular file explicitly recorded as empty.
                 write_file(&target, &[], entry.mode)?;
+                None
             } else {
                 return Err(Error::PayloadNotFound {
                     entry: entry.path.to_string(),
                 });
-            }
-            Ok(ExtractOutcome::Written)
+            };
+            Ok(ExtractOutcome::Written(recovery))
         }
         FileType::SymbolicLink => {
             let Some(link_target) = entry.symlink_target() else {
@@ -195,7 +299,7 @@ fn extract_one(
                 std::fs::create_dir_all(parent).map_err(|source| Error::io(parent, source))?;
             }
             create_symlink_or_fallback(link_target, &target)?;
-            Ok(ExtractOutcome::Written)
+            Ok(ExtractOutcome::Written(None))
         }
         // Devices and FIFOs need privileges and a live system; skip them.
         _ => Ok(ExtractOutcome::Skipped),
