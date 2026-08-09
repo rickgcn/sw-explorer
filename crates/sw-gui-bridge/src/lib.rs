@@ -14,9 +14,13 @@
 //!   declared by `bridge`.
 //! * `entry` converts `sw-core` entries into the entry summary and
 //!   detail DTOs declared by `bridge`.
+//! * `hardware` extracts hardware attribute candidates from the loaded
+//!   distribution and converts `sw-core` entry selections into the
+//!   selection DTOs declared by `bridge`.
 mod backend;
 mod bridge;
 mod detail;
 mod entry;
+mod hardware;
 #[cfg(test)]
 mod tests;

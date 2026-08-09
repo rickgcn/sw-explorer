@@ -11,8 +11,10 @@
 use crate::bridge::ffi;
 use crate::detail;
 use crate::entry;
+use crate::hardware;
 use sw_core::distribution::Distribution;
 use sw_core::idb::{Entry, EntryId};
+use sw_core::mach::eval::HardwareProfile;
 use sw_core::query::Query;
 
 /// Identifies one domain object of the loaded distribution by its
@@ -72,6 +74,19 @@ impl std::fmt::Display for SearchError {
 }
 
 impl std::error::Error for SearchError {}
+
+/// Error for hardware selection: no distribution loaded, or a
+/// malformed profile pair (an empty attribute name).
+#[derive(Debug)]
+pub(crate) struct SelectionError(String);
+
+impl std::fmt::Display for SelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SelectionError {}
 
 /// Rust-side backend state behind the opaque CXX handle.
 pub(crate) struct Backend {
@@ -288,6 +303,33 @@ impl Backend {
             })
     }
 
+    /// Maps every entry of the distribution to the object id of the
+    /// product that actually owns it. Ownership is pointer identity
+    /// into a product's entry list — never the product segment of the
+    /// record's subsystem name: an IDB record may name a foreign
+    /// subsystem and still belong to the product whose IDB carries
+    /// it, and entry_detail resolves keys against that owner's entry
+    /// list. The map is rebuilt per query and never cached.
+    fn entry_owner_map(
+        &self,
+        distribution: &Distribution,
+    ) -> Result<std::collections::HashMap<*const Entry, u64>, ObjectDetailError> {
+        let mut owners = std::collections::HashMap::with_capacity(
+            distribution
+                .products()
+                .iter()
+                .map(|product| product.entries.len())
+                .sum(),
+        );
+        for (product_index, product) in distribution.products().iter().enumerate() {
+            let product_id = self.product_object_id(product_index)?;
+            for entry in &product.entries {
+                owners.insert(std::ptr::from_ref(entry), product_id);
+            }
+        }
+        Ok(owners)
+    }
+
     pub(crate) fn entries(
         &self,
         scope_id: u64,
@@ -358,29 +400,11 @@ impl Backend {
         let found = distribution.find(&Query::path(pattern));
 
         // Maps each hit to the object id of the product that actually
-        // owns the entry. Ownership is pointer identity into a
-        // product's entry list — never the product segment of the
-        // record's subsystem name: an IDB record may name a foreign
-        // subsystem and still belong to the product whose IDB carries
-        // it, and entry_detail resolves keys against that owner's
-        // entry list. The lookup is built once per search and never
-        // cached.
-        let mut owners: std::collections::HashMap<*const Entry, u64> =
-            std::collections::HashMap::with_capacity(
-                distribution
-                    .products()
-                    .iter()
-                    .map(|product| product.entries.len())
-                    .sum(),
-            );
-        for (product_index, product) in distribution.products().iter().enumerate() {
-            let product_id = self
-                .product_object_id(product_index)
-                .map_err(|error| SearchError(error.to_string()))?;
-            for entry in &product.entries {
-                owners.insert(std::ptr::from_ref(entry), product_id);
-            }
-        }
+        // owns the entry — the shared owner map, never the product
+        // segment of the record's subsystem name.
+        let owners = self
+            .entry_owner_map(distribution)
+            .map_err(|error| SearchError(error.to_string()))?;
 
         found
             .entries
@@ -415,5 +439,48 @@ impl Backend {
         let index = usize::try_from(entry_id).map_err(|_| missing())?;
         let entry = product.entry(EntryId(index)).ok_or_else(missing)?;
         Ok(entry::entry_detail(product_id, entry))
+    }
+
+    pub(crate) fn hardware_candidates(
+        &self,
+    ) -> Result<Vec<ffi::HardwareCandidateSet>, NoDistributionLoaded> {
+        let distribution = self.distribution.as_ref().ok_or(NoDistributionLoaded)?;
+        Ok(hardware::hardware_candidates(distribution))
+    }
+
+    pub(crate) fn select_entries(
+        &self,
+        values: Vec<ffi::HardwareValue>,
+    ) -> Result<ffi::SelectionSnapshot, SelectionError> {
+        let distribution = self
+            .distribution
+            .as_ref()
+            .ok_or_else(|| SelectionError("no distribution loaded".to_string()))?;
+
+        // The profile carries hardware facts only; expression
+        // semantics stay with the distribution metadata. Unknown
+        // attribute names and values pass through unchanged, and an
+        // empty value is a genuine fact (the media themselves carry
+        // restrictions like `GFXBOARD=` for headless boards); only an
+        // empty attribute name is malformed.
+        let mut builder = HardwareProfile::builder();
+        for pair in &values {
+            if pair.attribute.is_empty() {
+                return Err(SelectionError(
+                    "hardware attribute name is empty".to_string(),
+                ));
+            }
+            builder = builder.add(&pair.attribute, &pair.value);
+        }
+        let profile = builder.build();
+
+        // All MACH semantics — hierarchy restrictions, entry-specific
+        // expressions, mach-less fallback, duplicate paths, unresolved
+        // expressions and conflicts — come from the core selection.
+        let selection = distribution.select(&profile);
+        let owners = self
+            .entry_owner_map(distribution)
+            .map_err(|error| SelectionError(error.to_string()))?;
+        hardware::selection_snapshot(&selection, &owners).map_err(SelectionError)
     }
 }

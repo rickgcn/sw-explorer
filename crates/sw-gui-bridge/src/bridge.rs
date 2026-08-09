@@ -467,6 +467,60 @@ pub(crate) mod ffi {
         raw_idb_line: String,
     }
 
+    /// One hardware attribute/value pair of a hardware profile: a fact
+    /// about the simulated target machine, e.g. `CPUBOARD=IP22`. The
+    /// same attribute may appear several times with different values.
+    struct HardwareValue {
+        /// The hardware attribute name, e.g. `CPUBOARD`. Unknown
+        /// names are passed through unchanged.
+        attribute: String,
+        /// The attribute value, e.g. `IP22`. May be empty: the media
+        /// carry restrictions like `GFXBOARD=`.
+        value: String,
+    }
+
+    /// The candidate values of one hardware attribute, discovered in
+    /// the loaded distribution's parsed MACH expressions.
+    struct HardwareCandidateSet {
+        /// The hardware attribute name, e.g. `CPUBOARD`; unknown
+        /// attribute names are preserved verbatim.
+        attribute: String,
+        /// Values the distribution's MACH expressions compare this
+        /// attribute against, deduplicated, in first-appearance order.
+        values: Vec<String>,
+    }
+
+    /// The backend identity of one selected entry: the object id of
+    /// the product whose entry list actually holds the record, plus
+    /// the sw-core entry id inside that product.
+    struct SelectionEntryKey {
+        /// Object id of the owning product.
+        product_id: u64,
+        /// The sw-core entry id; zero is a perfectly valid id.
+        entry_id: u64,
+    }
+
+    /// One contested path plus the entries competing for it, exactly
+    /// as the core selection reports it.
+    struct SelectionConflictDetail {
+        /// The contested path.
+        path: String,
+        /// The competing candidates; never resolved by the bridge.
+        candidates: Vec<SelectionEntryKey>,
+    }
+
+    /// Which entries a hardware profile selects across the whole
+    /// distribution. Selection carries entry identities only; the
+    /// entry list and inspector data keep coming from `entries`,
+    /// `search_entries` and `entry_detail`.
+    struct SelectionSnapshot {
+        /// Entries that would be installed, in distribution order.
+        /// Conflict candidates stay included.
+        selected: Vec<SelectionEntryKey>,
+        /// Paths with ambiguous or unresolvable candidates.
+        conflicts: Vec<SelectionConflictDetail>,
+    }
+
     extern "Rust" {
         /// Opaque handle to the Rust backend state.
         type Backend;
@@ -550,5 +604,32 @@ pub(crate) mod ffi {
         /// is zero, unknown or not a product, or when `entry_id`
         /// is out of range.
         fn entry_detail(self: &Backend, product_id: u64, entry_id: u64) -> Result<EntryDetail>;
+
+        /// Lists the hardware attribute values found in the loaded
+        /// distribution's parsed MACH expressions (product, image and
+        /// subsystem restrictions plus entry `mach(...)` attributes),
+        /// grouped by attribute, deduplicated, in first-appearance
+        /// order. Unparseable expression payloads are never guessed
+        /// at and contribute nothing. Unknown attribute names are
+        /// preserved verbatim.
+        ///
+        /// Fails when no distribution is loaded.
+        fn hardware_candidates(self: &Backend) -> Result<Vec<HardwareCandidateSet>>;
+
+        /// Computes which entries the given hardware profile selects,
+        /// across the whole distribution. All MACH semantics — product,
+        /// image, subsystem and entry expressions, mach-less fallback,
+        /// duplicate paths, unparseable expressions and conflicts —
+        /// come from `sw-core`; the bridge only translates entry
+        /// references into entry keys.
+        ///
+        /// Each pair is one attribute value; an attribute may occur
+        /// several times. An empty attribute name is rejected; an
+        /// empty value is a genuine fact (the media carry
+        /// restrictions like `GFXBOARD=`). Unknown attributes and
+        /// values are passed through unchanged.
+        ///
+        /// Fails when no distribution is loaded.
+        fn select_entries(self: &Backend, values: Vec<HardwareValue>) -> Result<SelectionSnapshot>;
     }
 }

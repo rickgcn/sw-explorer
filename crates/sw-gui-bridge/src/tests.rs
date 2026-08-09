@@ -4,6 +4,7 @@
 use crate::backend::new_backend;
 use crate::bridge::ffi;
 use std::path::{Path, PathBuf};
+use sw_core::mach::eval::HardwareProfile;
 
 fn temp_root(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -195,8 +196,8 @@ fn push_attributes(bytes: &mut Vec<u8>, attributes: &[(u8, Vec<u8>)]) {
 
 /// Writes a level-9 descriptor with one image, exposing every
 /// field the detail APIs decode: product attributes (mach, cut
-/// points), image version/order and full subsystem records with
-/// rules and attributes.
+/// points), image attributes (mach), image version/order and full
+/// subsystem records with rules and attributes.
 #[allow(clippy::too_many_arguments)]
 fn write_rich_descriptor(
     root: &Path,
@@ -208,6 +209,7 @@ fn write_rich_descriptor(
     image_title: &str,
     image_order: u16,
     image_version: u32,
+    image_attributes: Vec<(u8, Vec<u8>)>,
     subsystems: &[SubsystemSpec],
 ) {
     let mut bytes = b"pd001V999P00\0".to_vec();
@@ -229,7 +231,7 @@ fn write_rich_descriptor(
     bytes.extend_from_slice(&image_order.to_be_bytes());
     bytes.extend_from_slice(&image_version.to_be_bytes());
     push_lp16(&mut bytes, ""); // desc
-    push_attributes(&mut bytes, &[]);
+    push_attributes(&mut bytes, &image_attributes);
     bytes.extend_from_slice(&(subsystems.len() as u16).to_be_bytes());
 
     for subsystem in subsystems {
@@ -334,6 +336,7 @@ fn write_rich_dist(root: &Path) {
         "System Software",
         3,
         42,
+        vec![],
         &[unix, ghost],
     );
     write_idb(
@@ -2093,4 +2096,971 @@ fn real_dist_search_smoke() {
     let detail = backend.entry_detail(row.product_id, row.entry_id).unwrap();
     assert_eq!(detail.path, row.path);
     assert_eq!(detail.subsystem, row.subsystem);
+}
+
+// ---------------------------------------------------------------------------
+// Hardware candidates and hardware-profile selection
+// ---------------------------------------------------------------------------
+
+/// One hardware attribute/value pair, the bridge input shape.
+fn hw(attribute: &str, value: &str) -> ffi::HardwareValue {
+    ffi::HardwareValue {
+        attribute: attribute.to_string(),
+        value: value.to_string(),
+    }
+}
+
+/// The (product id, entry id) pairs of a selection key list.
+fn key_pairs(keys: &[ffi::SelectionEntryKey]) -> Vec<(u64, u64)> {
+    keys.iter()
+        .map(|key| (key.product_id, key.entry_id))
+        .collect()
+}
+
+/// The (attribute, values) pairs of a candidate list.
+fn candidate_pairs(candidates: &[ffi::HardwareCandidateSet]) -> Vec<(String, Vec<String>)> {
+    candidates
+        .iter()
+        .map(|set| (set.attribute.clone(), set.values.clone()))
+        .collect()
+}
+
+/// Object id of the product called `name`, looked up in the hierarchy
+/// — never derived from id arithmetic.
+fn product_object_id(backend: &crate::backend::Backend, name: &str) -> u64 {
+    backend
+        .hierarchy()
+        .unwrap()
+        .iter()
+        .find(|node| matches!(node.kind, ffi::ObjectKind::Product) && node.name == name)
+        .map(|node| node.id)
+        .unwrap_or_else(|| panic!("product {name} not found"))
+}
+
+/// Writes the standard selection test distribution: one descriptor+
+/// IDB product `sel` whose entries exercise mach-specific selection,
+/// mach-less fallback, duplicate-path conflicts and unparsed MACH,
+/// plus one descriptor subsystem (`broken`) whose MACH payload cannot
+/// be parsed.
+///
+/// Object ids: 1 = product `sel`, 2 = image `sel.sw`, 3 = `unix`,
+/// 4 = `broken`. Entry ids 0–10 in IDB order.
+fn write_selection_dist(root: &Path) {
+    let unix = SubsystemSpec::plain("unix", "UNIX", "ALL", 0x0850);
+    let broken = SubsystemSpec {
+        attributes: vec![(b'm', b"=BROKEN".to_vec())],
+        ..SubsystemSpec::plain("broken", "Broken", "ALL", 0x0850)
+    };
+    write_rich_descriptor(
+        root,
+        "sel",
+        "Selection Product",
+        1,
+        vec![],
+        "sw",
+        "System Software",
+        1,
+        1,
+        vec![],
+        &[unix, broken],
+    );
+    write_raw_idb(
+        root,
+        "sel",
+        "f 0755 root sys usr/bin/plain src/plain sel.sw.unix sum(1) size(10) cmpsize(0)\n\
+         f 0755 root sys usr/bin/board src/board sel.sw.unix sum(1) size(10) cmpsize(0) mach(CPUBOARD=IP22)\n\
+         f 0755 root sys usr/bin/board26 src/board26 sel.sw.unix sum(1) size(10) cmpsize(0) mach(IP26)\n\
+         f 0644 root sys usr/lib/dup src/dup1 sel.sw.unix sum(1) size(10) cmpsize(0) mach(CPUBOARD=IP22)\n\
+         f 0644 root sys usr/lib/dup src/dup2 sel.sw.unix sum(1) size(10) cmpsize(0)\n\
+         f 0644 root sys usr/lib/conf src/conf4 sel.sw.unix sum(1) size(10) cmpsize(0) mach(CPUARCH=R4000)\n\
+         f 0644 root sys usr/lib/conf src/conf5 sel.sw.unix sum(1) size(10) cmpsize(0) mach(CPUARCH=R5000)\n\
+         f 0644 root sys usr/lib/fb src/fb1 sel.sw.unix sum(1) size(10) cmpsize(0)\n\
+         f 0644 root sys usr/lib/fb src/fb2 sel.sw.unix sum(1) size(10) cmpsize(0)\n\
+         f 0644 root sys usr/lib/broken src/broken sel.sw.unix sum(1) size(10) cmpsize(0) mach(=GARBAGE)\n\
+         f 0755 root sys usr/bin/kern src/kern sel.sw.broken sum(1) size(10) cmpsize(0)\n",
+    );
+}
+
+/// Writes the empty-value selection distribution: one product `gfx`
+/// whose IDB carries a mach-less record and one record restricted to
+/// headless boards through `mach(GFXBOARD=)` — the empty right-hand
+/// side real media use.
+///
+/// Object ids: 1 = product `gfx`, 2 = image `gfx.sw`, 3 = `unix`.
+/// Entry ids 0–1 in IDB order.
+fn write_empty_value_dist(root: &Path) {
+    write_rich_descriptor(
+        root,
+        "gfx",
+        "Gfx Product",
+        1,
+        vec![],
+        "sw",
+        "System Software",
+        1,
+        1,
+        vec![],
+        &[SubsystemSpec::plain("unix", "UNIX", "ALL", 0x0850)],
+    );
+    write_raw_idb(
+        root,
+        "gfx",
+        "f 0755 root sys usr/bin/any src/any gfx.sw.unix sum(1) size(10) cmpsize(0)\n\
+         f 0755 root sys usr/bin/headless src/headless gfx.sw.unix sum(1) size(10) cmpsize(0) mach(GFXBOARD=)\n",
+    );
+}
+
+/// Writes the hierarchy-level selection distribution: `imach` carries
+/// an image MACH restriction, `pmach` a product restriction and
+/// `smach` a subsystem restriction; each product holds one mach-less
+/// entry.
+fn write_level_mach_dist(root: &Path) {
+    write_rich_descriptor(
+        root,
+        "imach",
+        "Image Mach Product",
+        1,
+        vec![],
+        "sw",
+        "System Software",
+        1,
+        1,
+        vec![(b'm', b"GFXBOARD=EXPRESS".to_vec())],
+        &[SubsystemSpec::plain("unix", "UNIX", "ALL", 0x0850)],
+    );
+    write_idb(root, "imach", &[("imach.sw.unix", "usr/bin/imach")]);
+
+    write_rich_descriptor(
+        root,
+        "pmach",
+        "Product Mach Product",
+        1,
+        vec![(b'm', b"CPUBOARD=IP22".to_vec())],
+        "sw",
+        "System Software",
+        1,
+        1,
+        vec![],
+        &[SubsystemSpec::plain("unix", "UNIX", "ALL", 0x0850)],
+    );
+    write_idb(root, "pmach", &[("pmach.sw.unix", "usr/bin/pmach")]);
+
+    let unix = SubsystemSpec {
+        attributes: vec![(b'm', b"MODE=64bit".to_vec())],
+        ..SubsystemSpec::plain("unix", "UNIX", "ALL", 0x0850)
+    };
+    write_rich_descriptor(
+        root,
+        "smach",
+        "Subsystem Mach Product",
+        1,
+        vec![],
+        "sw",
+        "System Software",
+        1,
+        1,
+        vec![],
+        &[unix],
+    );
+    write_idb(root, "smach", &[("smach.sw.unix", "usr/bin/smach")]);
+}
+
+/// Writes the selection ownership regression distribution: `alpha`'s
+/// IDB carries a record naming the *foreign* subsystem `beta.sw.unix`.
+/// The entry still belongs to alpha, and selection keys must say so.
+///
+/// Object ids: 1 = product `alpha`, 2 = image `beta.sw`, 3 = `unix`,
+/// 4 = product `beta`, 5 = image `beta.sw`, 6 = `unix`.
+fn write_foreign_selection_dist(root: &Path) {
+    write_raw_idb(
+        root,
+        "alpha",
+        "f 0644 root sys usr/bin/foreign src/foreign beta.sw.unix sum(1) size(1) cmpsize(0)\n",
+    );
+    write_raw_idb(
+        root,
+        "beta",
+        "f 0644 root sys usr/bin/actual-beta src/b beta.sw.unix sum(1) size(1) cmpsize(0)\n",
+    );
+}
+
+/// Writes the candidate-extraction test distribution: one product
+/// `cand` carrying MACH expressions on every hierarchy level and on
+/// its entries, covering nested `&&`/`||`/`!`, several comparison
+/// operators, bare-value shorthand, an unknown attribute, repeated
+/// values and an unparseable payload. The subsystem also carries a
+/// conditional-flag condition (`IP99`) that is *not* a MACH
+/// expression and must never surface as a candidate.
+///
+/// Object ids: 1 = product `cand`, 2 = image `cand.sw`, 3 = `unix`.
+fn write_candidates_dist(root: &Path) {
+    let unix = SubsystemSpec {
+        attributes: vec![
+            (b'm', b"MODE>=64bit".to_vec()),
+            (b'm', b"CPUBOARD<IP30".to_vec()),
+            (b'D', b"CPUBOARD=IP99".to_vec()),
+        ],
+        ..SubsystemSpec::plain("unix", "UNIX", "ALL", 0x0850)
+    };
+    write_rich_descriptor(
+        root,
+        "cand",
+        "Candidate Product",
+        1,
+        vec![(
+            b'm',
+            b"CPUBOARD=IP22 && (GFXBOARD=EXPRESS || GFXBOARD=NEWPRESS)".to_vec(),
+        )],
+        "sw",
+        "System Software",
+        1,
+        1,
+        vec![
+            (b'm', b"GFXBOARD!=SERVER".to_vec()),
+            (b'm', b"!(VIDEO=EVO)".to_vec()),
+        ],
+        &[unix],
+    );
+    write_raw_idb(
+        root,
+        "cand",
+        "f 0755 root sys usr/bin/board26 src/b26 cand.sw.unix sum(1) size(10) cmpsize(0) mach(IP26)\n\
+         f 0755 root sys usr/bin/frob src/frob cand.sw.unix sum(1) size(10) cmpsize(0) mach(FROBNICATE=YES)\n\
+         f 0755 root sys usr/bin/legacy src/legacy cand.sw.unix sum(1) size(10) cmpsize(0) mach(CPUBOARD=IP22 GFXBOARD=EXPRESS)\n\
+         f 0755 root sys usr/bin/garbage src/garbage cand.sw.unix sum(1) size(10) cmpsize(0) mach(=GARBAGE)\n\
+         f 0755 root sys usr/bin/again src/again cand.sw.unix sum(1) size(10) cmpsize(0) mach(CPUBOARD=IP22)\n",
+    );
+}
+
+#[test]
+fn candidates_require_loaded_distribution() {
+    let backend = new_backend();
+    assert_eq!(
+        backend.hardware_candidates().err().unwrap().to_string(),
+        "no distribution loaded"
+    );
+}
+
+#[test]
+fn candidates_cover_every_mach_source_in_first_appearance_order() {
+    let root = temp_root("candidates-all-sources");
+    write_candidates_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // Product restrictions first, then the image with its subsystems,
+    // then the entries in IDB order. Nested && / || / ! trees are
+    // walked; every comparison's right-hand side becomes a candidate,
+    // whatever the operator; a bare `IP26` is a CPUBOARD comparison;
+    // the unknown FROBNICATE attribute is preserved verbatim. IP22 and
+    // EXPRESS repeat on later entries and stay deduplicated.
+    assert_eq!(
+        candidate_pairs(&backend.hardware_candidates().unwrap()),
+        vec![
+            (
+                "CPUBOARD".to_string(),
+                vec!["IP22".to_string(), "IP30".to_string(), "IP26".to_string()],
+            ),
+            (
+                "GFXBOARD".to_string(),
+                vec![
+                    "EXPRESS".to_string(),
+                    "NEWPRESS".to_string(),
+                    "SERVER".to_string(),
+                ],
+            ),
+            ("VIDEO".to_string(), vec!["EVO".to_string()]),
+            ("MODE".to_string(), vec!["64bit".to_string()]),
+            ("FROBNICATE".to_string(), vec!["YES".to_string()]),
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn candidates_ignore_unparseable_payloads() {
+    let root = temp_root("candidates-unresolved");
+    write_candidates_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // The unparseable entry payload `=GARBAGE` contributes nothing;
+    // nothing is guessed from raw text.
+    for set in backend.hardware_candidates().unwrap() {
+        assert!(!set.attribute.is_empty());
+        for value in &set.values {
+            assert!(!value.is_empty());
+            assert!(!value.contains("GARBAGE"));
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn candidates_ignore_conditional_flag_conditions() {
+    let root = temp_root("candidates-flags");
+    write_candidates_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // IP99 only appears in a `default` flag condition, which is not a
+    // MACH expression.
+    for set in backend.hardware_candidates().unwrap() {
+        assert!(!set.values.iter().any(|value| value == "IP99"));
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn candidates_survive_failed_open() {
+    let root = temp_root("candidates-failed-open");
+    write_candidates_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+    let before = backend.hardware_candidates().unwrap();
+
+    backend
+        .open_distribution("/definitely/missing/distribution")
+        .err()
+        .unwrap();
+    assert_eq!(
+        candidate_pairs(&before),
+        candidate_pairs(&backend.hardware_candidates().unwrap())
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn candidates_follow_successful_reopen() {
+    let root_a = temp_root("candidates-reopen-a");
+    write_candidates_dist(&root_a);
+    let root_b = temp_root("candidates-reopen-b");
+    write_selection_dist(&root_b);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root_a.to_str().unwrap()).unwrap();
+    assert!(
+        backend
+            .hardware_candidates()
+            .unwrap()
+            .iter()
+            .any(|set| set.attribute == "FROBNICATE")
+    );
+
+    backend.open_distribution(root_b.to_str().unwrap()).unwrap();
+    let after = candidate_pairs(&backend.hardware_candidates().unwrap());
+    assert_eq!(
+        after,
+        vec![
+            (
+                "CPUBOARD".to_string(),
+                vec!["IP22".to_string(), "IP26".to_string()]
+            ),
+            (
+                "CPUARCH".to_string(),
+                vec!["R4000".to_string(), "R5000".to_string()],
+            ),
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
+}
+
+#[test]
+fn selection_requires_loaded_distribution() {
+    let backend = new_backend();
+    assert_eq!(
+        backend
+            .select_entries(vec![hw("CPUBOARD", "IP22")])
+            .err()
+            .unwrap()
+            .to_string(),
+        "no distribution loaded"
+    );
+}
+
+#[test]
+fn selection_rejects_empty_attribute_name() {
+    let root = temp_root("selection-blank");
+    write_selection_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    assert_eq!(
+        backend
+            .select_entries(vec![hw("", "IP22")])
+            .err()
+            .unwrap()
+            .to_string(),
+        "hardware attribute name is empty"
+    );
+
+    // Unknown attribute and value names are not rejected.
+    backend
+        .select_entries(vec![hw("FROBNICATE", "YES")])
+        .unwrap();
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_empty_value_matches_core_select() {
+    let root = temp_root("selection-empty-value");
+    write_empty_value_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+    let distribution = sw_core::distribution::Distribution::open(&root).unwrap();
+
+    // The empty right-hand side is parsed from the media and offered
+    // as a candidate like any other value.
+    let candidates = backend.hardware_candidates().unwrap();
+    assert_eq!(
+        candidate_pairs(&candidates),
+        vec![("GFXBOARD".to_string(), vec![String::new()])]
+    );
+
+    // The empty value is a genuine hardware fact: it flows into the
+    // profile unchanged and the bridge selection matches the core
+    // selection entry for entry.
+    let pairs = vec![hw("GFXBOARD", "")];
+    let mut builder = HardwareProfile::builder();
+    for pair in &pairs {
+        builder = builder.add(&pair.attribute, &pair.value);
+    }
+    let core = distribution.select(&builder.build());
+    let snapshot = backend.select_entries(pairs).unwrap();
+
+    assert_eq!(snapshot.selected.len(), core.selected.len());
+    assert_eq!(snapshot.conflicts.len(), core.conflicts.len());
+    let bridge_paths: Vec<String> = snapshot
+        .selected
+        .iter()
+        .map(|key| {
+            backend
+                .entry_detail(key.product_id, key.entry_id)
+                .unwrap()
+                .path
+        })
+        .collect();
+    let core_paths: Vec<String> = core
+        .selected
+        .iter()
+        .map(|entry| entry.path.to_string())
+        .collect();
+    assert_eq!(bridge_paths, core_paths);
+
+    // The empty value is not inert: it selects the headless record a
+    // non-empty value rejects, while the mach-less record is selected
+    // either way.
+    assert!(bridge_paths.iter().any(|path| path == "usr/bin/headless"));
+    let express_paths: Vec<String> = backend
+        .select_entries(vec![hw("GFXBOARD", "EXPRESS")])
+        .unwrap()
+        .selected
+        .iter()
+        .map(|key| {
+            backend
+                .entry_detail(key.product_id, key.entry_id)
+                .unwrap()
+                .path
+        })
+        .collect();
+    assert!(!express_paths.iter().any(|path| path == "usr/bin/headless"));
+    assert!(express_paths.iter().any(|path| path == "usr/bin/any"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_selects_ordinary_entries() {
+    let root = temp_root("selection-ordinary");
+    write_selection_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // CPUBOARD=IP22: the plain fallback, the IP22 entry and the
+    // IP22-specific duplicate win; the two fallbacks of usr/lib/fb
+    // conflict; the unparsed entry and the unresolved subsystem's
+    // entry are conflicts but never selected. Entry id 0 is a
+    // perfectly valid selected id.
+    let snapshot = backend
+        .select_entries(vec![hw("CPUBOARD", "IP22")])
+        .unwrap();
+    assert_eq!(
+        key_pairs(&snapshot.selected),
+        vec![(1, 0), (1, 1), (1, 3), (1, 7), (1, 8)]
+    );
+    let conflicts: Vec<(String, Vec<(u64, u64)>)> = snapshot
+        .conflicts
+        .iter()
+        .map(|conflict| (conflict.path.clone(), key_pairs(&conflict.candidates)))
+        .collect();
+    assert_eq!(
+        conflicts,
+        vec![
+            ("usr/lib/fb".to_string(), vec![(1, 7), (1, 8)]),
+            ("usr/lib/broken".to_string(), vec![(1, 9)]),
+            ("usr/bin/kern".to_string(), vec![(1, 10)]),
+        ]
+    );
+
+    // Every selected key resolves back to its entry.
+    for key in &snapshot.selected {
+        backend.entry_detail(key.product_id, key.entry_id).unwrap();
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_specific_beats_fallback() {
+    let root = temp_root("selection-specific");
+    write_selection_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // The IP22-specific duplicate wins over the mach-less fallback.
+    let snapshot = backend
+        .select_entries(vec![hw("CPUBOARD", "IP22")])
+        .unwrap();
+    let selected = key_pairs(&snapshot.selected);
+    assert!(selected.contains(&(1, 3)));
+    assert!(!selected.contains(&(1, 4)));
+
+    // With a non-matching board the fallback is selected instead.
+    let snapshot = backend
+        .select_entries(vec![hw("CPUBOARD", "IP19")])
+        .unwrap();
+    let selected = key_pairs(&snapshot.selected);
+    assert!(!selected.contains(&(1, 3)));
+    assert!(selected.contains(&(1, 4)));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_multiple_matching_specific_entries_conflict() {
+    let root = temp_root("selection-specific-conflict");
+    write_selection_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // Both CPUARCH-specific records match: both stay selected and the
+    // path is reported as a conflict with both candidates.
+    let snapshot = backend
+        .select_entries(vec![hw("CPUARCH", "R4000"), hw("CPUARCH", "R5000")])
+        .unwrap();
+    let selected = key_pairs(&snapshot.selected);
+    assert!(selected.contains(&(1, 5)));
+    assert!(selected.contains(&(1, 6)));
+    let conflict = snapshot
+        .conflicts
+        .iter()
+        .find(|conflict| conflict.path == "usr/lib/conf")
+        .unwrap();
+    assert_eq!(key_pairs(&conflict.candidates), vec![(1, 5), (1, 6)]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_multiple_fallbacks_conflict() {
+    let root = temp_root("selection-fallback-conflict");
+    write_selection_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // Two mach-less records share usr/lib/fb: both are selected and
+    // the path conflicts, under any profile.
+    let snapshot = backend
+        .select_entries(vec![hw("CPUBOARD", "IP19")])
+        .unwrap();
+    let selected = key_pairs(&snapshot.selected);
+    assert!(selected.contains(&(1, 7)));
+    assert!(selected.contains(&(1, 8)));
+    let conflict = snapshot
+        .conflicts
+        .iter()
+        .find(|conflict| conflict.path == "usr/lib/fb")
+        .unwrap();
+    assert_eq!(key_pairs(&conflict.candidates), vec![(1, 7), (1, 8)]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_unparsed_entry_mach_conflicts_but_is_never_selected() {
+    let root = temp_root("selection-unparsed-entry");
+    write_selection_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // mach(=GARBAGE) cannot be evaluated: the record is reported as a
+    // conflict candidate and stays out of the selected set.
+    let snapshot = backend
+        .select_entries(vec![hw("CPUBOARD", "IP22")])
+        .unwrap();
+    assert!(!key_pairs(&snapshot.selected).contains(&(1, 9)));
+    let conflict = snapshot
+        .conflicts
+        .iter()
+        .find(|conflict| conflict.path == "usr/lib/broken")
+        .unwrap();
+    assert_eq!(key_pairs(&conflict.candidates), vec![(1, 9)]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_unresolved_hierarchy_mach_conflicts_but_is_never_selected() {
+    let root = temp_root("selection-unresolved-subsystem");
+    write_selection_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // The `broken` subsystem's descriptor MACH payload does not
+    // parse: its entry's applicability is unknown, so the path is a
+    // conflict and the record is not selected.
+    let snapshot = backend
+        .select_entries(vec![hw("CPUBOARD", "IP22")])
+        .unwrap();
+    assert!(!key_pairs(&snapshot.selected).contains(&(1, 10)));
+    let conflict = snapshot
+        .conflicts
+        .iter()
+        .find(|conflict| conflict.path == "usr/bin/kern")
+        .unwrap();
+    assert_eq!(key_pairs(&conflict.candidates), vec![(1, 10)]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_respects_every_hierarchy_level() {
+    let root = temp_root("selection-levels");
+    write_level_mach_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+    let imach = product_object_id(&backend, "imach");
+    let pmach = product_object_id(&backend, "pmach");
+    let smach = product_object_id(&backend, "smach");
+
+    // All three restrictions match: every product's entry is
+    // selected.
+    let snapshot = backend
+        .select_entries(vec![
+            hw("CPUBOARD", "IP22"),
+            hw("GFXBOARD", "EXPRESS"),
+            hw("MODE", "64bit"),
+        ])
+        .unwrap();
+    assert_eq!(
+        key_pairs(&snapshot.selected),
+        vec![(imach, 0), (pmach, 0), (smach, 0)]
+    );
+
+    // Only the product-level restriction matches: the image and
+    // subsystem restrictions exclude their products.
+    let snapshot = backend
+        .select_entries(vec![hw("CPUBOARD", "IP22")])
+        .unwrap();
+    assert_eq!(key_pairs(&snapshot.selected), vec![(pmach, 0)]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_multi_valued_attributes() {
+    let root = temp_root("selection-multi-value");
+    write_selection_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // One attribute carrying several values: CPUARCH=MIPS2 alone
+    // matches nothing, but the R4000 alternative does.
+    let snapshot = backend
+        .select_entries(vec![hw("CPUARCH", "MIPS2"), hw("CPUARCH", "R4000")])
+        .unwrap();
+    let selected = key_pairs(&snapshot.selected);
+    assert!(selected.contains(&(1, 5)));
+    assert!(!selected.contains(&(1, 6)));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_keys_identify_the_owning_product() {
+    let root = temp_root("selection-ownership");
+    write_foreign_selection_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+    let alpha = product_object_id(&backend, "alpha");
+    let beta = product_object_id(&backend, "beta");
+
+    // Both records are mach-less fallbacks and therefore selected.
+    // The record naming the foreign beta.sw.unix subsystem belongs to
+    // alpha: its key carries alpha's product object id, and the
+    // inspector resolves it back to alpha's record.
+    let snapshot = backend
+        .select_entries(vec![hw("CPUBOARD", "IP22")])
+        .unwrap();
+    assert_eq!(key_pairs(&snapshot.selected), vec![(alpha, 0), (beta, 0)]);
+
+    let foreign = backend.entry_detail(alpha, 0).unwrap();
+    assert_eq!(foreign.path, "usr/bin/foreign");
+    assert_eq!(foreign.subsystem, "beta.sw.unix");
+    let actual_beta = backend.entry_detail(beta, 0).unwrap();
+    assert_eq!(actual_beta.path, "usr/bin/actual-beta");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_empty_profile_does_not_panic() {
+    let root = temp_root("selection-empty-profile");
+    write_selection_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // An empty profile matches no comparison: mach-less fallbacks are
+    // selected, mach-specific records are not, unknown applicability
+    // still conflicts.
+    let snapshot = backend.select_entries(vec![]).unwrap();
+    let selected = key_pairs(&snapshot.selected);
+    assert!(selected.contains(&(1, 0)));
+    assert!(selected.contains(&(1, 4)));
+    assert!(!selected.contains(&(1, 1)));
+    assert!(!selected.contains(&(1, 3)));
+    assert_eq!(snapshot.conflicts.len(), 3);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_survives_failed_open() {
+    let root = temp_root("selection-failed-open");
+    write_selection_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+    let before = backend
+        .select_entries(vec![hw("CPUBOARD", "IP22")])
+        .unwrap();
+
+    backend
+        .open_distribution("/definitely/missing/distribution")
+        .err()
+        .unwrap();
+    let after = backend
+        .select_entries(vec![hw("CPUBOARD", "IP22")])
+        .unwrap();
+    assert_eq!(key_pairs(&before.selected), key_pairs(&after.selected));
+    assert_eq!(before.conflicts.len(), after.conflicts.len());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_follows_successful_reopen() {
+    let root_a = temp_root("selection-reopen-a");
+    write_selection_dist(&root_a);
+    let root_b = temp_root("selection-reopen-b");
+    write_idb(&root_b, "gamma", &[("gamma.sw.unix", "usr/bin/gamma")]);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root_a.to_str().unwrap()).unwrap();
+    let before = backend
+        .select_entries(vec![hw("CPUBOARD", "IP22")])
+        .unwrap();
+    assert!(before.selected.len() > 1);
+
+    backend.open_distribution(root_b.to_str().unwrap()).unwrap();
+    let after = backend
+        .select_entries(vec![hw("CPUBOARD", "IP22")])
+        .unwrap();
+    let gamma = product_object_id(&backend, "gamma");
+    assert_eq!(key_pairs(&after.selected), vec![(gamma, 0)]);
+    assert!(after.conflicts.is_empty());
+
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
+}
+
+#[test]
+fn selection_matches_core_distribution_select() {
+    let root = temp_root("selection-core-cross-check");
+    write_selection_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+    let distribution = sw_core::distribution::Distribution::open(&root).unwrap();
+
+    let pairs = vec![
+        hw("CPUBOARD", "IP22"),
+        hw("CPUARCH", "R4000"),
+        hw("CPUARCH", "R5000"),
+    ];
+    let mut builder = HardwareProfile::builder();
+    for pair in &pairs {
+        builder = builder.add(&pair.attribute, &pair.value);
+    }
+    let core = distribution.select(&builder.build());
+    let snapshot = backend.select_entries(pairs).unwrap();
+
+    // Same selection, same order: the bridge adds only key
+    // resolution, never its own semantics.
+    assert_eq!(snapshot.selected.len(), core.selected.len());
+    let bridge_paths: Vec<String> = snapshot
+        .selected
+        .iter()
+        .map(|key| {
+            backend
+                .entry_detail(key.product_id, key.entry_id)
+                .unwrap()
+                .path
+        })
+        .collect();
+    let core_paths: Vec<String> = core
+        .selected
+        .iter()
+        .map(|entry| entry.path.to_string())
+        .collect();
+    assert_eq!(bridge_paths, core_paths);
+
+    assert_eq!(snapshot.conflicts.len(), core.conflicts.len());
+    for (bridge_conflict, core_conflict) in snapshot.conflicts.iter().zip(core.conflicts.iter()) {
+        assert_eq!(bridge_conflict.path, core_conflict.path.to_string());
+        let bridge_candidates: Vec<String> = bridge_conflict
+            .candidates
+            .iter()
+            .map(|key| {
+                backend
+                    .entry_detail(key.product_id, key.entry_id)
+                    .unwrap()
+                    .path
+            })
+            .collect();
+        let core_candidates: Vec<String> = core_conflict
+            .candidates
+            .iter()
+            .map(|entry| entry.path.to_string())
+            .collect();
+        assert_eq!(bridge_candidates, core_candidates);
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Hardware candidate and selection smoke test against a real
+/// distribution directory, using the same `SW_EXPLORER_TEST_DIST`
+/// opt-in as the other smoke tests.
+///
+/// The profile is built from values the media actually carry (never
+/// from a built-in machine database), and the bridge selection is
+/// cross-checked entry by entry against the core selection the CLI
+/// exposes through `sw select`.
+#[test]
+fn real_dist_hardware_smoke() {
+    let Some(raw) = std::env::var_os("SW_EXPLORER_TEST_DIST") else {
+        eprintln!("SW_EXPLORER_TEST_DIST not set; skipping");
+        return;
+    };
+    let path = PathBuf::from(raw);
+    assert!(
+        path.is_dir(),
+        "SW_EXPLORER_TEST_DIST is set but not a directory: {}",
+        path.display()
+    );
+
+    let mut backend = new_backend();
+    backend.open_distribution(path.to_str().unwrap()).unwrap();
+    let distribution = sw_core::distribution::Distribution::open(&path).unwrap();
+
+    // Candidates come from the media: at least one attribute set, no
+    // empty names. Empty values are kept when the media carry them
+    // (e.g. `GFXBOARD=` restricts an entry to headless boards).
+    let candidates = backend.hardware_candidates().unwrap();
+    assert!(
+        !candidates.is_empty(),
+        "expected MACH candidates in a full media set"
+    );
+    for set in &candidates {
+        assert!(!set.attribute.is_empty());
+        assert!(!set.values.is_empty());
+    }
+
+    // Profile: the first CPUBOARD value the media use (a full media
+    // set always restricts some entries by CPU board).
+    let board = candidates
+        .iter()
+        .find(|set| set.attribute == "CPUBOARD")
+        .and_then(|set| set.values.first())
+        .expect("a full media set carries CPUBOARD candidates");
+    let pairs = vec![hw("CPUBOARD", board)];
+    let mut builder = HardwareProfile::builder();
+    for pair in &pairs {
+        builder = builder.add(&pair.attribute, &pair.value);
+    }
+    let core = distribution.select(&builder.build());
+    let snapshot = backend.select_entries(pairs).unwrap();
+
+    assert!(!snapshot.selected.is_empty());
+    assert_eq!(snapshot.selected.len(), core.selected.len());
+    assert_eq!(snapshot.conflicts.len(), core.conflicts.len());
+
+    // Every selected key resolves back to the very entry the core
+    // selected at that position.
+    for (key, entry) in snapshot.selected.iter().zip(core.selected.iter()) {
+        let detail = backend.entry_detail(key.product_id, key.entry_id).unwrap();
+        assert_eq!(detail.path, entry.path.to_string());
+        assert_eq!(detail.subsystem, entry.subsystem.to_string());
+    }
+    // Conflict candidates resolve as well.
+    for conflict in &snapshot.conflicts {
+        assert!(!conflict.candidates.is_empty());
+        for key in &conflict.candidates {
+            backend.entry_detail(key.product_id, key.entry_id).unwrap();
+        }
+    }
+
+    // A different media-carried board selects differently somewhere:
+    // at minimum the core cross-check above pins the semantics for
+    // any profile, so here only the bridge/core agreement is
+    // re-verified for the alternative value.
+    if let Some(other) = candidates
+        .iter()
+        .find(|set| set.attribute == "CPUBOARD")
+        .and_then(|set| set.values.get(1))
+    {
+        let alt_pairs = vec![hw("CPUBOARD", other)];
+        let mut builder = HardwareProfile::builder();
+        for pair in &alt_pairs {
+            builder = builder.add(&pair.attribute, &pair.value);
+        }
+        let alt_core = distribution.select(&builder.build());
+        let alt_snapshot = backend.select_entries(alt_pairs).unwrap();
+        assert_eq!(alt_snapshot.selected.len(), alt_core.selected.len());
+        assert_eq!(alt_snapshot.conflicts.len(), alt_core.conflicts.len());
+    }
 }
