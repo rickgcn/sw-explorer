@@ -6,9 +6,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(Qt6 6.8 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Widgets Test)
 
 qt_standard_project_setup()
+
+enable_testing()
 
 # ---------------------------------------------------------------------------
 # Workspace layout
@@ -252,3 +254,53 @@ target_link_libraries(sw-explorer PRIVATE
 if(SW_NATIVE_LIB_DIRS)
     target_link_directories(sw-explorer PRIVATE ${SW_NATIVE_LIB_DIRS})
 endif()
+
+# ---------------------------------------------------------------------------
+# Tests
+#
+# The model tests are GUI-free (QTEST_GUILESS_MAIN), so they run
+# headless on every CI platform.
+# ---------------------------------------------------------------------------
+
+add_executable(DistributionTreeModelTest
+    tests/DistributionTreeModelTest.cpp
+    src/HierarchySnapshot.h
+    src/models/DistributionTreeModel.h
+    src/models/DistributionTreeModel.cpp
+)
+
+target_include_directories(DistributionTreeModelTest PRIVATE src)
+
+target_link_libraries(DistributionTreeModelTest PRIVATE
+    Qt6::Core
+    Qt6::Test
+)
+
+add_test(NAME DistributionTreeModelTest COMMAND DistributionTreeModelTest)
+
+# The worker test drives the real Rust backend through the CXX
+# bridge, so it links the staticlib exactly like the application.
+add_executable(BackendWorkerTest
+    tests/BackendWorkerTest.cpp
+    src/HierarchySnapshot.h
+    src/BackendWorker.h
+    src/BackendWorker.cpp
+    "${SW_GENERATED_SOURCE}"
+)
+
+target_include_directories(BackendWorkerTest PRIVATE src "${SW_GENERATED_DIR}")
+
+add_dependencies(BackendWorkerTest sw_gui_bridge_staticlib)
+
+target_link_libraries(BackendWorkerTest PRIVATE
+    Qt6::Core
+    Qt6::Test
+    sw_gui_bridge
+    ${SW_NATIVE_LIBS}
+)
+
+if(SW_NATIVE_LIB_DIRS)
+    target_link_directories(BackendWorkerTest PRIVATE ${SW_NATIVE_LIB_DIRS})
+endif()
+
+add_test(NAME BackendWorkerTest COMMAND BackendWorkerTest)

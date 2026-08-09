@@ -33,3 +33,12 @@ it together with the native libraries reported by
 
 Run the resulting `sw-explorer` binary (or `sw-explorer.app` on macOS)
 and use *File > Open Distribution...* to open an IRIX `dist` directory.
+
+## Tests
+
+The Qt model tests use Qt Test and CTest. They are GUI-free
+(`QTEST_GUILESS_MAIN`) and run headless on every platform:
+
+```sh
+ctest --test-dir build/sw-explorer --build-config Release --output-on-failure
+```
