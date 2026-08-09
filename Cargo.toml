@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "crates/sw-cli",
-    "crates/sw-core"
+    "crates/sw-core",
+    "crates/sw-gui-bridge"
 ]
 resolver = "3"
 
@@ -17,3 +18,4 @@ sw-core = { path = "crates/sw-core" }
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
+cxx = "=1.0.199"
