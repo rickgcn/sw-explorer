@@ -1,0 +1,3 @@
+# Golden test fixtures are byte-exact data.
+# Never perform text / line-ending normalization on them.
+crates/*/tests/data/** -text
