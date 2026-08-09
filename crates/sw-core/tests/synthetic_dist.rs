@@ -1,7 +1,7 @@
 //! Deterministic end-to-end tests against a tiny synthetic distribution
 //! built in a temporary directory: descriptor + IDB + one image archive.
 use std::path::PathBuf;
-use sw_core::descriptor::model::{SubsystemPresence, Version};
+use sw_core::descriptor::model::{ConditionalFlag, SubsystemPresence, Version};
 use sw_core::distribution::Distribution;
 use sw_core::extract::{self, DecodeMode, ExtractOptions, PathMode};
 use sw_core::image::PayloadResolution;
@@ -11,7 +11,7 @@ use sw_core::path::IrixPath;
 /// Builds a minimal but complete level-9 descriptor for a product with
 /// one `sw` image and one `unix` subsystem, plus — with `ghost` — a
 /// second subsystem that no IDB entry references.
-fn descriptor_bytes(product: &str, ghost: bool) -> Vec<u8> {
+fn descriptor_bytes(product: &str, ghost: bool, unix_attrs: &[&str]) -> Vec<u8> {
     fn lp16(bytes: &mut Vec<u8>, s: &str) {
         bytes.extend_from_slice(&(s.len() as u16).to_be_bytes());
         bytes.extend_from_slice(s.as_bytes());
@@ -63,8 +63,10 @@ fn descriptor_bytes(product: &str, ghost: bool) -> Vec<u8> {
     bytes.extend_from_slice(&0u16.to_be_bytes()); // slot 4
     bytes.extend_from_slice(&0u16.to_be_bytes()); // slot 5
     bytes.extend_from_slice(&0u16.to_be_bytes()); // slot 6
-    bytes.extend_from_slice(&1u16.to_be_bytes()); // slot 7: one string
-    lp16(&mut bytes, "DMODE=64bit");
+    bytes.extend_from_slice(&(unix_attrs.len() as u16).to_be_bytes()); // slot 7
+    for attr in unix_attrs {
+        lp16(&mut bytes, attr);
+    }
     bytes.extend_from_slice(&0u16.to_be_bytes()); // slot 8
 
     if ghost {
@@ -124,7 +126,29 @@ fn build_dist() -> PathBuf {
     }
     std::fs::write(root.join("test.sw"), archive).unwrap();
 
-    std::fs::write(root.join("test"), descriptor_bytes("test", true)).unwrap();
+    std::fs::write(
+        root.join("test"),
+        descriptor_bytes("test", true, &["DMODE=64bit"]),
+    )
+    .unwrap();
+
+    // A product whose subsystem carries an unparsable `mach` attribute,
+    // and a product with a descriptor but no IDB at all.
+    std::fs::write(
+        root.join("side"),
+        descriptor_bytes("side", false, &["m=IP99"]),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("side.idb"),
+        "f 0644 root sys bin/side src/side side.sw.unix sum(1) size(4) cmpsize(0)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("bare"),
+        descriptor_bytes("bare", false, &["DMODE=64bit"]),
+    )
+    .unwrap();
 
     // Assembled as bytes because the IDB is Latin-1: the café.txt line
     // contains a raw 0xE9 byte.
@@ -180,9 +204,11 @@ fn descriptor_is_the_hierarchy_authority() {
     assert_eq!(descriptor.name, "test");
     assert_eq!(descriptor.stamp, 0x0102_0304);
     assert_eq!(product.title.as_deref(), Some("Synthetic Test Product"));
-    // Unknown metadata is preserved raw, not interpreted.
-    assert_eq!(descriptor.metadata.len(), 1);
-    assert!(descriptor.metadata[0].mach().is_none());
+    // Unknown attributes are preserved raw, not interpreted.
+    assert_eq!(descriptor.attributes.len(), 1);
+    assert_eq!(descriptor.attributes[0].tag, b'P');
+    assert_eq!(descriptor.attributes[0].text, "16909060_42");
+    assert!(descriptor.attributes[0].mach().is_none());
 
     let image = product
         .images
@@ -191,6 +217,7 @@ fn descriptor_is_the_hierarchy_authority() {
         .expect("image sw");
     assert_eq!(image.title.as_deref(), Some("System Software"));
     assert_eq!(image.version, Some(Version(0x0102_0305)));
+    assert_eq!(image.order, Some(9999));
 
     let unix = image
         .subsystems
@@ -209,7 +236,24 @@ fn descriptor_is_the_hierarchy_authority() {
     let rules = unix.rules.as_ref().expect("descriptor-decoded rules");
     assert_eq!(rules.prerequisites.len(), 1);
     assert_eq!(rules.prerequisites[0].all_of[0].target(), "other.sw.base");
-    assert!(rules.replaces.is_none());
+    assert_eq!(rules.replaces.len(), 1);
+    assert_eq!(rules.replaces[0].target(), "patch*.sw.unix");
+    assert!(rules.follows.is_empty());
+    assert!(rules.incompatibilities.is_empty());
+    assert!(rules.updates.is_empty());
+
+    // The raw flag word 0x0852 carries the default bit, and the `D`
+    // attribute makes it hardware-conditional.
+    let flags = unix.flags.as_ref().expect("descriptor-decoded flags");
+    assert_eq!(flags.required, ConditionalFlag::No);
+    let ConditionalFlag::When(expressions) = &flags.default else {
+        panic!("default flag must be hardware-conditional");
+    };
+    assert_eq!(expressions.len(), 1);
+    assert_eq!(flags.miniroot, ConditionalFlag::No);
+    assert!(flags.inplace);
+    assert!(!flags.patch);
+    assert!(unix.mach.as_ref().unwrap().is_empty());
     assert!(!unix.entry_ids.is_empty());
 
     // Declared in the descriptor but absent from the IDB: legal, kept,
@@ -321,6 +365,58 @@ fn selection_falls_back_without_match() {
 }
 
 #[test]
+fn discovers_products_with_only_one_authority() {
+    let (_root, dist) = open();
+    // Descriptor + IDB.
+    assert!(dist.product("test").unwrap().idb_file.is_some());
+    assert!(dist.product("side").is_some());
+
+    // Descriptor only: kept, with an empty entry list and a warning.
+    let bare = dist.product("bare").expect("descriptor-only product");
+    assert!(bare.descriptor.is_some());
+    assert!(bare.idb_file.is_none());
+    assert!(bare.entries.is_empty());
+    assert!(!bare.images.is_empty());
+    assert!(
+        bare.diagnostics
+            .iter()
+            .any(|d| d.message.contains("no IDB"))
+    );
+}
+
+#[test]
+fn selection_reports_unresolved_subsystem_mach() {
+    let (_root, dist) = open();
+    let profile = HardwareProfile::builder()
+        .set("CPUBOARD", "IP22")
+        .set("CPUARCH", "R4400")
+        .build();
+    let selection = dist.select(&profile);
+
+    // side.sw.unix carries an unparsable `mach` expression: its
+    // applicability is unknown, so its entry is reported as a conflict
+    // and never silently selected.
+    let side = dist.product("side").unwrap();
+    let unix = &side.images[0].subsystems[0];
+    assert_eq!(
+        unix.mach.as_ref().unwrap().unresolved,
+        &["=IP99".to_string()]
+    );
+    assert!(
+        !selection
+            .selected
+            .iter()
+            .any(|e| e.subsystem.to_string() == "side.sw.unix")
+    );
+    let conflict = selection
+        .conflicts
+        .iter()
+        .find(|c| c.path.as_str() == "bin/side")
+        .expect("bin/side conflict");
+    assert_eq!(conflict.candidates.len(), 1);
+}
+
+#[test]
 fn extracts_to_host_filesystem() {
     let (root, dist) = open();
     let out = root.join("out");
@@ -358,7 +454,7 @@ fn regular_entry_without_payload_is_a_failure() {
     let root = std::env::temp_dir().join(format!("sw-core-nopayload-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("t"), descriptor_bytes("t", false)).unwrap();
+    std::fs::write(root.join("t"), descriptor_bytes("t", false, &[])).unwrap();
     // No cmpsize at all: no payload record exists for this file.
     std::fs::write(
         root.join("t.idb"),

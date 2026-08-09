@@ -255,3 +255,107 @@ fn descriptors_parse_and_reconcile_with_idb() {
     );
     assert!(idb_only.is_empty(), "IDB-only subsystems: {idb_only:?}");
 }
+
+/// Descriptor semantics must be fully decoded on real media: every
+/// descriptor-backed subsystem carries decoded flags, mach, autominiroot
+/// and rules (IDB-only subsystems carry nothing), and the decoded values
+/// must respect the writer's invariants.
+#[test]
+fn descriptor_semantics_are_decoded() {
+    let Some(path) = dist_path() else {
+        eprintln!("SW_EXPLORER_TEST_DIST not set; skipping");
+        return;
+    };
+    let dist = Distribution::open(&path).expect("open distribution");
+
+    let mut patches = 0usize;
+    let mut follows_records = 0usize;
+    let mut conditional_flags = 0usize;
+    let mut mach_restricted = 0usize;
+    let mut miniroot = 0usize;
+    for product in dist.products() {
+        if product.descriptor.is_some() {
+            let mach = product.mach.as_ref().unwrap_or_else(|| {
+                panic!("{}: descriptor product without decoded mach", product.name)
+            });
+            assert!(
+                mach.unresolved.is_empty(),
+                "{}: unparsable product mach expressions: {:?}",
+                product.name,
+                mach.unresolved
+            );
+        }
+        for image in &product.images {
+            if let Some(mach) = &image.mach {
+                assert!(
+                    mach.unresolved.is_empty(),
+                    "{}: unparsable image mach expressions: {:?}",
+                    image.name,
+                    mach.unresolved
+                );
+            }
+            for subsystem in &image.subsystems {
+                match (
+                    subsystem.presence.descriptor,
+                    &subsystem.flags,
+                    &subsystem.rules,
+                ) {
+                    (true, Some(flags), Some(rules)) => {
+                        let mach = subsystem.mach.as_ref().unwrap();
+                        assert!(
+                            mach.unresolved.is_empty(),
+                            "{}: unparsable subsystem mach expressions: {:?}",
+                            subsystem.name,
+                            mach.unresolved
+                        );
+                        assert!(subsystem.autominiroot.is_some());
+                        // `follows` is only ever encoded for patches.
+                        if !rules.follows.is_empty() {
+                            follows_records += rules.follows.len();
+                            assert!(
+                                flags.patch,
+                                "{}: follows records on a non-patch subsystem",
+                                subsystem.name
+                            );
+                        }
+                        // The miniroot decode is exactly "inplace cleared".
+                        assert_eq!(
+                            flags.miniroot != sw_core::descriptor::model::ConditionalFlag::No,
+                            !flags.inplace,
+                            "{}: miniroot/inplace mismatch",
+                            subsystem.name
+                        );
+                        if flags.patch {
+                            patches += 1;
+                        }
+                        if matches!(
+                            flags.required,
+                            sw_core::descriptor::model::ConditionalFlag::When(_)
+                        ) || matches!(
+                            flags.default,
+                            sw_core::descriptor::model::ConditionalFlag::When(_)
+                        ) {
+                            conditional_flags += 1;
+                        }
+                        if !subsystem.mach.as_ref().unwrap().is_empty() {
+                            mach_restricted += 1;
+                        }
+                        if flags.miniroot != sw_core::descriptor::model::ConditionalFlag::No {
+                            miniroot += 1;
+                        }
+                    }
+                    (false, None, None) => {
+                        assert!(subsystem.mach.is_none());
+                        assert!(subsystem.autominiroot.is_none());
+                    }
+                    _ => panic!("{}: presence/decoded semantics mismatch", subsystem.name),
+                }
+            }
+        }
+    }
+    eprintln!(
+        "semantics: {patches} patch subsystems, {follows_records} follows records, \
+         {conditional_flags} hardware-conditional flags, {mach_restricted} mach-restricted, \
+         {miniroot} miniroot"
+    );
+}
