@@ -296,6 +296,177 @@ pub(crate) mod ffi {
         autominiroot: Vec<RangeDetail>,
     }
 
+    /// The kind of filesystem object an IDB record describes.
+    ///
+    /// Mirrors `sw_core::idb::FileType`; a type letter the bridge does
+    /// not know maps to `Other`, with the raw letter preserved in
+    /// `file_type_raw`.
+    enum EntryFileType {
+        /// `f` — a regular file.
+        Regular,
+        /// `d` — a directory.
+        Directory,
+        /// `l` — a symbolic link.
+        SymbolicLink,
+        /// `b` — a block special device.
+        BlockDevice,
+        /// `c` — a character special device.
+        CharacterDevice,
+        /// `p` — a named pipe (FIFO).
+        Fifo,
+        /// Any other type letter; `file_type_raw` carries it.
+        Other,
+    }
+
+    /// One row of the entry browser: one IDB record.
+    ///
+    /// Rows are IDB records, not a deduplicated installed filesystem:
+    /// the same path may appear several times (hardware-conditional
+    /// variants) and every occurrence is its own row.
+    struct EntrySummary {
+        /// Object id of the containing product.
+        product_id: u64,
+        /// The sw-core entry id: the 0-based position in the
+        /// product's entry list. Zero is a perfectly valid id.
+        entry_id: u64,
+
+        /// Normalized install path, e.g. `usr/bin/Xsgi`.
+        path: String,
+        /// Fully qualified subsystem, e.g. `eoe.sw.unix`.
+        subsystem: String,
+
+        /// The kind of filesystem object.
+        file_type: EntryFileType,
+        /// The raw IDB type letter; meaningful even when `file_type`
+        /// is `Other`.
+        file_type_raw: String,
+
+        /// Whether the `size(...)` attribute is present.
+        size_known: bool,
+        /// Uncompressed size in bytes, when known.
+        size: u64,
+
+        /// Whether the archive stored size is known.
+        stored_size_known: bool,
+        /// Bytes occupied in the image archive: `cmpsize` when
+        /// non-zero, `size` when stored uncompressed. A `cmpsize(0)`
+        /// record never surfaces as "stored size 0".
+        stored_size: u64,
+
+        /// Parsed `mach(...)` expression texts, exactly as written.
+        mach: Vec<String>,
+        /// Raw `mach(...)` payloads that could not be parsed; never
+        /// dropped.
+        unresolved_mach: Vec<String>,
+    }
+
+    /// Everything the inspector shows for one IDB entry.
+    ///
+    /// The important attributes are structured; the complete original
+    /// IDB record line is kept as the lossless fallback for every
+    /// attribute that has no dedicated field.
+    struct EntryDetail {
+        /// Object id of the containing product.
+        product_id: u64,
+        /// The sw-core entry id; zero is a perfectly valid id.
+        entry_id: u64,
+
+        /// The kind of filesystem object.
+        file_type: EntryFileType,
+        /// The raw IDB type letter; meaningful even when `file_type`
+        /// is `Other`.
+        file_type_raw: String,
+
+        /// Permission bits, parsed from the octal IDB field.
+        mode: u32,
+        /// Owner name, e.g. `root`.
+        owner: String,
+        /// Group name, e.g. `sys`.
+        group: String,
+
+        /// Normalized install path.
+        path: String,
+        /// Install path exactly as written in the IDB.
+        raw_path: String,
+        /// Build-tree source path recorded by `gendist`.
+        source_path: String,
+        /// Fully qualified subsystem, e.g. `eoe.sw.unix`.
+        subsystem: String,
+
+        /// Whether the `size(...)` attribute is present.
+        size_known: bool,
+        /// Uncompressed size in bytes, when known.
+        size: u64,
+
+        /// Whether the `cmpsize(...)` attribute is present.
+        compressed_size_known: bool,
+        /// Size as stored in the image archive, when known; zero
+        /// means the file is stored uncompressed.
+        compressed_size: u64,
+
+        /// Whether the archive stored size is known.
+        stored_size_known: bool,
+        /// Bytes occupied in the image archive (`cmpsize` when
+        /// non-zero, `size` when stored uncompressed).
+        stored_size: u64,
+
+        /// Whether the `sum(...)` checksum attribute is present.
+        checksum_known: bool,
+        /// Checksum of the installed file, when known.
+        checksum: u64,
+
+        /// Whether the `config(...)` attribute is present.
+        config_known: bool,
+        /// Config mode: `suggest`, `update`, `noupdate`, or the raw
+        /// value when it is none of the known modes.
+        config_mode: String,
+
+        /// Whether the entry carries a `symval(...)` target.
+        symlink_target_known: bool,
+        /// Symbolic link target, when known.
+        symlink_target: String,
+
+        /// Whether the entry carries `dev(major minor)` numbers.
+        device_known: bool,
+        /// Major device number, when known.
+        device_major: u32,
+        /// Minor device number, when known.
+        device_minor: u32,
+
+        /// Parsed `mach(...)` expression texts, exactly as written.
+        /// An entry without MACH attributes is known to be
+        /// unrestricted, which is not the same as unknown.
+        mach: Vec<String>,
+        /// Raw `mach(...)` payloads that could not be parsed; never
+        /// dropped.
+        unresolved_mach: Vec<String>,
+
+        /// Whether the entry carries payload bytes in an image
+        /// archive.
+        payload_present: bool,
+        /// The image archive holding the payload, e.g. `eoe.sw`.
+        payload_image: String,
+
+        /// Whether the stored payload size is known.
+        payload_encoded_size_known: bool,
+        /// Size of the payload as stored, when known.
+        payload_encoded_size: u64,
+
+        /// Whether the layout algorithm could predict the record
+        /// offset. This is an *expected* offset: it has not been
+        /// confirmed by reading the archive.
+        expected_record_offset_known: bool,
+        /// Expected record offset, when known.
+        expected_record_offset: u64,
+
+        /// The IDB file the entry was parsed from.
+        origin_idb_path: String,
+        /// 1-based line number within that file.
+        origin_line: u64,
+        /// The complete original IDB record line.
+        raw_idb_line: String,
+    }
+
     extern "Rust" {
         /// Opaque handle to the Rust backend state.
         type Backend;
@@ -336,5 +507,27 @@ pub(crate) mod ffi {
         /// Fails when no distribution is loaded, when `id` is zero or
         /// unknown, or when `id` identifies a product or image.
         fn subsystem_detail(self: &Backend, id: u64) -> Result<SubsystemDetail>;
+
+        /// Lists the IDB entries below a product, image or subsystem
+        /// scope, in exact IDB order.
+        ///
+        /// Every scope filters the product's flat entry list, so
+        /// interleaved subsystem records are never regrouped and
+        /// duplicate paths (hardware-conditional variants) are never
+        /// deduplicated.
+        ///
+        /// Fails when no distribution is loaded or when `scope_id`
+        /// is zero or unknown.
+        fn entries(self: &Backend, scope_id: u64) -> Result<Vec<EntrySummary>>;
+
+        /// Returns the detail snapshot of one entry.
+        ///
+        /// `product_id` must identify a product and `entry_id` must
+        /// exist in that product's entry list; entry id 0 is valid.
+        ///
+        /// Fails when no distribution is loaded, when `product_id`
+        /// is zero, unknown or not a product, or when `entry_id`
+        /// is out of range.
+        fn entry_detail(self: &Backend, product_id: u64, entry_id: u64) -> Result<EntryDetail>;
     }
 }

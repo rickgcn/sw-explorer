@@ -10,7 +10,9 @@
 //!   a failed open keeps the previous state untouched.
 use crate::bridge::ffi;
 use crate::detail;
+use crate::entry;
 use sw_core::distribution::Distribution;
+use sw_core::idb::EntryId;
 
 /// Identifies one domain object of the loaded distribution by its
 /// position: product index, image index and subsystem index into
@@ -255,5 +257,84 @@ impl Backend {
             &image.subsystems[subsystem_index],
             id,
         ))
+    }
+
+    /// Object id of the product with the given index, found by
+    /// scanning the object table — never derived from id arithmetic.
+    fn product_object_id(&self, product_index: usize) -> Result<u64, ObjectDetailError> {
+        self.objects
+            .iter()
+            .position(|entry| {
+                matches!(entry.reference, ObjectRef::Product(index) if index == product_index)
+            })
+            .map(|position| position as u64 + 1)
+            .ok_or_else(|| {
+                ObjectDetailError(format!("product index {product_index} has no object id"))
+            })
+    }
+
+    pub(crate) fn entries(
+        &self,
+        scope_id: u64,
+    ) -> Result<Vec<ffi::EntrySummary>, ObjectDetailError> {
+        let (reference, distribution) = self.resolve_object(scope_id)?;
+        let product_index = match *reference {
+            ObjectRef::Product(product_index) => product_index,
+            ObjectRef::Image(product_index, _) => product_index,
+            ObjectRef::Subsystem(product_index, ..) => product_index,
+        };
+        let product = &distribution.products()[product_index];
+        let product_id = self.product_object_id(product_index)?;
+
+        // Every scope filters the product's flat entry list, so the
+        // result keeps the exact IDB order: interleaved subsystem
+        // records are never regrouped, and duplicate paths are never
+        // deduplicated.
+        let scoped: Vec<&sw_core::idb::Entry> = match *reference {
+            ObjectRef::Product(_) => product.entries.iter().collect(),
+            ObjectRef::Image(_, image_index) => {
+                let image_name = &product.images[image_index].name;
+                product
+                    .entries
+                    .iter()
+                    .filter(|entry| &entry.subsystem.image_name() == image_name)
+                    .collect()
+            }
+            ObjectRef::Subsystem(_, image_index, subsystem_index) => {
+                let name = &product.images[image_index].subsystems[subsystem_index].name;
+                product
+                    .entries
+                    .iter()
+                    .filter(|entry| &entry.subsystem == name)
+                    .collect()
+            }
+        };
+        Ok(scoped
+            .into_iter()
+            .map(|entry| entry::entry_summary(product_id, entry))
+            .collect())
+    }
+
+    pub(crate) fn entry_detail(
+        &self,
+        product_id: u64,
+        entry_id: u64,
+    ) -> Result<ffi::EntryDetail, ObjectDetailError> {
+        let (reference, distribution) = self.resolve_object(product_id)?;
+        let ObjectRef::Product(product_index) = *reference else {
+            return Err(wrong_kind(product_id, "a product", reference));
+        };
+        let product = &distribution.products()[product_index];
+        let missing = || {
+            ObjectDetailError(format!(
+                "entry {entry_id} does not exist in product {}",
+                product.name.as_str()
+            ))
+        };
+        // Checked conversion first, then a bounds-checked lookup;
+        // entry id 0 is a perfectly valid first entry.
+        let index = usize::try_from(entry_id).map_err(|_| missing())?;
+        let entry = product.entry(EntryId(index)).ok_or_else(missing)?;
+        Ok(entry::entry_detail(product_id, entry))
     }
 }

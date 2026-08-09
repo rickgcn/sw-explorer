@@ -12,8 +12,11 @@
 //!   distribution and its object-id table.
 //! * `detail` converts `sw-core` domain objects into the detail DTOs
 //!   declared by `bridge`.
+//! * `entry` converts `sw-core` entries into the entry summary and
+//!   detail DTOs declared by `bridge`.
 mod backend;
 mod bridge;
 mod detail;
+mod entry;
 #[cfg(test)]
 mod tests;

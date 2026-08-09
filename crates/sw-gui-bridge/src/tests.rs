@@ -43,6 +43,40 @@ fn write_idb(root: &Path, product: &str, entries: &[(&str, &str)]) {
     std::fs::write(root.join(format!("{product}.idb")), idb).unwrap();
 }
 
+/// Writes an IDB file with the exact given content, for entry tests
+/// that need full control over every record.
+fn write_raw_idb(root: &Path, product: &str, content: &str) {
+    std::fs::write(root.join(format!("{product}.idb")), content).unwrap();
+}
+
+/// Writes the standard entry test distribution: one IDB-only product
+/// `entries` whose records exercise ordering, duplicate paths, file
+/// types, MACH variants and size semantics.
+///
+/// Image `entries.sw` holds subsystems `alpha` and `beta` with
+/// deliberately interleaved records; image `entries.man` holds `man`.
+///
+/// Object ids: 1 = product `entries`, 2 = image `entries.sw`,
+/// 3 = `alpha`, 4 = `beta`, 5 = image `entries.man`, 6 = `man`.
+fn write_entries_dist(root: &Path) {
+    write_raw_idb(
+        root,
+        "entries",
+        "f 0755 root sys usr/bin/a src/a entries.sw.alpha sum(10) size(100) cmpsize(60)\n\
+         f 0644 root sys usr/lib/libx.so src/libx entries.sw.beta sum(20) size(200) cmpsize(0) mach(CPUBOARD=IP22)\n\
+         f 0644 root sys usr/lib/libx.so src/libx2 entries.sw.beta sum(21) size(210) cmpsize(0) mach(CPUBOARD=IP26)\n\
+         d 0755 root sys etc src/etc entries.sw.alpha\n\
+         f 0644 root sys man/a src/man/a entries.man.man sum(30) size(300) cmpsize(0)\n\
+         l 0777 root sys usr/bin/link src/l entries.sw.alpha symval(../lib/libx.so)\n\
+         b 0600 root sys dev/dsk0 src/d entries.sw.alpha dev(1 2)\n\
+         f 0644 root sys usr/lib/libx.so src/libx3 entries.sw.beta sum(22) size(220) cmpsize(50) mach(=GARBAGE)\n\
+         x 0644 root sys weird src/w entries.sw.alpha sum(1) size(5) cmpsize(0)\n\
+         f 0644 root sys usr/bin/cfg src/cfg entries.sw.alpha sum(9) size(9) cmpsize(0) config(wildmode)\n\
+         f 0644 root sys usr/bin/nocmp src/n entries.sw.alpha sum(5) size(77)\n\
+         f 0644 root sys man/b src/man/b entries.man.man sum(31) size(310) cmpsize(0)\n",
+    );
+}
+
 /// Builds a minimal level-9 descriptor for a product with a single
 /// `sw` image containing the given subsystems.
 fn write_descriptor(root: &Path, product: &str, subsystems: &[&str]) {
@@ -1086,6 +1120,475 @@ fn real_dist_detail_smoke() {
                 assert_eq!(detail.mach.known, detail.descriptor_present);
                 assert_eq!(detail.mapping_known, detail.descriptor_present);
                 assert_eq!(detail.autominiroot_known, detail.descriptor_present);
+            }
+            _ => panic!("unexpected object kind"),
+        }
+    }
+}
+
+#[test]
+fn entries_require_loaded_distribution() {
+    let backend = new_backend();
+    assert_eq!(
+        backend.entries(1).err().unwrap().to_string(),
+        "no distribution loaded"
+    );
+    assert_eq!(
+        backend.entry_detail(1, 0).err().unwrap().to_string(),
+        "no distribution loaded"
+    );
+}
+
+#[test]
+fn entries_reject_zero_and_out_of_range_scope_ids() {
+    let root = temp_root("entries-bad-scope");
+    write_entries_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+    // Six objects: product, two images with their subsystems.
+    assert_eq!(backend.hierarchy().unwrap().len(), 6);
+
+    assert_eq!(
+        backend.entries(0).err().unwrap().to_string(),
+        "object id 0 does not identify a distribution object"
+    );
+    assert_eq!(
+        backend.entries(7).err().unwrap().to_string(),
+        "object 7 does not exist"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn product_scope_returns_all_entries_in_idb_order() {
+    let root = temp_root("entries-product-scope");
+    write_entries_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    let rows = backend.entries(1).unwrap();
+    assert_eq!(rows.len(), 12);
+    // Product scope is the flat entry list: ids are exactly 0..n and
+    // every row carries the product's object id.
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row.entry_id, index as u64);
+        assert_eq!(row.product_id, 1);
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn image_scope_keeps_interleaved_idb_order() {
+    let root = temp_root("entries-image-scope");
+    write_entries_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // Image entries.sw (object 2) holds alpha and beta records that
+    // are interleaved in the IDB; the scope must not regroup them
+    // by subsystem.
+    let rows = backend.entries(2).unwrap();
+    let paths: Vec<&str> = rows.iter().map(|row| row.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "usr/bin/a",
+            "usr/lib/libx.so",
+            "usr/lib/libx.so",
+            "etc",
+            "usr/bin/link",
+            "dev/dsk0",
+            "usr/lib/libx.so",
+            "weird",
+            "usr/bin/cfg",
+            "usr/bin/nocmp",
+        ]
+    );
+    let ids: Vec<u64> = rows.iter().map(|row| row.entry_id).collect();
+    assert_eq!(ids, vec![0, 1, 2, 3, 5, 6, 7, 8, 9, 10]);
+    assert!(rows.iter().all(|row| row.product_id == 1));
+
+    // The other image sees only its own records.
+    let man = backend.entries(5).unwrap();
+    let man_paths: Vec<&str> = man.iter().map(|row| row.path.as_str()).collect();
+    assert_eq!(man_paths, vec!["man/a", "man/b"]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn subsystem_scope_keeps_idb_order_and_duplicate_paths() {
+    let root = temp_root("entries-subsystem-scope");
+    write_entries_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // Subsystem beta (object 4): three records, all with the same
+    // path. They are IDB records — hardware-conditional variants —
+    // and must stay three rows in their original relative order.
+    let beta = backend.entries(4).unwrap();
+    assert_eq!(beta.len(), 3);
+    let ids: Vec<u64> = beta.iter().map(|row| row.entry_id).collect();
+    assert_eq!(ids, vec![1, 2, 7]);
+    assert!(beta.iter().all(|row| row.path == "usr/lib/libx.so"));
+    assert!(
+        beta.iter()
+            .all(|row| row.subsystem == "entries.sw.beta" && row.product_id == 1)
+    );
+
+    let alpha = backend.entries(3).unwrap();
+    let alpha_ids: Vec<u64> = alpha.iter().map(|row| row.entry_id).collect();
+    assert_eq!(alpha_ids, vec![0, 3, 5, 6, 8, 9, 10]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn entry_summary_reports_sizes_types_and_mach() {
+    let root = temp_root("entries-summary-fields");
+    write_entries_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+    let rows = backend.entries(1).unwrap();
+
+    // Compressed file: stored size is cmpsize, not size.
+    assert!(rows[0].size_known);
+    assert_eq!(rows[0].size, 100);
+    assert!(rows[0].stored_size_known);
+    assert_eq!(rows[0].stored_size, 60);
+    assert!(matches!(rows[0].file_type, ffi::EntryFileType::Regular));
+    assert_eq!(rows[0].file_type_raw, "f");
+
+    // cmpsize(0) means stored uncompressed: stored size is the plain
+    // size, never 0.
+    assert!(rows[1].stored_size_known);
+    assert_eq!(rows[1].stored_size, 200);
+    assert_eq!(rows[1].mach, vec!["CPUBOARD=IP22".to_string()]);
+    assert!(rows[1].unresolved_mach.is_empty());
+
+    // Directory: no size attributes at all, both unknown.
+    assert!(!rows[3].size_known);
+    assert!(!rows[3].stored_size_known);
+    assert!(matches!(rows[3].file_type, ffi::EntryFileType::Directory));
+    assert_eq!(rows[3].file_type_raw, "d");
+
+    // Unresolved MACH is kept, never dropped.
+    assert!(rows[7].mach.is_empty());
+    assert_eq!(rows[7].unresolved_mach, vec!["=GARBAGE".to_string()]);
+    assert_eq!(rows[7].stored_size, 50);
+
+    // Unknown type letter: enum maps to Other, raw letter preserved.
+    assert!(matches!(rows[8].file_type, ffi::EntryFileType::Other));
+    assert_eq!(rows[8].file_type_raw, "x");
+
+    // No cmpsize at all: stored size unknown.
+    assert!(rows[10].size_known);
+    assert_eq!(rows[10].size, 77);
+    assert!(!rows[10].stored_size_known);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn entry_detail_decodes_regular_file() {
+    let root = temp_root("entry-detail-regular");
+    write_entries_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // Entry id 0 is a perfectly valid id.
+    let detail = backend.entry_detail(1, 0).unwrap();
+    assert_eq!(detail.product_id, 1);
+    assert_eq!(detail.entry_id, 0);
+    assert!(matches!(detail.file_type, ffi::EntryFileType::Regular));
+    assert_eq!(detail.file_type_raw, "f");
+    assert_eq!(detail.mode, 0o755);
+    assert_eq!(detail.owner, "root");
+    assert_eq!(detail.group, "sys");
+    assert_eq!(detail.path, "usr/bin/a");
+    assert_eq!(detail.raw_path, "usr/bin/a");
+    assert_eq!(detail.source_path, "src/a");
+    assert_eq!(detail.subsystem, "entries.sw.alpha");
+    assert!(detail.size_known);
+    assert_eq!(detail.size, 100);
+    assert!(detail.compressed_size_known);
+    assert_eq!(detail.compressed_size, 60);
+    assert!(detail.stored_size_known);
+    assert_eq!(detail.stored_size, 60);
+    assert!(detail.checksum_known);
+    assert_eq!(detail.checksum, 10);
+    assert!(!detail.config_known);
+    assert!(!detail.symlink_target_known);
+    assert!(!detail.device_known);
+    assert!(detail.mach.is_empty());
+    assert!(detail.unresolved_mach.is_empty());
+
+    // Payload locator metadata: the entry is the first payload-bearing
+    // record of its image, so the layout algorithm predicts the offset
+    // right behind the 13-byte archive header.
+    assert!(detail.payload_present);
+    assert_eq!(detail.payload_image, "entries.sw");
+    assert!(detail.payload_encoded_size_known);
+    assert_eq!(detail.payload_encoded_size, 60);
+    assert!(detail.expected_record_offset_known);
+    assert_eq!(detail.expected_record_offset, 13);
+
+    assert!(detail.origin_idb_path.ends_with("entries.idb"));
+    assert_eq!(detail.origin_line, 1);
+    assert_eq!(
+        detail.raw_idb_line,
+        "f 0755 root sys usr/bin/a src/a entries.sw.alpha sum(10) size(100) cmpsize(60)"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn entry_detail_decodes_special_file_kinds() {
+    let root = temp_root("entry-detail-kinds");
+    write_entries_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    let link = backend.entry_detail(1, 5).unwrap();
+    assert!(matches!(link.file_type, ffi::EntryFileType::SymbolicLink));
+    assert_eq!(link.file_type_raw, "l");
+    assert!(link.symlink_target_known);
+    assert_eq!(link.symlink_target, "../lib/libx.so");
+    // No size attributes: sizes and payload are unknown, not zero.
+    assert!(!link.size_known);
+    assert!(!link.stored_size_known);
+    assert!(!link.checksum_known);
+    assert!(!link.payload_present);
+
+    let device = backend.entry_detail(1, 6).unwrap();
+    assert!(matches!(device.file_type, ffi::EntryFileType::BlockDevice));
+    assert_eq!(device.file_type_raw, "b");
+    assert_eq!(device.mode, 0o600);
+    assert!(device.device_known);
+    assert_eq!(device.device_major, 1);
+    assert_eq!(device.device_minor, 2);
+
+    // Unknown config value is preserved verbatim.
+    let config = backend.entry_detail(1, 9).unwrap();
+    assert!(config.config_known);
+    assert_eq!(config.config_mode, "wildmode");
+
+    // Unknown type letter survives in the detail as well.
+    let weird = backend.entry_detail(1, 8).unwrap();
+    assert!(matches!(weird.file_type, ffi::EntryFileType::Other));
+    assert_eq!(weird.file_type_raw, "x");
+
+    // Entry without cmpsize carries no payload locator.
+    let uncompressed = backend.entry_detail(1, 10).unwrap();
+    assert!(!uncompressed.compressed_size_known);
+    assert!(!uncompressed.stored_size_known);
+    assert!(!uncompressed.payload_present);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn entry_detail_keeps_unresolved_mach_and_origin() {
+    let root = temp_root("entry-detail-mach");
+    write_entries_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    let detail = backend.entry_detail(1, 7).unwrap();
+    assert!(detail.mach.is_empty());
+    assert_eq!(detail.unresolved_mach, vec!["=GARBAGE".to_string()]);
+    assert_eq!(detail.origin_line, 8);
+    assert_eq!(
+        detail.raw_idb_line,
+        "f 0644 root sys usr/lib/libx.so src/libx3 entries.sw.beta sum(22) size(220) cmpsize(50) mach(=GARBAGE)"
+    );
+
+    let parsed = backend.entry_detail(1, 1).unwrap();
+    assert_eq!(parsed.mach, vec!["CPUBOARD=IP22".to_string()]);
+    assert!(parsed.unresolved_mach.is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn entry_detail_rejects_bad_keys() {
+    let root = temp_root("entry-detail-bad-keys");
+    write_entries_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    assert_eq!(
+        backend.entry_detail(0, 0).err().unwrap().to_string(),
+        "object id 0 does not identify a distribution object"
+    );
+    // The product id must actually identify a product.
+    assert_eq!(
+        backend.entry_detail(2, 0).err().unwrap().to_string(),
+        "object 2 is an image, not a product"
+    );
+    assert_eq!(
+        backend.entry_detail(3, 0).err().unwrap().to_string(),
+        "object 3 is a subsystem, not a product"
+    );
+    assert_eq!(
+        backend.entry_detail(1000, 0).err().unwrap().to_string(),
+        "object 1000 does not exist"
+    );
+    // Out-of-range entry ids fail with the product named, including
+    // ids that do not even fit the platform's usize.
+    assert_eq!(
+        backend.entry_detail(1, 12).err().unwrap().to_string(),
+        "entry 12 does not exist in product entries"
+    );
+    assert_eq!(
+        backend.entry_detail(1, u64::MAX).err().unwrap().to_string(),
+        "entry 18446744073709551615 does not exist in product entries"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn failed_open_keeps_previous_entry_keys_valid() {
+    let root = temp_root("entries-keep");
+    write_entries_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+    let before = backend.entry_detail(1, 0).unwrap();
+
+    let missing = root.join("missing");
+    assert!(
+        backend
+            .open_distribution(missing.to_str().unwrap())
+            .is_err()
+    );
+
+    // The failed open touched nothing: the old entry keys still work.
+    assert_eq!(backend.entries(1).unwrap().len(), 12);
+    let after = backend.entry_detail(1, 0).unwrap();
+    assert_eq!(after.path, before.path);
+    assert_eq!(after.raw_idb_line, before.raw_idb_line);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn successful_reopen_queries_new_entry_table() {
+    let root_a = temp_root("entries-reopen-a");
+    write_entries_dist(&root_a);
+    let root_b = temp_root("entries-reopen-b");
+    write_idb(&root_b, "beta2", &[("beta2.sw.unix", "only")]);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root_a.to_str().unwrap()).unwrap();
+    assert_eq!(backend.entries(1).unwrap().len(), 12);
+
+    backend.open_distribution(root_b.to_str().unwrap()).unwrap();
+    let rows = backend.entries(1).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].path, "only");
+    assert_eq!(rows[0].subsystem, "beta2.sw.unix");
+    // The new table is what the keys resolve against now.
+    assert_eq!(backend.entry_detail(1, 0).unwrap().path, "only");
+    assert_eq!(
+        backend.entry_detail(1, 1).err().unwrap().to_string(),
+        "entry 1 does not exist in product beta2"
+    );
+
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
+}
+
+/// Entry smoke test against a real distribution directory, using the
+/// same `SW_EXPLORER_TEST_DIST` opt-in as the other smoke tests.
+#[test]
+fn real_dist_entries_smoke() {
+    let Some(raw) = std::env::var_os("SW_EXPLORER_TEST_DIST") else {
+        eprintln!("SW_EXPLORER_TEST_DIST not set; skipping");
+        return;
+    };
+    let path = PathBuf::from(raw);
+    assert!(
+        path.is_dir(),
+        "SW_EXPLORER_TEST_DIST is set but not a directory: {}",
+        path.display()
+    );
+
+    let mut backend = new_backend();
+    backend.open_distribution(path.to_str().unwrap()).unwrap();
+    let nodes = backend.hierarchy().unwrap();
+    let by_id: std::collections::HashMap<u64, &ffi::HierarchyNode> =
+        nodes.iter().map(|node| (node.id, node)).collect();
+
+    for node in &nodes {
+        let rows = backend.entries(node.id).unwrap();
+        // The scope count must agree with the hierarchy node exactly.
+        assert_eq!(
+            rows.len() as u64,
+            node.entry_count,
+            "entry count mismatch at scope {}",
+            node.name
+        );
+        // Entry ids must be strictly increasing in every scope: the
+        // original IDB order, never a regrouping.
+        for pair in rows.windows(2) {
+            assert!(
+                pair[0].entry_id < pair[1].entry_id,
+                "entry order broken at scope {}",
+                node.name
+            );
+        }
+
+        match node.kind {
+            ffi::ObjectKind::Product => {
+                // Product scope is the flat entry list itself.
+                for (index, row) in rows.iter().enumerate() {
+                    assert_eq!(row.entry_id, index as u64);
+                    assert_eq!(row.product_id, node.id);
+                }
+                // Entry detail round-trips agree with the summary.
+                if let Some(first) = rows.first() {
+                    let detail = backend.entry_detail(node.id, first.entry_id).unwrap();
+                    assert_eq!(detail.product_id, first.product_id);
+                    assert_eq!(detail.entry_id, first.entry_id);
+                    assert_eq!(detail.path, first.path);
+                    assert_eq!(detail.subsystem, first.subsystem);
+                    assert_eq!(detail.size_known, first.size_known);
+                    assert_eq!(detail.size, first.size);
+                    assert_eq!(detail.stored_size_known, first.stored_size_known);
+                    assert_eq!(detail.stored_size, first.stored_size);
+                    assert_eq!(detail.mach, first.mach);
+                    assert_eq!(detail.unresolved_mach, first.unresolved_mach);
+                }
+            }
+            ffi::ObjectKind::Image => {
+                let prefix = format!("{}.", node.name);
+                assert!(
+                    rows.iter().all(|row| row.subsystem.starts_with(&prefix)),
+                    "image scope {} leaked a foreign subsystem",
+                    node.name
+                );
+            }
+            ffi::ObjectKind::Subsystem => {
+                let image = by_id[&node.parent_id].name.to_string();
+                let identity = format!("{image}.{}", node.name);
+                assert!(
+                    rows.iter().all(|row| row.subsystem == identity),
+                    "subsystem scope {identity} leaked a foreign subsystem"
+                );
             }
             _ => panic!("unexpected object kind"),
         }
