@@ -141,10 +141,12 @@ pub struct ExtractArgs {
     pub fail_fast: bool,
 }
 
-/// Validates a `--mach` value: `VALUE` or `ATTRIBUTE=VALUE`.
+/// Validates a `--mach` value: `VALUE` or `ATTRIBUTE=VALUE`. The
+/// attribute name is never empty; the value may be (`GFXBOARD=`
+/// restricts a record to headless boards on real media).
 fn parse_mach_value(value: &str) -> Result<String, String> {
     match value.split_once('=') {
-        Some((attribute, val)) if !attribute.is_empty() && !val.is_empty() => Ok(value.to_string()),
+        Some((attribute, _)) if !attribute.is_empty() => Ok(value.to_string()),
         None if !value.is_empty() => Ok(value.to_string()),
         _ => Err(format!(
             "invalid hardware value {value:?}: expected VALUE or ATTRIBUTE=VALUE"
