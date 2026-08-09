@@ -122,3 +122,6 @@ jobs:
 
       - name: Build
         run: cmake --build build/sw-explorer --config Release --parallel
+
+      - name: Run model tests
+        run: ctest --test-dir build/sw-explorer --build-config Release --output-on-failure
