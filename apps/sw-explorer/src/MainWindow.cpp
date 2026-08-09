@@ -9,11 +9,17 @@
 #include <QFileDialog>
 #include <QHeaderView>
 #include <QItemSelectionModel>
+#include <QKeySequence>
+#include <QLineEdit>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QSignalBlocker>
+#include <QSizePolicy>
 #include <QSplitter>
 #include <QStatusBar>
 #include <QThread>
+#include <QTimer>
+#include <QToolBar>
 #include <QTreeView>
 
 MainWindow::MainWindow()
@@ -24,6 +30,49 @@ MainWindow::MainWindow()
     m_openAction = new QAction(tr("Open Distribution..."), this);
     connect(m_openAction, &QAction::triggered, this, &MainWindow::chooseDistribution);
     menuBar()->addMenu(tr("&File"))->addAction(m_openAction);
+
+    // The toolbar carries the same open action as the menu on the
+    // left and the global path search on the right.
+    auto *toolbar = addToolBar(tr("Main"));
+    toolbar->setObjectName(QStringLiteral("mainToolBar"));
+    toolbar->setMovable(false);
+    toolbar->addAction(m_openAction);
+
+    auto *spacer = new QWidget(toolbar);
+    spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    toolbar->addWidget(spacer);
+
+    m_searchEdit = new QLineEdit(toolbar);
+    m_searchEdit->setObjectName(QStringLiteral("searchEdit"));
+    m_searchEdit->setPlaceholderText(tr("Search paths..."));
+    m_searchEdit->setClearButtonEnabled(true);
+    m_searchEdit->setFixedWidth(280);
+    // No distribution yet: nothing to search.
+    m_searchEdit->setEnabled(false);
+    toolbar->addWidget(m_searchEdit);
+
+    // The standard Find shortcut focuses the search box.
+    auto *findAction = new QAction(tr("Find"), this);
+    findAction->setObjectName(QStringLiteral("findAction"));
+    findAction->setShortcut(QKeySequence::Find);
+    connect(findAction, &QAction::triggered, this, [this] {
+        if (m_searchEdit->isEnabled()) {
+            m_searchEdit->setFocus(Qt::ShortcutFocusReason);
+            m_searchEdit->selectAll();
+        }
+    });
+    addAction(findAction);
+
+    // Keystrokes restart the debounce; only a pause (or Enter) turns
+    // the current text into one backend request.
+    m_searchDebounce = new QTimer(this);
+    m_searchDebounce->setSingleShot(true);
+    m_searchDebounce->setInterval(250);
+    connect(m_searchDebounce, &QTimer::timeout, this, [this] {
+        startSearch(m_searchEdit->text());
+    });
+    connect(m_searchEdit, &QLineEdit::textChanged, this, &MainWindow::onSearchTextChanged);
+    connect(m_searchEdit, &QLineEdit::returnPressed, this, &MainWindow::onSearchReturnPressed);
 
     // Left: the distribution hierarchy. Middle: the entries of the
     // selected scope. Right: the inspector.
@@ -53,6 +102,7 @@ MainWindow::MainWindow()
             &QItemSelectionModel::currentChanged,
             this,
             &MainWindow::onTreeSelectionChanged);
+    connect(m_treeView, &QTreeView::clicked, this, &MainWindow::onTreeClicked);
     connect(m_model, &QAbstractItemModel::modelReset, this, &MainWindow::clearSelection);
     connect(m_entries, &EntryBrowserWidget::entrySelected, this, &MainWindow::onEntrySelected);
 
@@ -84,6 +134,10 @@ MainWindow::MainWindow()
             &MainWindow::entriesRequested,
             m_worker,
             &BackendWorker::entriesRequested);
+    connect(this,
+            &MainWindow::searchEntriesRequested,
+            m_worker,
+            &BackendWorker::searchEntriesRequested);
     connect(this,
             &MainWindow::entryDetailRequested,
             m_worker,
@@ -166,7 +220,13 @@ void MainWindow::onCandidateReady(quint64 productCount,
     // distribution while the tree already carries the new object ids,
     // so tree interaction is locked until the commit lands: no
     // inspector request may be issued in that window.
+    //
+    // Only now — with the candidate validated and accepted — is the
+    // old distribution's search state cleared; a failed or rejected
+    // open never touches it.
+    exitSearch();
     m_treeView->setEnabled(false);
+    m_searchEdit->setEnabled(false);
     emit candidateAccepted();
 
     QString text = tr("Loaded %1 products").arg(productCount);
@@ -193,6 +253,7 @@ void MainWindow::onCandidateCommitted()
 {
     // The backend now serves the object ids the tree carries.
     m_treeView->setEnabled(true);
+    m_searchEdit->setEnabled(true);
 }
 
 void MainWindow::onTreeSelectionChanged(const QModelIndex &current, const QModelIndex &previous)
@@ -202,11 +263,32 @@ void MainWindow::onTreeSelectionChanged(const QModelIndex &current, const QModel
         clearSelection();
         return;
     }
+    // Picking a hierarchy scope always leaves search mode: tree scope
+    // and global search results never mix in the entry browser.
+    exitSearch();
+    activateHierarchySelection(current);
+}
 
+void MainWindow::onTreeClicked(const QModelIndex &index)
+{
+    // currentChanged does not fire when the clicked row already is
+    // the current one; during a search that click must still leave
+    // search mode and restore the scope. A click on any other row
+    // arrives together with currentChanged, which handles it — the
+    // guard keeps the two paths from issuing duplicate requests.
+    if (!m_searchActive || index != m_treeView->currentIndex()) {
+        return;
+    }
+    exitSearch();
+    activateHierarchySelection(index);
+}
+
+void MainWindow::activateHierarchySelection(const QModelIndex &index)
+{
     // QModelIndex -> HierarchyItem -> object identity: the selection
     // chain from view to backend object id and kind.
-    const quint64 objectId = m_model->objectId(current);
-    const HierarchyKind kind = m_model->kind(current);
+    const quint64 objectId = m_model->objectId(index);
+    const HierarchyKind kind = m_model->kind(index);
 
     // A hierarchy selection drives both panes at once: the inspector
     // shows the object detail, the entry browser lists the scope's
@@ -217,9 +299,80 @@ void MainWindow::onTreeSelectionChanged(const QModelIndex &current, const QModel
 
     ++m_activeEntriesRequestId;
     m_entries->showLoading(
-        m_model->data(m_model->index(current.row(), DistributionTreeModel::NameColumn, current.parent()))
+        m_model->data(m_model->index(index.row(), DistributionTreeModel::NameColumn, index.parent()))
             .toString());
     emit entriesRequested(m_activeEntriesRequestId, objectId);
+}
+
+void MainWindow::onSearchTextChanged(const QString &text)
+{
+    if (text.isEmpty()) {
+        if (!m_searchActive) {
+            return;
+        }
+        // An empty field means browsing mode, never a "match
+        // everything" search: drop the pending search and fall back
+        // to the scope the tree still has selected.
+        m_searchActive = false;
+        m_searchDebounce->stop();
+        restoreHierarchyScope();
+        return;
+    }
+
+    // Entering or refining search mode. Every change invalidates both
+    // request families, so a late response of an older query can
+    // never flash its results; the debounce turns the keystrokes into
+    // one request once the user pauses.
+    m_searchActive = true;
+    ++m_activeEntriesRequestId;
+    ++m_activeInspectorRequestId;
+    m_inspector->showEmpty();
+    m_entries->showLoading(tr("Search: %1").arg(text));
+    m_searchDebounce->start();
+}
+
+void MainWindow::onSearchReturnPressed()
+{
+    // Enter searches immediately with a fresh request id; the pending
+    // debounce is stopped so it cannot fire a duplicate afterwards.
+    m_searchDebounce->stop();
+    const QString text = m_searchEdit->text();
+    if (text.isEmpty()) {
+        return;
+    }
+    startSearch(text);
+}
+
+void MainWindow::startSearch(const QString &query)
+{
+    if (query.isEmpty() || !m_searchActive) {
+        return;
+    }
+    ++m_activeEntriesRequestId;
+    emit searchEntriesRequested(m_activeEntriesRequestId, query);
+}
+
+void MainWindow::exitSearch()
+{
+    if (!m_searchActive && m_searchEdit->text().isEmpty()) {
+        return;
+    }
+    // Programmatic clears must not re-enter the search state machine
+    // through textChanged.
+    const QSignalBlocker blocker(m_searchEdit);
+    m_searchEdit->clear();
+    m_searchDebounce->stop();
+    m_searchActive = false;
+}
+
+void MainWindow::restoreHierarchyScope()
+{
+    const QModelIndex current = m_treeView->currentIndex();
+    if (current.isValid()) {
+        activateHierarchySelection(current);
+    } else {
+        clearSelection();
+    }
 }
 
 void MainWindow::clearSelection()
@@ -244,6 +397,9 @@ void MainWindow::onEntrySelected(quint64 productId, quint64 entryId)
 void MainWindow::setOpenInProgress(bool inProgress)
 {
     m_openAction->setEnabled(!inProgress);
+    // No search while an open is in flight; a failed open hands the
+    // previous distribution's search box back.
+    m_searchEdit->setEnabled(!inProgress && m_hasDistribution);
 }
 
 void MainWindow::onProductDetailReady(quint64 requestId, const ProductDetailSnapshot &detail)
@@ -295,10 +451,14 @@ void MainWindow::onEntryDetailReady(quint64 requestId, const EntryDetailSnapshot
 void MainWindow::onEntriesReady(quint64 requestId, const EntryListSnapshot &entries)
 {
     if (requestId != m_activeEntriesRequestId) {
-        // A scope the user has already left: drop it silently.
+        // A scope or query the user has already left: drop it
+        // silently.
         return;
     }
     m_entries->showEntries(entries);
+    // A successful render also clears any earlier entries or search
+    // error from the status bar, back to the distribution state.
+    restoreLoadedStatus();
 }
 
 void MainWindow::onEntriesFailed(quint64 requestId, const QString &message)

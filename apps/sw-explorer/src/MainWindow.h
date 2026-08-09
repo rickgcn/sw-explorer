@@ -8,8 +8,10 @@
 
 QT_BEGIN_NAMESPACE
 class QAction;
+class QLineEdit;
 class QModelIndex;
 class QThread;
+class QTimer;
 class QTreeView;
 QT_END_NAMESPACE
 
@@ -27,6 +29,13 @@ class InspectorWidget;
 // newest request of its family is accepted, everything older is
 // dropped silently. Selection changes, model resets and newly opened
 // distributions all invalidate the pending requests.
+//
+// The toolbar search box switches the entry browser between two
+// exclusive content sources: a non-empty query is a global path
+// search across the whole distribution, an empty query is hierarchy
+// browsing of the selected tree scope. Both source kinds share the
+// entries request family, and every query change invalidates the
+// in-flight requests of both families.
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
@@ -41,6 +50,7 @@ signals:
     void candidateRejected();
     void detailRequested(quint64 requestId, quint64 objectId, HierarchyKind kind);
     void entriesRequested(quint64 requestId, quint64 scopeId);
+    void searchEntriesRequested(quint64 requestId, const QString &query);
     void entryDetailRequested(quint64 requestId, quint64 productId, quint64 entryId);
 
 private slots:
@@ -51,6 +61,9 @@ private slots:
     void onDistributionOpenFailed(const QString &message);
     void onCandidateCommitted();
     void onTreeSelectionChanged(const QModelIndex &current, const QModelIndex &previous);
+    void onTreeClicked(const QModelIndex &index);
+    void onSearchTextChanged(const QString &text);
+    void onSearchReturnPressed();
     void onProductDetailReady(quint64 requestId, const ProductDetailSnapshot &detail);
     void onImageDetailReady(quint64 requestId, const ImageDetailSnapshot &detail);
     void onSubsystemDetailReady(quint64 requestId, const SubsystemDetailSnapshot &detail);
@@ -64,6 +77,16 @@ private:
     void setOpenInProgress(bool inProgress);
     void clearSelection();
     void restoreLoadedStatus();
+    // Issues the detail and entries requests for one hierarchy index.
+    void activateHierarchySelection(const QModelIndex &index);
+    // Leaves search mode without re-entering the textChanged handler:
+    // clears the field with blocked signals and stops the debounce.
+    void exitSearch();
+    // Reloads the tree's current scope, or empties both panes when
+    // the tree has no selection.
+    void restoreHierarchyScope();
+    // Emits one global search request with a fresh entries requestId.
+    void startSearch(const QString &query);
 
     QAction *m_openAction = nullptr;
 
@@ -72,11 +95,18 @@ private:
     EntryBrowserWidget *m_entries = nullptr;
     InspectorWidget *m_inspector = nullptr;
 
+    QLineEdit *m_searchEdit = nullptr;
+    QTimer *m_searchDebounce = nullptr;
+    // Whether the entry browser shows search results rather than a
+    // hierarchy scope; never inferred from the pane contents.
+    bool m_searchActive = false;
+
     // The newest inspector request (object detail or entry detail);
     // responses with any other id are stale and dropped.
     quint64 m_activeInspectorRequestId = 0;
-    // The newest entry-list request; a separate family, so a slow
-    // entry list never invalidates a quick entry detail.
+    // The newest entry-list request (scope listing or search
+    // results); a separate family, so a slow entry list never
+    // invalidates a quick entry detail.
     quint64 m_activeEntriesRequestId = 0;
 
     // Last successfully loaded state, kept in sync with the committed

@@ -21,10 +21,13 @@
 // every query, so a rejected snapshot can never desynchronize the GUI
 // tree from the Rust-side object ids.
 //
-// Detail queries are answered only by the committed backend; the
-// candidate is never queried. Every detailRequested carries a
-// requestId that the response echoes back unchanged, so the GUI can
-// drop responses that arrive after the selection moved on.
+// Queries — details, scope entries and global path searches — are
+// answered only by the committed backend; the candidate is never
+// queried. Every request carries a requestId that the response
+// echoes back unchanged, so the GUI can drop responses that arrive
+// after the selection moved on. Search results reuse the entries
+// signals: a search hit list is the same EntryListSnapshot shape the
+// scope listing produces.
 class BackendWorker : public QObject
 {
     Q_OBJECT
@@ -38,6 +41,7 @@ public slots:
     void discardCandidate();
     void detailRequested(quint64 requestId, quint64 objectId, HierarchyKind kind);
     void entriesRequested(quint64 requestId, quint64 scopeId);
+    void searchEntriesRequested(quint64 requestId, const QString &query);
     void entryDetailRequested(quint64 requestId, quint64 productId, quint64 entryId);
 
 signals:

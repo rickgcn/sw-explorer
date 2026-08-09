@@ -215,6 +215,16 @@ EntrySummarySnapshot toQt(const sw::EntrySummary &summary)
     return out;
 }
 
+EntryListSnapshot toQt(const rust::Vec<sw::EntrySummary> &entries)
+{
+    EntryListSnapshot out;
+    out.reserve(static_cast<qsizetype>(entries.size()));
+    for (const sw::EntrySummary &entry : entries) {
+        out.append(toQt(entry));
+    }
+    return out;
+}
+
 EntryDetailSnapshot toQt(const sw::EntryDetail &detail)
 {
     EntryDetailSnapshot out;
@@ -352,13 +362,25 @@ void BackendWorker::entriesRequested(quint64 requestId, quint64 scopeId)
     // Like every query, this only ever talks to the committed
     // backend; a pending candidate is not queryable.
     try {
-        const rust::Vec<sw::EntrySummary> entries = m_backend->entries(scopeId);
-        EntryListSnapshot snapshot;
-        snapshot.reserve(static_cast<qsizetype>(entries.size()));
-        for (const sw::EntrySummary &entry : entries) {
-            snapshot.append(toQt(entry));
-        }
-        emit entriesReady(requestId, snapshot);
+        emit entriesReady(requestId, toQt(m_backend->entries(scopeId)));
+    } catch (const rust::Error &error) {
+        emit entriesFailed(requestId, QString::fromUtf8(error.what()));
+    }
+}
+
+void BackendWorker::searchEntriesRequested(quint64 requestId, const QString &query)
+{
+    // A search is a whole-distribution query against the committed
+    // backend, like every other query; a pending candidate is not
+    // queryable. Results and failures reuse the entries signals:
+    // both are plain entry lists for the same browser.
+    //
+    // QString -> rust::Str goes through an explicit UTF-8 byte array;
+    // the current locale is never involved.
+    const QByteArray utf8 = query.toUtf8();
+    const rust::Str rustQuery(utf8.constData(), static_cast<std::size_t>(utf8.size()));
+    try {
+        emit entriesReady(requestId, toQt(m_backend->search_entries(rustQuery)));
     } catch (const rust::Error &error) {
         emit entriesFailed(requestId, QString::fromUtf8(error.what()));
     }
