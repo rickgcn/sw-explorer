@@ -223,10 +223,13 @@ message(STATUS "Rust staticlib native dependencies (after driver-runtime filter)
 
 qt_add_executable(sw-explorer
     src/main.cpp
+    src/HierarchySnapshot.h
     src/MainWindow.h
     src/MainWindow.cpp
     src/BackendWorker.h
     src/BackendWorker.cpp
+    src/models/DistributionTreeModel.h
+    src/models/DistributionTreeModel.cpp
     "${SW_GENERATED_SOURCE}"
 )
 
@@ -235,7 +238,7 @@ set_target_properties(sw-explorer PROPERTIES
     MACOSX_BUNDLE ON
 )
 
-target_include_directories(sw-explorer PRIVATE "${SW_GENERATED_DIR}")
+target_include_directories(sw-explorer PRIVATE src "${SW_GENERATED_DIR}")
 
 # Build the staticlib before anything of sw-explorer compiles or links.
 add_dependencies(sw-explorer sw_gui_bridge_staticlib)
