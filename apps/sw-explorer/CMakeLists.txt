@@ -380,3 +380,48 @@ add_test(NAME EntryBrowserWidgetTest COMMAND EntryBrowserWidgetTest)
 set_tests_properties(EntryBrowserWidgetTest PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
 )
+
+# The main-window search tests are QWidget tests (QTEST_MAIN) driving
+# the real backend through the worker thread, so they link the
+# staticlib exactly like the application; the offscreen platform
+# keeps them headless on every CI platform.
+add_executable(MainWindowSearchTest
+    tests/MainWindowSearchTest.cpp
+    src/HierarchySnapshot.h
+    src/InspectorSnapshot.h
+    src/EntrySnapshot.h
+    src/ByteFormat.h
+    src/InspectorWidget.h
+    src/InspectorWidget.cpp
+    src/EntryBrowserWidget.h
+    src/EntryBrowserWidget.cpp
+    src/MainWindow.h
+    src/MainWindow.cpp
+    src/BackendWorker.h
+    src/BackendWorker.cpp
+    src/models/DistributionTreeModel.h
+    src/models/DistributionTreeModel.cpp
+    src/models/EntryTableModel.h
+    src/models/EntryTableModel.cpp
+    "${SW_GENERATED_SOURCE}"
+)
+
+target_include_directories(MainWindowSearchTest PRIVATE src "${SW_GENERATED_DIR}")
+
+add_dependencies(MainWindowSearchTest sw_gui_bridge_staticlib)
+
+target_link_libraries(MainWindowSearchTest PRIVATE
+    Qt6::Widgets
+    Qt6::Test
+    sw_gui_bridge
+    ${SW_NATIVE_LIBS}
+)
+
+if(SW_NATIVE_LIB_DIRS)
+    target_link_directories(MainWindowSearchTest PRIVATE ${SW_NATIVE_LIB_DIRS})
+endif()
+
+add_test(NAME MainWindowSearchTest COMMAND MainWindowSearchTest)
+set_tests_properties(MainWindowSearchTest PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+)

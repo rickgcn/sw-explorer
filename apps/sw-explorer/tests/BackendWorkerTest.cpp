@@ -32,6 +32,13 @@ private slots:
     void entriesWithBadScopeFail();
     void entryDetailWithBadKeyFails();
     void candidateEntriesAreNotQueryable();
+    void searchRoundTripsSnapshots();
+    void searchExplicitWildcardIsNotWrapped();
+    void searchZeroResultsIsNotAnError();
+    void searchEmptyQueryFails();
+    void searchWithoutDistributionFails();
+    void candidateSearchIsNotQueryable();
+    void searchResultKeysResolveEntryDetail();
 };
 
 namespace {
@@ -47,6 +54,44 @@ bool writeSyntheticDist(QTemporaryDir &dir)
     idb.write("f 0644 root sys a src/a test.sw.unix sum(1) size(5) cmpsize(0)\n");
     idb.write("f 0644 root sys b src/b test.sw.unix sum(1) size(5) cmpsize(0)\n");
     idb.write("f 0644 root sys c src/c test.man.man sum(1) size(5) cmpsize(0)\n");
+    return true;
+}
+
+// Two products: `alpha` with usr/bin/Xsgi in alpha.sw.unix and
+// usr/lib/libGL.so in alpha.sw.gfx, `beta` with a second
+// usr/bin/Xsgi record in beta.sw.unix. Object ids: 1 = alpha,
+// 2 = alpha.sw, 3 = unix, 4 = gfx, 5 = beta, 6 = beta.sw, 7 = unix.
+bool writeTwoProductDist(QTemporaryDir &dir)
+{
+    QFile alphaIdb(dir.filePath(QStringLiteral("alpha.idb")));
+    if (!alphaIdb.open(QIODevice::WriteOnly)) {
+        return false;
+    }
+    alphaIdb.write(
+        "f 0755 root sys usr/bin/Xsgi src/Xsgi alpha.sw.unix sum(1) size(100) cmpsize(60)\n");
+    alphaIdb.write(
+        "f 0644 root sys usr/lib/libGL.so src/libGL alpha.sw.gfx sum(2) size(200) cmpsize(0)\n");
+    alphaIdb.close();
+
+    QFile betaIdb(dir.filePath(QStringLiteral("beta.idb")));
+    if (!betaIdb.open(QIODevice::WriteOnly)) {
+        return false;
+    }
+    betaIdb.write(
+        "f 0755 root sys usr/bin/Xsgi src/Xsgi-beta beta.sw.unix sum(3) size(110) cmpsize(0)\n");
+    return true;
+}
+
+// One product `gamma` with a single usr/bin/gamma record; the
+// contents never overlap with writeTwoProductDist.
+bool writeGammaDist(QTemporaryDir &dir)
+{
+    QFile idb(dir.filePath(QStringLiteral("gamma.idb")));
+    if (!idb.open(QIODevice::WriteOnly)) {
+        return false;
+    }
+    idb.write(
+        "f 0755 root sys usr/bin/gamma src/gamma gamma.sw.unix sum(1) size(10) cmpsize(0)\n");
     return true;
 }
 
@@ -539,6 +584,198 @@ void BackendWorkerTest::candidateEntriesAreNotQueryable()
     QCOMPARE(detailSpy.count(), 1);
     QCOMPARE(qvariant_cast<EntryDetailSnapshot>(detailSpy.first().at(1)).path,
              QStringLiteral("a"));
+}
+
+void BackendWorkerTest::searchRoundTripsSnapshots()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeTwoProductDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy entriesSpy(&worker, &BackendWorker::entriesReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::entriesFailed);
+
+    // A search spans every product: Xsgi lives in alpha and beta.
+    worker.searchEntriesRequested(90, QStringLiteral("Xsgi"));
+    QCOMPARE(failSpy.count(), 0);
+    QCOMPARE(entriesSpy.count(), 1);
+    QCOMPARE(entriesSpy.first().at(0).toULongLong(), 90);
+    const auto hits = qvariant_cast<EntryListSnapshot>(entriesSpy.first().at(1));
+    QCOMPARE(hits.size(), 2);
+    // Distribution product order, each product in IDB order.
+    QCOMPARE(hits.at(0).productId, 1);
+    QCOMPARE(hits.at(0).entryId, 0);
+    QCOMPARE(hits.at(0).path, QStringLiteral("usr/bin/Xsgi"));
+    QCOMPARE(hits.at(0).subsystem, QStringLiteral("alpha.sw.unix"));
+    QCOMPARE(hits.at(0).storedSize, 60);
+    QCOMPARE(hits.at(1).productId, 5);
+    QCOMPARE(hits.at(1).entryId, 0);
+    QCOMPARE(hits.at(1).path, QStringLiteral("usr/bin/Xsgi"));
+    QCOMPARE(hits.at(1).subsystem, QStringLiteral("beta.sw.unix"));
+
+    // Plain text is a substring match: libGL hits one record.
+    worker.searchEntriesRequested(91, QStringLiteral("libGL"));
+    QCOMPARE(entriesSpy.count(), 2);
+    const auto gl = qvariant_cast<EntryListSnapshot>(entriesSpy.at(1).at(1));
+    QCOMPARE(gl.size(), 1);
+    QCOMPARE(gl.at(0).productId, 1);
+    QCOMPARE(gl.at(0).entryId, 1);
+    QCOMPARE(gl.at(0).path, QStringLiteral("usr/lib/libGL.so"));
+    QCOMPARE(failSpy.count(), 0);
+}
+
+void BackendWorkerTest::searchExplicitWildcardIsNotWrapped()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeTwoProductDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy entriesSpy(&worker, &BackendWorker::entriesReady);
+
+    // A pattern with its own wildcard reaches the matcher unchanged:
+    // "libGL*" requires the path to start with libGL, so nothing
+    // matches; a wrapped pattern would hit usr/lib/libGL.so.
+    worker.searchEntriesRequested(95, QStringLiteral("libGL*"));
+    QCOMPARE(entriesSpy.count(), 1);
+    QCOMPARE(qvariant_cast<EntryListSnapshot>(entriesSpy.first().at(1)).size(), 0);
+
+    // "*.so" matches only paths ending in .so.
+    worker.searchEntriesRequested(96, QStringLiteral("*.so"));
+    QCOMPARE(entriesSpy.count(), 2);
+    const auto hits = qvariant_cast<EntryListSnapshot>(entriesSpy.at(1).at(1));
+    QCOMPARE(hits.size(), 1);
+    QCOMPARE(hits.at(0).path, QStringLiteral("usr/lib/libGL.so"));
+}
+
+void BackendWorkerTest::searchZeroResultsIsNotAnError()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeTwoProductDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy entriesSpy(&worker, &BackendWorker::entriesReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::entriesFailed);
+
+    worker.searchEntriesRequested(97, QStringLiteral("definitely-not-a-file"));
+    QCOMPARE(failSpy.count(), 0);
+    QCOMPARE(entriesSpy.count(), 1);
+    QCOMPARE(qvariant_cast<EntryListSnapshot>(entriesSpy.first().at(1)).size(), 0);
+}
+
+void BackendWorkerTest::searchEmptyQueryFails()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeTwoProductDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy entriesSpy(&worker, &BackendWorker::entriesReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::entriesFailed);
+
+    worker.searchEntriesRequested(98, QString());
+    QCOMPARE(entriesSpy.count(), 0);
+    QCOMPARE(failSpy.count(), 1);
+    QCOMPARE(failSpy.first().at(0).toULongLong(), 98);
+    QCOMPARE(failSpy.first().at(1).toString(), QStringLiteral("search query is empty"));
+}
+
+void BackendWorkerTest::searchWithoutDistributionFails()
+{
+    BackendWorker worker;
+    QSignalSpy failSpy(&worker, &BackendWorker::entriesFailed);
+
+    worker.searchEntriesRequested(99, QStringLiteral("Xsgi"));
+    QCOMPARE(failSpy.count(), 1);
+    QCOMPARE(failSpy.first().at(0).toULongLong(), 99);
+    QCOMPARE(failSpy.first().at(1).toString(), QStringLiteral("no distribution loaded"));
+}
+
+void BackendWorkerTest::candidateSearchIsNotQueryable()
+{
+    // Like every other query, a search only ever talks to the
+    // committed backend; a pending candidate is not queryable.
+    QTemporaryDir dirA;
+    QVERIFY(writeTwoProductDist(dirA));
+    QTemporaryDir dirB;
+    QVERIFY(writeGammaDist(dirB));
+
+    BackendWorker worker;
+    worker.openDistribution(dirA.path());
+    worker.commitCandidate();
+
+    // A pending candidate stays invisible: gamma only exists in the
+    // candidate, the committed backend still answers with alpha/beta.
+    worker.openDistribution(dirB.path());
+
+    QSignalSpy entriesSpy(&worker, &BackendWorker::entriesReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::entriesFailed);
+
+    worker.searchEntriesRequested(100, QStringLiteral("gamma"));
+    QCOMPARE(entriesSpy.count(), 1);
+    QCOMPARE(qvariant_cast<EntryListSnapshot>(entriesSpy.first().at(1)).size(), 0);
+
+    worker.searchEntriesRequested(101, QStringLiteral("Xsgi"));
+    QCOMPARE(entriesSpy.count(), 2);
+    QCOMPARE(qvariant_cast<EntryListSnapshot>(entriesSpy.at(1).at(1)).size(), 2);
+
+    // After the commit the same queries see the new distribution.
+    worker.commitCandidate();
+    worker.searchEntriesRequested(102, QStringLiteral("gamma"));
+    QCOMPARE(entriesSpy.count(), 3);
+    const auto gamma = qvariant_cast<EntryListSnapshot>(entriesSpy.at(2).at(1));
+    QCOMPARE(gamma.size(), 1);
+    QCOMPARE(gamma.at(0).path, QStringLiteral("usr/bin/gamma"));
+
+    worker.searchEntriesRequested(103, QStringLiteral("Xsgi"));
+    QCOMPARE(entriesSpy.count(), 4);
+    QCOMPARE(qvariant_cast<EntryListSnapshot>(entriesSpy.at(3).at(1)).size(), 0);
+    QCOMPARE(failSpy.count(), 0);
+}
+
+void BackendWorkerTest::searchResultKeysResolveEntryDetail()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeTwoProductDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy entriesSpy(&worker, &BackendWorker::entriesReady);
+    QSignalSpy detailSpy(&worker, &BackendWorker::entryDetailReady);
+    QSignalSpy detailFailSpy(&worker, &BackendWorker::detailFailed);
+
+    worker.searchEntriesRequested(110, QStringLiteral("Xsgi"));
+    QCOMPARE(entriesSpy.count(), 1);
+    const auto hits = qvariant_cast<EntryListSnapshot>(entriesSpy.first().at(1));
+    QCOMPARE(hits.size(), 2);
+
+    // The (productId, entryId) key of every hit feeds the inspector
+    // query directly.
+    for (qsizetype i = 0; i < hits.size(); ++i) {
+        worker.entryDetailRequested(111 + i, hits.at(i).productId, hits.at(i).entryId);
+    }
+    QCOMPARE(detailFailSpy.count(), 0);
+    QCOMPARE(detailSpy.count(), 2);
+    const auto first = qvariant_cast<EntryDetailSnapshot>(detailSpy.first().at(1));
+    QCOMPARE(first.path, QStringLiteral("usr/bin/Xsgi"));
+    QCOMPARE(first.subsystem, QStringLiteral("alpha.sw.unix"));
+    QCOMPARE(first.size, 100);
+    QCOMPARE(first.storedSize, 60);
+    const auto second = qvariant_cast<EntryDetailSnapshot>(detailSpy.at(1).at(1));
+    QCOMPARE(second.path, QStringLiteral("usr/bin/Xsgi"));
+    QCOMPARE(second.subsystem, QStringLiteral("beta.sw.unix"));
 }
 
 QTEST_GUILESS_MAIN(BackendWorkerTest)
