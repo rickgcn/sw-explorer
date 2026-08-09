@@ -79,3 +79,42 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --locked
+
+  gui-build:
+    name: GUI Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Rust 1.95.0
+        uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
+        with:
+          toolchain: 1.95.0
+          cache: true
+          rustflags: ""
+
+      - name: Install Qt 6.8.3
+        uses: jurplel/install-qt-action@v4.3.1
+        with:
+          version: '6.8.3'
+          cache: true
+
+      - name: Install cxxbridge-cmd 1.0.199
+        run: cargo install cxxbridge-cmd --version 1.0.199 --locked
+
+      - name: Configure
+        run: cmake -S apps/sw-explorer -B build/sw-explorer -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build/sw-explorer --config Release --parallel
