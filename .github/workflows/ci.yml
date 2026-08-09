@@ -1,3 +1,7 @@
+# Keep CI on explicit OS generations.
+# Avoid *-latest so hosted-runner migrations do not silently
+# change the project's supported build baseline.
+
 name: CI
 
 on:
@@ -24,7 +28,7 @@ env:
 jobs:
   quality:
     name: Quality
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
@@ -62,9 +66,9 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
+          - ubuntu-24.04
+          - windows-2022
+          - macos-15
 
     steps:
       - name: Checkout
@@ -89,9 +93,9 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
+          - ubuntu-24.04
+          - windows-2022
+          - macos-15
 
     steps:
       - name: Checkout
