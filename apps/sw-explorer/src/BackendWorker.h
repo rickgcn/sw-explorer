@@ -5,6 +5,7 @@
 
 #include <optional>
 
+#include "EntrySnapshot.h"
 #include "HierarchySnapshot.h"
 #include "InspectorSnapshot.h"
 #include "sw_gui_bridge.h"
@@ -36,6 +37,8 @@ public slots:
     void commitCandidate();
     void discardCandidate();
     void detailRequested(quint64 requestId, quint64 objectId, HierarchyKind kind);
+    void entriesRequested(quint64 requestId, quint64 scopeId);
+    void entryDetailRequested(quint64 requestId, quint64 productId, quint64 entryId);
 
 signals:
     void candidateReady(quint64 productCount,
@@ -51,6 +54,12 @@ signals:
     void imageDetailReady(quint64 requestId, const ImageDetailSnapshot &detail);
     void subsystemDetailReady(quint64 requestId, const SubsystemDetailSnapshot &detail);
     void detailFailed(quint64 requestId, const QString &message);
+
+    void entriesReady(quint64 requestId, const EntryListSnapshot &entries);
+    void entriesFailed(quint64 requestId, const QString &message);
+    // Entry detail failures reuse detailFailed: the requestId keeps
+    // the two inspector request families apart on the GUI side.
+    void entryDetailReady(quint64 requestId, const EntryDetailSnapshot &detail);
 
 private:
     // The committed backend: what every future query talks to.

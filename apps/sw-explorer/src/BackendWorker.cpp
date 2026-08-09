@@ -176,6 +176,88 @@ SubsystemDetailSnapshot toQt(const sw::SubsystemDetail &detail)
     return out;
 }
 
+EntryFileType toQt(sw::EntryFileType fileType)
+{
+    switch (fileType) {
+    case sw::EntryFileType::Regular:
+        return EntryFileType::Regular;
+    case sw::EntryFileType::Directory:
+        return EntryFileType::Directory;
+    case sw::EntryFileType::SymbolicLink:
+        return EntryFileType::SymbolicLink;
+    case sw::EntryFileType::BlockDevice:
+        return EntryFileType::BlockDevice;
+    case sw::EntryFileType::CharacterDevice:
+        return EntryFileType::CharacterDevice;
+    case sw::EntryFileType::Fifo:
+        return EntryFileType::Fifo;
+    case sw::EntryFileType::Other:
+        return EntryFileType::Other;
+    }
+    Q_UNREACHABLE();
+}
+
+EntrySummarySnapshot toQt(const sw::EntrySummary &summary)
+{
+    EntrySummarySnapshot out;
+    out.productId = summary.product_id;
+    out.entryId = summary.entry_id;
+    out.path = toQString(summary.path);
+    out.subsystem = toQString(summary.subsystem);
+    out.fileType = toQt(summary.file_type);
+    out.fileTypeRaw = toQString(summary.file_type_raw);
+    out.sizeKnown = summary.size_known;
+    out.size = summary.size;
+    out.storedSizeKnown = summary.stored_size_known;
+    out.storedSize = summary.stored_size;
+    out.mach = toQStringList(summary.mach);
+    out.unresolvedMach = toQStringList(summary.unresolved_mach);
+    return out;
+}
+
+EntryDetailSnapshot toQt(const sw::EntryDetail &detail)
+{
+    EntryDetailSnapshot out;
+    out.productId = detail.product_id;
+    out.entryId = detail.entry_id;
+    out.fileType = toQt(detail.file_type);
+    out.fileTypeRaw = toQString(detail.file_type_raw);
+    out.mode = detail.mode;
+    out.owner = toQString(detail.owner);
+    out.group = toQString(detail.group);
+    out.path = toQString(detail.path);
+    out.rawPath = toQString(detail.raw_path);
+    out.sourcePath = toQString(detail.source_path);
+    out.subsystem = toQString(detail.subsystem);
+    out.sizeKnown = detail.size_known;
+    out.size = detail.size;
+    out.compressedSizeKnown = detail.compressed_size_known;
+    out.compressedSize = detail.compressed_size;
+    out.storedSizeKnown = detail.stored_size_known;
+    out.storedSize = detail.stored_size;
+    out.checksumKnown = detail.checksum_known;
+    out.checksum = detail.checksum;
+    out.configKnown = detail.config_known;
+    out.configMode = toQString(detail.config_mode);
+    out.symlinkTargetKnown = detail.symlink_target_known;
+    out.symlinkTarget = toQString(detail.symlink_target);
+    out.deviceKnown = detail.device_known;
+    out.deviceMajor = detail.device_major;
+    out.deviceMinor = detail.device_minor;
+    out.mach = toQStringList(detail.mach);
+    out.unresolvedMach = toQStringList(detail.unresolved_mach);
+    out.payloadPresent = detail.payload_present;
+    out.payloadImage = toQString(detail.payload_image);
+    out.payloadEncodedSizeKnown = detail.payload_encoded_size_known;
+    out.payloadEncodedSize = detail.payload_encoded_size;
+    out.expectedRecordOffsetKnown = detail.expected_record_offset_known;
+    out.expectedRecordOffset = detail.expected_record_offset;
+    out.originIdbPath = toQString(detail.origin_idb_path);
+    out.originLine = detail.origin_line;
+    out.rawIdbLine = toQString(detail.raw_idb_line);
+    return out;
+}
+
 } // namespace
 
 BackendWorker::BackendWorker(QObject *parent)
@@ -260,6 +342,32 @@ void BackendWorker::detailRequested(quint64 requestId, quint64 objectId, Hierarc
             emit subsystemDetailReady(requestId, toQt(m_backend->subsystem_detail(objectId)));
             break;
         }
+    } catch (const rust::Error &error) {
+        emit detailFailed(requestId, QString::fromUtf8(error.what()));
+    }
+}
+
+void BackendWorker::entriesRequested(quint64 requestId, quint64 scopeId)
+{
+    // Like every query, this only ever talks to the committed
+    // backend; a pending candidate is not queryable.
+    try {
+        const rust::Vec<sw::EntrySummary> entries = m_backend->entries(scopeId);
+        EntryListSnapshot snapshot;
+        snapshot.reserve(static_cast<qsizetype>(entries.size()));
+        for (const sw::EntrySummary &entry : entries) {
+            snapshot.append(toQt(entry));
+        }
+        emit entriesReady(requestId, snapshot);
+    } catch (const rust::Error &error) {
+        emit entriesFailed(requestId, QString::fromUtf8(error.what()));
+    }
+}
+
+void BackendWorker::entryDetailRequested(quint64 requestId, quint64 productId, quint64 entryId)
+{
+    try {
+        emit entryDetailReady(requestId, toQt(m_backend->entry_detail(productId, entryId)));
     } catch (const rust::Error &error) {
         emit detailFailed(requestId, QString::fromUtf8(error.what()));
     }

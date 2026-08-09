@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include "BackendWorker.h"
+#include "EntryBrowserWidget.h"
 #include "InspectorWidget.h"
 #include "models/DistributionTreeModel.h"
 
@@ -18,14 +19,14 @@
 MainWindow::MainWindow()
 {
     setWindowTitle(QStringLiteral("SW Explorer"));
-    resize(960, 600);
+    resize(1200, 700);
 
     m_openAction = new QAction(tr("Open Distribution..."), this);
     connect(m_openAction, &QAction::triggered, this, &MainWindow::chooseDistribution);
     menuBar()->addMenu(tr("&File"))->addAction(m_openAction);
 
-    // Left: the distribution hierarchy. Right: the future content
-    // area, for now a selection placeholder.
+    // Left: the distribution hierarchy. Middle: the entries of the
+    // selected scope. Right: the inspector.
     m_model = new DistributionTreeModel(this);
     m_treeView = new QTreeView;
     m_treeView->setModel(m_model);
@@ -35,14 +36,17 @@ MainWindow::MainWindow()
     m_treeView->header()->setSectionResizeMode(DistributionTreeModel::EntriesColumn,
                                                QHeaderView::ResizeToContents);
 
+    m_entries = new EntryBrowserWidget;
     m_inspector = new InspectorWidget;
 
     auto *splitter = new QSplitter(this);
     splitter->addWidget(m_treeView);
+    splitter->addWidget(m_entries);
     splitter->addWidget(m_inspector);
     splitter->setStretchFactor(0, 0);
     splitter->setStretchFactor(1, 1);
-    splitter->setSizes({320, 640});
+    splitter->setStretchFactor(2, 0);
+    splitter->setSizes({300, 540, 360});
     setCentralWidget(splitter);
 
     connect(m_treeView->selectionModel(),
@@ -50,6 +54,7 @@ MainWindow::MainWindow()
             this,
             &MainWindow::onTreeSelectionChanged);
     connect(m_model, &QAbstractItemModel::modelReset, this, &MainWindow::clearSelection);
+    connect(m_entries, &EntryBrowserWidget::entrySelected, this, &MainWindow::onEntrySelected);
 
     statusBar()->showMessage(tr("No distribution loaded."));
 
@@ -75,6 +80,14 @@ MainWindow::MainWindow()
             &MainWindow::detailRequested,
             m_worker,
             &BackendWorker::detailRequested);
+    connect(this,
+            &MainWindow::entriesRequested,
+            m_worker,
+            &BackendWorker::entriesRequested);
+    connect(this,
+            &MainWindow::entryDetailRequested,
+            m_worker,
+            &BackendWorker::entryDetailRequested);
     connect(m_worker, &BackendWorker::candidateReady, this, &MainWindow::onCandidateReady);
     connect(m_worker,
             &BackendWorker::distributionOpenFailed,
@@ -97,6 +110,12 @@ MainWindow::MainWindow()
             this,
             &MainWindow::onSubsystemDetailReady);
     connect(m_worker, &BackendWorker::detailFailed, this, &MainWindow::onDetailFailed);
+    connect(m_worker, &BackendWorker::entriesReady, this, &MainWindow::onEntriesReady);
+    connect(m_worker, &BackendWorker::entriesFailed, this, &MainWindow::onEntriesFailed);
+    connect(m_worker,
+            &BackendWorker::entryDetailReady,
+            this,
+            &MainWindow::onEntryDetailReady);
     m_workerThread->start();
 }
 
@@ -189,17 +208,37 @@ void MainWindow::onTreeSelectionChanged(const QModelIndex &current, const QModel
     const quint64 objectId = m_model->objectId(current);
     const HierarchyKind kind = m_model->kind(current);
 
-    ++m_activeRequestId;
+    // A hierarchy selection drives both panes at once: the inspector
+    // shows the object detail, the entry browser lists the scope's
+    // IDB records. Each family gets its own fresh request id.
+    ++m_activeInspectorRequestId;
     m_inspector->showLoading();
-    emit detailRequested(m_activeRequestId, objectId, kind);
+    emit detailRequested(m_activeInspectorRequestId, objectId, kind);
+
+    ++m_activeEntriesRequestId;
+    m_entries->showLoading(
+        m_model->data(m_model->index(current.row(), DistributionTreeModel::NameColumn, current.parent()))
+            .toString());
+    emit entriesRequested(m_activeEntriesRequestId, objectId);
 }
 
 void MainWindow::clearSelection()
 {
-    // Invalidate the pending request: a late response must never
-    // overwrite the cleared inspector.
-    ++m_activeRequestId;
+    // Invalidate the pending requests: a late response must never
+    // overwrite the cleared panes.
+    ++m_activeInspectorRequestId;
+    ++m_activeEntriesRequestId;
     m_inspector->showEmpty();
+    m_entries->showEmpty();
+}
+
+void MainWindow::onEntrySelected(quint64 productId, quint64 entryId)
+{
+    // An entry pick replaces only the inspector content; the entry
+    // list the user is browsing stays untouched.
+    ++m_activeInspectorRequestId;
+    m_inspector->showLoading();
+    emit entryDetailRequested(m_activeInspectorRequestId, productId, entryId);
 }
 
 void MainWindow::setOpenInProgress(bool inProgress)
@@ -209,7 +248,7 @@ void MainWindow::setOpenInProgress(bool inProgress)
 
 void MainWindow::onProductDetailReady(quint64 requestId, const ProductDetailSnapshot &detail)
 {
-    if (requestId != m_activeRequestId) {
+    if (requestId != m_activeInspectorRequestId) {
         return;
     }
     m_inspector->showProduct(detail);
@@ -218,7 +257,7 @@ void MainWindow::onProductDetailReady(quint64 requestId, const ProductDetailSnap
 
 void MainWindow::onImageDetailReady(quint64 requestId, const ImageDetailSnapshot &detail)
 {
-    if (requestId != m_activeRequestId) {
+    if (requestId != m_activeInspectorRequestId) {
         return;
     }
     m_inspector->showImage(detail);
@@ -227,7 +266,7 @@ void MainWindow::onImageDetailReady(quint64 requestId, const ImageDetailSnapshot
 
 void MainWindow::onSubsystemDetailReady(quint64 requestId, const SubsystemDetailSnapshot &detail)
 {
-    if (requestId != m_activeRequestId) {
+    if (requestId != m_activeInspectorRequestId) {
         return;
     }
     m_inspector->showSubsystem(detail);
@@ -236,12 +275,39 @@ void MainWindow::onSubsystemDetailReady(quint64 requestId, const SubsystemDetail
 
 void MainWindow::onDetailFailed(quint64 requestId, const QString &message)
 {
-    if (requestId != m_activeRequestId) {
+    if (requestId != m_activeInspectorRequestId) {
         // Stale failure: the user has moved on; stay silent.
         return;
     }
     m_inspector->showError(message);
     statusBar()->showMessage(tr("Unable to load details: %1").arg(message));
+}
+
+void MainWindow::onEntryDetailReady(quint64 requestId, const EntryDetailSnapshot &detail)
+{
+    if (requestId != m_activeInspectorRequestId) {
+        return;
+    }
+    m_inspector->showEntry(detail);
+    restoreLoadedStatus();
+}
+
+void MainWindow::onEntriesReady(quint64 requestId, const EntryListSnapshot &entries)
+{
+    if (requestId != m_activeEntriesRequestId) {
+        // A scope the user has already left: drop it silently.
+        return;
+    }
+    m_entries->showEntries(entries);
+}
+
+void MainWindow::onEntriesFailed(quint64 requestId, const QString &message)
+{
+    if (requestId != m_activeEntriesRequestId) {
+        return;
+    }
+    m_entries->showError(message);
+    statusBar()->showMessage(tr("Unable to load entries: %1").arg(message));
 }
 
 void MainWindow::restoreLoadedStatus()

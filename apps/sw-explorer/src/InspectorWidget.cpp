@@ -1,6 +1,10 @@
 #include "InspectorWidget.h"
 
+#include "ByteFormat.h"
+
 #include <QApplication>
+#include <QFileInfo>
+#include <QFontDatabase>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -68,6 +72,29 @@ void addFormRow(QFormLayout *form, const QString &name, const QString &value)
 QString yesNo(bool value)
 {
     return value ? InspectorWidget::tr("Yes") : InspectorWidget::tr("No");
+}
+
+// The entry type as a readable label; an unknown type keeps its raw
+// IDB letter visible instead of collapsing into a generic word.
+QString entryTypeText(const EntryDetailSnapshot &detail)
+{
+    switch (detail.fileType) {
+    case EntryFileType::Regular:
+        return InspectorWidget::tr("Regular file");
+    case EntryFileType::Directory:
+        return InspectorWidget::tr("Directory");
+    case EntryFileType::SymbolicLink:
+        return InspectorWidget::tr("Symbolic link");
+    case EntryFileType::BlockDevice:
+        return InspectorWidget::tr("Block device");
+    case EntryFileType::CharacterDevice:
+        return InspectorWidget::tr("Character device");
+    case EntryFileType::Fifo:
+        return InspectorWidget::tr("Fifo");
+    case EntryFileType::Other:
+        return InspectorWidget::tr("Unknown ('%1')").arg(detail.fileTypeRaw);
+    }
+    Q_UNREACHABLE();
 }
 
 // The CLI range spelling, e.g. "patch*.sw.unix 0..1274627332" or
@@ -311,6 +338,11 @@ void InspectorWidget::showSubsystem(const SubsystemDetailSnapshot &detail)
     showContent(QStringLiteral("subsystemPage"), buildSubsystemPage(detail));
 }
 
+void InspectorWidget::showEntry(const EntryDetailSnapshot &detail)
+{
+    showContent(QStringLiteral("entryPage"), buildEntryPage(detail));
+}
+
 namespace {
 
 // The shared content scaffold: bold name header, optional subtitle,
@@ -345,6 +377,104 @@ QWidget *makeContent(const QString &name, const QString &title, QVBoxLayout **ou
 }
 
 } // namespace
+
+QWidget *InspectorWidget::buildEntryPage(const EntryDetailSnapshot &detail)
+{
+    QVBoxLayout *layout = nullptr;
+    QWidget *page = makeContent(detail.path, QString(), &layout);
+
+    QFormLayout *general = startFormSection(layout, tr("General"), QStringLiteral("generalSection"));
+    addFormRow(general, tr("Type"), entryTypeText(detail));
+    // IDB modes are octal; keep the familiar 0755 spelling.
+    addFormRow(general,
+               tr("Mode"),
+               QStringLiteral("%1").arg(detail.mode, 4, 8, QLatin1Char('0')));
+    addFormRow(general, tr("Owner"), detail.owner);
+    addFormRow(general, tr("Group"), detail.group);
+    addFormRow(general, tr("Subsystem"), detail.subsystem);
+    // Unknown sizes show as "-", never as a fake 0.
+    addFormRow(general,
+               tr("Size"),
+               detail.sizeKnown ? formatByteSize(detail.size) : QStringLiteral("-"));
+    addFormRow(general,
+               tr("Stored"),
+               detail.storedSizeKnown ? formatByteSize(detail.storedSize)
+                                      : QStringLiteral("-"));
+    // Compressed only applies when the record actually stores
+    // compressed bytes (cmpsize > 0); otherwise it is redundant
+    // with Stored and stays hidden.
+    if (detail.compressedSizeKnown && detail.compressedSize > 0) {
+        addFormRow(general, tr("Compressed"), formatByteSize(detail.compressedSize));
+    }
+    if (detail.checksumKnown) {
+        addFormRow(general, tr("Checksum"), QString::number(detail.checksum));
+    }
+    // Type-specific rows: present only when the entry actually
+    // carries the attribute, hidden otherwise.
+    if (detail.configKnown) {
+        addFormRow(general, tr("Config"), detail.configMode);
+    }
+    if (detail.symlinkTargetKnown) {
+        addFormRow(general, tr("Link target"), detail.symlinkTarget);
+    }
+    if (detail.deviceKnown) {
+        addFormRow(general,
+                   tr("Device"),
+                   tr("%1, %2").arg(detail.deviceMajor).arg(detail.deviceMinor));
+    }
+
+    QFormLayout *paths = startFormSection(layout, tr("Paths"), QStringLiteral("pathsSection"));
+    addFormRow(paths, tr("Install"), detail.path);
+    addFormRow(paths, tr("Raw"), detail.rawPath);
+    addFormRow(paths, tr("Source"), detail.sourcePath);
+
+    // An entry without MACH attributes is known to be unrestricted,
+    // so the hardware sections appear only when there is something
+    // to show.
+    HardwareSnapshot mach;
+    mach.known = true;
+    mach.expressions = detail.mach;
+    mach.unresolved = detail.unresolvedMach;
+    addHardwareSections(layout, mach);
+
+    // Payload metadata only: everything here comes from the layout
+    // metadata, nothing was read from the image archive. The record
+    // offset is the expected one, never an actual verified offset.
+    if (detail.payloadPresent) {
+        QFormLayout *payload =
+            startFormSection(layout, tr("Payload"), QStringLiteral("payloadSection"));
+        addFormRow(payload, tr("Image"), detail.payloadImage);
+        addFormRow(payload,
+                   tr("Encoded size"),
+                   detail.payloadEncodedSizeKnown
+                       ? formatByteSize(detail.payloadEncodedSize)
+                       : QStringLiteral("-"));
+        addFormRow(payload,
+                   tr("Expected record offset"),
+                   detail.expectedRecordOffsetKnown
+                       ? QStringLiteral("0x%1").arg(detail.expectedRecordOffset, 8, 16, QLatin1Char('0'))
+                       : QStringLiteral("-"));
+    }
+
+    QFormLayout *origin =
+        startFormSection(layout, tr("IDB Source"), QStringLiteral("idbSourceSection"));
+    auto *fileLabel = textLabel(QFileInfo(detail.originIdbPath).fileName());
+    fileLabel->setToolTip(detail.originIdbPath);
+    origin->addRow(tr("File"), fileLabel);
+    addFormRow(origin, tr("Line"), QString::number(detail.originLine));
+
+    // The complete original record: the lossless fallback for every
+    // attribute that has no structured field above.
+    QVBoxLayout *raw =
+        startSection(layout, tr("Raw IDB Record"), QStringLiteral("rawIdbSection"));
+    auto *rawLabel = textLabel(detail.rawIdbLine);
+    rawLabel->setObjectName(QStringLiteral("rawIdbLine"));
+    rawLabel->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+    raw->addWidget(rawLabel);
+
+    layout->addStretch();
+    return page;
+}
 
 QWidget *InspectorWidget::buildProductPage(const ProductDetailSnapshot &detail)
 {

@@ -227,14 +227,20 @@ qt_add_executable(sw-explorer
     src/main.cpp
     src/HierarchySnapshot.h
     src/InspectorSnapshot.h
+    src/EntrySnapshot.h
+    src/ByteFormat.h
     src/InspectorWidget.h
     src/InspectorWidget.cpp
+    src/EntryBrowserWidget.h
+    src/EntryBrowserWidget.cpp
     src/MainWindow.h
     src/MainWindow.cpp
     src/BackendWorker.h
     src/BackendWorker.cpp
     src/models/DistributionTreeModel.h
     src/models/DistributionTreeModel.cpp
+    src/models/EntryTableModel.h
+    src/models/EntryTableModel.cpp
     "${SW_GENERATED_SOURCE}"
 )
 

@@ -2,6 +2,7 @@
 
 #include <QWidget>
 
+#include "EntrySnapshot.h"
 #include "InspectorSnapshot.h"
 
 QT_BEGIN_NAMESPACE
@@ -32,12 +33,14 @@ public:
     void showProduct(const ProductDetailSnapshot &detail);
     void showImage(const ImageDetailSnapshot &detail);
     void showSubsystem(const SubsystemDetailSnapshot &detail);
+    void showEntry(const EntryDetailSnapshot &detail);
     void showError(const QString &message);
 
 private:
     QWidget *buildProductPage(const ProductDetailSnapshot &detail);
     QWidget *buildImagePage(const ImageDetailSnapshot &detail);
     QWidget *buildSubsystemPage(const SubsystemDetailSnapshot &detail);
+    QWidget *buildEntryPage(const EntryDetailSnapshot &detail);
     void showContent(const QString &pageName, QWidget *content);
 
     QStackedWidget *m_stack = nullptr;
