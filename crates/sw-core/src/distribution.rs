@@ -11,9 +11,10 @@
 //! is missing or unreadable falls back to a tree derived from the IDB
 //! alone, with every subsystem marked accordingly.
 use crate::descriptor::model::{
-    DescriptorMetadata, ProductDescriptor, Subsystem, SubsystemPresence,
+    Cutpoint, HardwareRestrictions, ProductDescriptor, Subsystem, SubsystemPresence,
 };
 use crate::descriptor::parser as descriptor_parser;
+use crate::descriptor::semantics;
 use crate::diagnostic::Diagnostic;
 use crate::error::{Error, Result};
 use crate::idb::parser as idb_parser;
@@ -23,10 +24,8 @@ use crate::image::layout::{
 };
 use crate::image::reader::ImageReader;
 use crate::image::{Image, ImageArchive, ImageLayout};
-use crate::mach::HardwareExpr;
 use crate::mach::eval::HardwareProfile;
 use crate::names::{ImageName, ProductName};
-use crate::path::IrixPath;
 use crate::query::{Query, QueryResult};
 use crate::selection::{self, EntrySelection};
 use std::path::{Path, PathBuf};
@@ -54,6 +53,11 @@ impl Distribution {
     /// every product's IDB is parsed, images and subsystems are assembled,
     /// and image layouts are computed.
     ///
+    /// Products are discovered as the *union* of IDB files (`<name>.idb`)
+    /// and descriptor files (extensionless `<name>` with a `pd001V`
+    /// header): a product with only one of the two is kept, mirroring
+    /// the descriptor/IDB asymmetry real media allow.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::NotADistribution`] if `path` is not a directory, or
@@ -66,7 +70,9 @@ impl Distribution {
         }
 
         let mut listing = std::fs::read_dir(&root).map_err(|source| Error::io(&root, source))?;
-        let mut idb_files: Vec<PathBuf> = Vec::new();
+        let mut idb_files: std::collections::BTreeMap<String, PathBuf> =
+            std::collections::BTreeMap::new();
+        let mut stems: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         while let Some(entry) = listing
             .next()
             .transpose()
@@ -74,19 +80,27 @@ impl Distribution {
         {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "idb") {
-                idb_files.push(path);
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    stems.insert(stem.to_string());
+                    idb_files.insert(stem.to_string(), path);
+                }
+            } else if path.extension().is_none()
+                && path.is_file()
+                && has_descriptor_header(&path)
+                && let Some(stem) = path.file_name().and_then(|s| s.to_str())
+            {
+                stems.insert(stem.to_string());
             }
         }
-        idb_files.sort();
 
         let mut diagnostics = Vec::new();
         let mut products = Vec::new();
-        for idb_file in idb_files {
-            match build_product(&root, &idb_file) {
+        for stem in stems {
+            match build_product(&root, &stem, idb_files.get(&stem)) {
                 Ok(product) => products.push(product),
                 Err(error) => diagnostics.push(Diagnostic::error(
                     format!("skipping product: {error}"),
-                    Some(idb_file.display().to_string()),
+                    Some(stem),
                 )),
             }
         }
@@ -167,15 +181,16 @@ pub struct Product {
     pub descriptor_file: PathBuf,
     /// The parsed descriptor, if the file exists and parses exactly.
     pub descriptor: Option<ProductDescriptor>,
-    /// Path of the IDB file (e.g. `dist/eoe.idb`).
-    pub idb_file: PathBuf,
+    /// Path of the IDB file (e.g. `dist/eoe.idb`), if the product has
+    /// one.
+    pub idb_file: Option<PathBuf>,
     /// Product title from the descriptor.
     pub title: Option<String>,
-    /// Hardware applicability expressions (OR-ed) from the descriptor's
-    /// `mach` metadata blobs; `None` when there is no parsed descriptor.
-    pub mach: Option<Vec<HardwareExpr>>,
+    /// Hardware applicability from the descriptor's `mach` attribute
+    /// blobs; `None` when there is no parsed descriptor.
+    pub mach: Option<HardwareRestrictions>,
     /// Cut points recorded in the descriptor.
-    pub cutpoints: Vec<IrixPath>,
+    pub cutpoints: Vec<Cutpoint>,
     /// Images, in descriptor order (or first-appearance order in the IDB
     /// when the product has no parsed descriptor).
     pub images: Vec<Image>,
@@ -196,14 +211,17 @@ fn existing_file(path: PathBuf) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// Whether a file starts with the `pd001V` descriptor magic.
+fn has_descriptor_header(path: &Path) -> bool {
+    let mut prefix = [0u8; 6];
+    use std::io::Read as _;
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut prefix))
+        .is_ok_and(|()| &prefix == b"pd001V")
+}
+
 /// Builds one product from its IDB (and, where possible, its descriptor).
-fn build_product(root: &Path, idb_file: &Path) -> Result<Product> {
-    let stem = idb_file
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| Error::NotADistribution {
-            path: idb_file.to_path_buf(),
-        })?;
+fn build_product(root: &Path, stem: &str, idb_file: Option<&PathBuf>) -> Result<Product> {
     let name = ProductName::new(stem)?;
     let descriptor_file = root.join(stem);
 
@@ -224,13 +242,24 @@ fn build_product(root: &Path, idb_file: &Path) -> Result<Product> {
     } else {
         diagnostics.push(Diagnostic::warning(
             "product has no descriptor file",
-            Some(idb_file.display().to_string()),
+            idb_file.map(|path| path.display().to_string()),
         ));
         None
     };
 
-    let idb_bytes = std::fs::read(idb_file).map_err(|e| Error::io(idb_file, e))?;
-    let mut entries = idb_parser::parse(&idb_bytes, idb_file, &mut diagnostics)?;
+    let mut entries = match idb_file {
+        Some(idb_file) => {
+            let idb_bytes = std::fs::read(idb_file).map_err(|e| Error::io(idb_file, e))?;
+            idb_parser::parse(&idb_bytes, idb_file, &mut diagnostics)?
+        }
+        None => {
+            diagnostics.push(Diagnostic::warning(
+                "product has a descriptor but no IDB file",
+                Some(descriptor_file.display().to_string()),
+            ));
+            Vec::new()
+        }
+    };
 
     if let Some(descriptor) = &descriptor
         && descriptor.name != name.as_str()
@@ -258,26 +287,32 @@ fn build_product(root: &Path, idb_file: &Path) -> Result<Product> {
     );
     compute_layouts(&mut images, &mut entries);
 
-    let (title, mach) = match &descriptor {
+    let (title, mach, cutpoints) = match &descriptor {
         Some(descriptor) => (
-            (!descriptor.description.is_empty()).then(|| descriptor.description.clone()),
-            Some(metadata_mach(
-                &descriptor.metadata,
+            (!descriptor.text.effective().is_empty())
+                .then(|| descriptor.text.effective().to_string()),
+            Some(semantics::mach_expressions(
+                &descriptor.attributes,
                 &descriptor_file.display().to_string(),
                 &mut diagnostics,
             )),
+            semantics::cutpoints(
+                &descriptor.attributes,
+                &descriptor_file.display().to_string(),
+                &mut diagnostics,
+            ),
         ),
-        None => (None, None),
+        None => (None, None, Vec::new()),
     };
 
     Ok(Product {
         name,
         descriptor_file,
         descriptor,
-        idb_file: idb_file.to_path_buf(),
+        idb_file: idb_file.cloned(),
         title,
         mach,
-        cutpoints: Vec::new(),
+        cutpoints,
         images,
         entries,
         diagnostics,
@@ -317,37 +352,48 @@ fn tree_from_descriptor(
                     continue;
                 }
             };
+            let qualified_name = qualified.clone();
             subsystems.push(Subsystem {
                 name,
-                title: (!subsystem_record.description.is_empty())
-                    .then(|| subsystem_record.description.clone()),
+                title: (!subsystem_record.text.effective().is_empty())
+                    .then(|| subsystem_record.text.effective().to_string()),
                 mapping: (!subsystem_record.mapping.is_empty())
                     .then(|| subsystem_record.mapping.clone()),
                 presence: SubsystemPresence {
                     descriptor: true,
                     idb: false,
                 },
-                // The subsystem record carries no metadata blobs, so
-                // subsystem-level mach is not decoded; the raw flag word
-                // and the non-prerequisite rule slots are not decoded
-                // either. `None` means unknown — it must not be read as
-                // "no restriction" or "no rules".
-                mach: None,
-                flags: None,
-                autominiroot: None,
-                rules: Some(crate::descriptor::model::SubsystemRules {
-                    prerequisites: subsystem_record.prerequisites.clone(),
-                    ..Default::default()
-                }),
+                mach: Some(semantics::mach_expressions(
+                    &subsystem_record.attributes,
+                    &qualified_name,
+                    &mut *diagnostics,
+                )),
+                flags: Some(semantics::decode_flags(
+                    subsystem_record.flags_raw,
+                    &subsystem_record.attributes,
+                    &qualified_name,
+                    &mut *diagnostics,
+                )),
+                autominiroot: Some(semantics::autominiroot(
+                    &subsystem_record.attributes,
+                    &qualified_name,
+                    &mut *diagnostics,
+                )),
+                rules: Some(semantics::decode_rules(
+                    subsystem_record,
+                    &qualified_name,
+                    &mut *diagnostics,
+                )),
                 entry_ids: Vec::new(),
             });
         }
         images.push(Image {
-            title: (!image_record.description.is_empty()).then(|| image_record.description.clone()),
+            title: (!image_record.text.effective().is_empty())
+                .then(|| image_record.text.effective().to_string()),
             version: Some(image_record.version),
-            order: None,
-            mach: Some(metadata_mach(
-                &image_record.metadata,
+            order: Some(i32::from(image_record.order)),
+            mach: Some(semantics::mach_expressions(
+                &image_record.attributes,
                 &image_name.file_name(),
                 &mut *diagnostics,
             )),
@@ -485,28 +531,6 @@ fn open_image_archive(
             payloads: Vec::new(),
         },
     }
-}
-
-/// Collects the hardware expressions of `mach` metadata blobs (`m`
-/// prefix), reporting unparsable expressions as warnings.
-fn metadata_mach(
-    metadata: &[DescriptorMetadata],
-    origin: &str,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Vec<HardwareExpr> {
-    let mut expressions = Vec::new();
-    for blob in metadata {
-        if let Some(result) = blob.mach() {
-            match result {
-                Ok(expression) => expressions.push(expression),
-                Err(error) => diagnostics.push(Diagnostic::warning(
-                    format!("unparsable descriptor mach blob: {error}"),
-                    Some(origin.to_string()),
-                )),
-            }
-        }
-    }
-    expressions
 }
 
 /// Computes the layout of every image and attaches payload locators to

@@ -11,9 +11,8 @@ pub mod reader;
 pub(crate) mod resync;
 
 use crate::compress;
-use crate::descriptor::model::{Subsystem, Version};
+use crate::descriptor::model::{HardwareRestrictions, Subsystem, Version};
 use crate::error::Result;
-use crate::mach::HardwareExpr;
 use crate::names::ImageName;
 use std::path::PathBuf;
 
@@ -38,9 +37,9 @@ pub struct Image {
     pub version: Option<Version>,
     /// Installation order hint.
     pub order: Option<i32>,
-    /// Hardware applicability expressions (OR-ed) from the descriptor's
-    /// `mach` metadata blobs; `None` when there is no parsed descriptor.
-    pub mach: Option<Vec<HardwareExpr>>,
+    /// Hardware applicability from the descriptor's `mach` attribute
+    /// blobs; `None` when there is no parsed descriptor.
+    pub mach: Option<HardwareRestrictions>,
     /// The physical archive file.
     pub archive: ImageArchive,
     /// Subsystems grouped in this image.

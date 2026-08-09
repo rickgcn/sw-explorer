@@ -9,7 +9,9 @@
 //! The descriptor is the authoritative source of the
 //! product → image → subsystem hierarchy; the IDB only contributes file
 //! entries. [`model`] defines the physical records (which keep raw values
-//! for fields whose semantics are not confirmed) alongside the logical
-//! tree types; the parser decodes the binary grammar deterministically.
+//! for everything on the wire) alongside the logical tree types; the
+//! parser decodes the binary grammar deterministically, and the
+//! semantics layer decodes the physical records into the logical model.
 pub mod model;
 pub(crate) mod parser;
+pub(crate) mod semantics;

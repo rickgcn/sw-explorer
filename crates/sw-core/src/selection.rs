@@ -8,11 +8,17 @@
 //! ```
 //!
 //! (multiple expressions on the same level are OR-ed). The descriptor is
-//! the source of product- and image-level expressions; a level whose
-//! expressions are not decoded (`None`) is *unknown*, not "no
-//! restriction", and is therefore not used to exclude anything. Within
-//! one subsystem, several entries may share a path: a matching
-//! mach-specific entry wins over the mach-less fallback.
+//! the source of all three hierarchy levels; a level whose expressions
+//! are not decoded (`None`, which only happens without a descriptor
+//! record) is *unknown*, not "no restriction", and is therefore not used
+//! to exclude anything. Within one subsystem, several entries may share
+//! a path: a matching mach-specific entry wins over the mach-less
+//! fallback.
+//!
+//! Evaluation is fail-safe: a level whose expressions could not be
+//! parsed reports [`Applicability::Unknown`], and the affected entries
+//! are reported as unresolved conflicts instead of being silently
+//! selected (fail-open) or dropped (fail-closed data loss).
 //!
 //! Ambiguities are reported through [`SelectionConflict`] *and* the
 //! candidates stay in `selected`, so nothing silently disappears; it is
@@ -20,13 +26,16 @@
 //! Entries whose `mach` attribute could not be parsed are the exception:
 //! their applicability is unknown, so they are reported as conflicts but
 //! never selected.
+use crate::descriptor::model::{Applicability, HardwareRestrictions, Subsystem};
 use crate::distribution::Product;
 use crate::idb::{Entry, EntryId};
-use crate::mach::eval::{HardwareProfile, matches_any};
+use crate::image::Image;
+use crate::mach::eval::HardwareProfile;
 use crate::path::IrixPath;
 
 /// Several entries claim the same path and the selection rules cannot
-/// pick between them.
+/// pick between them, or the applicability of the candidates could not
+/// be determined.
 #[derive(Debug)]
 pub struct SelectionConflict<'a> {
     /// The contested path.
@@ -48,17 +57,32 @@ pub struct EntrySelection<'a> {
 /// Selects the applicable entries of one product for a target.
 pub fn select_product<'a>(product: &'a Product, profile: &HardwareProfile) -> EntrySelection<'a> {
     let mut selection = EntrySelection::default();
-    if !mach_matches(&product.mach, profile) {
-        return selection;
+    match applicability(&product.mach, profile) {
+        Applicability::NoMatch => return selection,
+        Applicability::Unknown => {
+            report_unresolved(product.entries.iter(), &mut selection);
+            return selection;
+        }
+        Applicability::Match => {}
     }
 
     for image in &product.images {
-        if !mach_matches(&image.mach, profile) {
-            continue;
+        match applicability(&image.mach, profile) {
+            Applicability::NoMatch => continue,
+            Applicability::Unknown => {
+                report_unresolved(image_entries(product, image), &mut selection);
+                continue;
+            }
+            Applicability::Match => {}
         }
         for subsystem in &image.subsystems {
-            if !mach_matches(&subsystem.mach, profile) {
-                continue;
+            match applicability(&subsystem.mach, profile) {
+                Applicability::NoMatch => continue,
+                Applicability::Unknown => {
+                    report_unresolved(subsystem_entries(product, subsystem), &mut selection);
+                    continue;
+                }
+                Applicability::Match => {}
             }
             select_subsystem_entries(product, &subsystem.entry_ids, profile, &mut selection);
         }
@@ -66,15 +90,55 @@ pub fn select_product<'a>(product: &'a Product, profile: &HardwareProfile) -> En
     selection
 }
 
-/// Whether a hierarchy level's hardware expressions match the target.
+/// Evaluates a hierarchy level's hardware restrictions for the target.
 ///
-/// `None` means the expressions are not decoded (unknown), which never
-/// excludes anything; `Some` applies the OR-ed expressions, with an
-/// empty list matching everything.
-fn mach_matches(mach: &Option<Vec<crate::mach::HardwareExpr>>, profile: &HardwareProfile) -> bool {
+/// `None` means the level has no descriptor record (its applicability
+/// is unknown to us); the established policy is to not exclude anything
+/// on that basis.
+fn applicability(mach: &Option<HardwareRestrictions>, profile: &HardwareProfile) -> Applicability {
     match mach {
-        Some(expressions) => matches_any(expressions, profile),
-        None => true,
+        Some(restrictions) => restrictions.evaluate(profile),
+        None => Applicability::Match,
+    }
+}
+
+/// The entries of one image.
+fn image_entries<'a>(product: &'a Product, image: &'a Image) -> impl Iterator<Item = &'a Entry> {
+    image
+        .subsystems
+        .iter()
+        .flat_map(|subsystem| subsystem_entries(product, subsystem))
+}
+
+/// The entries of one subsystem.
+fn subsystem_entries<'a>(
+    product: &'a Product,
+    subsystem: &'a Subsystem,
+) -> impl Iterator<Item = &'a Entry> {
+    subsystem
+        .entry_ids
+        .iter()
+        .filter_map(|id| product.entry(*id))
+}
+
+/// Reports entries whose applicability cannot be determined as
+/// conflicts, grouped by path.
+fn report_unresolved<'a>(
+    entries: impl Iterator<Item = &'a Entry>,
+    selection: &mut EntrySelection<'a>,
+) {
+    let mut groups: Vec<(&IrixPath, Vec<&Entry>)> = Vec::new();
+    for entry in entries {
+        match groups.iter_mut().find(|(path, _)| *path == &entry.path) {
+            Some((_, entries)) => entries.push(entry),
+            None => groups.push((&entry.path, vec![entry])),
+        }
+    }
+    for (path, candidates) in groups {
+        selection.conflicts.push(SelectionConflict {
+            path: path.clone(),
+            candidates,
+        });
     }
 }
 
