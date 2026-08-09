@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "HierarchySnapshot.h"
+#include "InspectorSnapshot.h"
 #include "sw_gui_bridge.h"
 
 // Owns the Rust backend and runs every call into it. Lives in a
@@ -18,6 +19,11 @@
 // backend. Until then the previously committed backend keeps serving
 // every query, so a rejected snapshot can never desynchronize the GUI
 // tree from the Rust-side object ids.
+//
+// Detail queries are answered only by the committed backend; the
+// candidate is never queried. Every detailRequested carries a
+// requestId that the response echoes back unchanged, so the GUI can
+// drop responses that arrive after the selection moved on.
 class BackendWorker : public QObject
 {
     Q_OBJECT
@@ -29,12 +35,22 @@ public slots:
     void openDistribution(const QString &path);
     void commitCandidate();
     void discardCandidate();
+    void detailRequested(quint64 requestId, quint64 objectId, HierarchyKind kind);
 
 signals:
     void candidateReady(quint64 productCount,
                         quint64 diagnosticCount,
                         const HierarchySnapshot &hierarchy);
     void distributionOpenFailed(const QString &message);
+    // Emitted after the candidate has actually been swapped in as the
+    // committed backend: from this point on the new object ids are
+    // queryable.
+    void candidateCommitted();
+
+    void productDetailReady(quint64 requestId, const ProductDetailSnapshot &detail);
+    void imageDetailReady(quint64 requestId, const ImageDetailSnapshot &detail);
+    void subsystemDetailReady(quint64 requestId, const SubsystemDetailSnapshot &detail);
+    void detailFailed(quint64 requestId, const QString &message);
 
 private:
     // The committed backend: what every future query talks to.

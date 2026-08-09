@@ -36,8 +36,10 @@ and use *File > Open Distribution...* to open an IRIX `dist` directory.
 
 ## Tests
 
-The Qt model tests use Qt Test and CTest. They are GUI-free
-(`QTEST_GUILESS_MAIN`) and run headless on every platform:
+The tests use Qt Test and CTest. The model and worker tests are
+GUI-free (`QTEST_GUILESS_MAIN`); the inspector tests are QWidget
+tests (`QTEST_MAIN`) pinned to the offscreen platform, so everything
+runs headless on every platform:
 
 ```sh
 ctest --test-dir build/sw-explorer --build-config Release --output-on-failure

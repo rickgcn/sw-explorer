@@ -22,6 +22,160 @@ QString toQString(const rust::String &value)
     return QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size()));
 }
 
+QStringList toQStringList(const rust::Vec<rust::String> &values)
+{
+    QStringList out;
+    out.reserve(static_cast<qsizetype>(values.size()));
+    for (const rust::String &value : values) {
+        out.append(toQString(value));
+    }
+    return out;
+}
+
+HardwareSnapshot toQt(const sw::HardwareDetail &detail)
+{
+    HardwareSnapshot out;
+    out.known = detail.known;
+    out.expressions = toQStringList(detail.expressions);
+    out.unresolved = toQStringList(detail.unresolved);
+    return out;
+}
+
+ConditionalFlagSnapshot toQt(const sw::ConditionalFlagDetail &detail)
+{
+    ConditionalFlagSnapshot out;
+    switch (detail.state) {
+    case sw::ConditionalFlagState::No:
+        out.state = ConditionalFlagState::No;
+        break;
+    case sw::ConditionalFlagState::Always:
+        out.state = ConditionalFlagState::Always;
+        break;
+    case sw::ConditionalFlagState::Conditional:
+        out.state = ConditionalFlagState::Conditional;
+        break;
+    case sw::ConditionalFlagState::Unresolved:
+        out.state = ConditionalFlagState::Unresolved;
+        break;
+    }
+    out.expressions = toQStringList(detail.expressions);
+    out.unresolved = toQStringList(detail.unresolved);
+    return out;
+}
+
+SubsystemFlagsSnapshot toQt(const sw::SubsystemFlagsDetail &detail)
+{
+    SubsystemFlagsSnapshot out;
+    out.known = detail.known;
+    out.required = toQt(detail.required);
+    out.defaultFlag = toQt(detail.default_flag);
+    out.miniroot = toQt(detail.miniroot);
+    out.inplace = detail.inplace;
+    out.patch = detail.patch;
+    out.clientOnly = detail.client_only;
+    out.overlay = detail.overlay;
+    out.overlayMember = detail.overlay_member;
+    return out;
+}
+
+RangeSnapshot toQt(const sw::RangeDetail &detail)
+{
+    RangeSnapshot out;
+    out.target = toQString(detail.target);
+    out.minVersion = detail.min_version;
+    out.maxIsUnbounded = detail.max_is_unbounded;
+    out.maxVersion = detail.max_version;
+    return out;
+}
+
+QList<RangeSnapshot> toQt(const rust::Vec<sw::RangeDetail> &details)
+{
+    QList<RangeSnapshot> out;
+    out.reserve(static_cast<qsizetype>(details.size()));
+    for (const sw::RangeDetail &detail : details) {
+        out.append(toQt(detail));
+    }
+    return out;
+}
+
+RulesSnapshot toQt(const sw::RulesDetail &detail)
+{
+    RulesSnapshot out;
+    out.known = detail.known;
+    for (const sw::PrerequisiteClauseDetail &clause : detail.prerequisites) {
+        out.prerequisites.append({toQt(clause.all_of)});
+    }
+    out.replaces = toQt(detail.replaces);
+    out.incompatibilities = toQt(detail.incompatibilities);
+    out.updates = toQt(detail.updates);
+    out.follows = toQt(detail.follows);
+    return out;
+}
+
+ProductDetailSnapshot toQt(const sw::ProductDetail &detail)
+{
+    ProductDetailSnapshot out;
+    out.id = detail.id;
+    out.name = toQString(detail.name);
+    out.title = toQString(detail.title);
+    out.descriptorPresent = detail.descriptor_present;
+    out.idbPresent = detail.idb_present;
+    out.imageCount = detail.image_count;
+    out.subsystemCount = detail.subsystem_count;
+    out.entryCount = detail.entry_count;
+    out.descriptorGeneration = toQString(detail.descriptor_generation);
+    out.descriptorLayoutLevel = detail.descriptor_layout_level;
+    out.descriptorStamp = detail.descriptor_stamp;
+    out.mach = toQt(detail.mach);
+    for (const sw::CutpointDetail &cutpoint : detail.cutpoints) {
+        out.cutpoints.append({toQString(cutpoint.path), cutpoint.sequence});
+    }
+    return out;
+}
+
+ImageDetailSnapshot toQt(const sw::ImageDetail &detail)
+{
+    ImageDetailSnapshot out;
+    out.id = detail.id;
+    out.name = toQString(detail.name);
+    out.title = toQString(detail.title);
+    out.productName = toQString(detail.product_name);
+    out.descriptorPresent = detail.descriptor_present;
+    out.idbPresent = detail.idb_present;
+    out.versionKnown = detail.version_known;
+    out.version = detail.version;
+    out.orderKnown = detail.order_known;
+    out.order = detail.order;
+    out.subsystemCount = detail.subsystem_count;
+    out.entryCount = detail.entry_count;
+    out.mach = toQt(detail.mach);
+    return out;
+}
+
+SubsystemDetailSnapshot toQt(const sw::SubsystemDetail &detail)
+{
+    SubsystemDetailSnapshot out;
+    out.id = detail.id;
+    out.identity = toQString(detail.identity);
+    out.shortName = toQString(detail.short_name);
+    out.title = toQString(detail.title);
+    out.productName = toQString(detail.product_name);
+    out.imageName = toQString(detail.image_name);
+    out.imageVersionKnown = detail.image_version_known;
+    out.imageVersion = detail.image_version;
+    out.descriptorPresent = detail.descriptor_present;
+    out.idbPresent = detail.idb_present;
+    out.entryCount = detail.entry_count;
+    out.mappingKnown = detail.mapping_known;
+    out.mapping = toQString(detail.mapping);
+    out.mach = toQt(detail.mach);
+    out.flags = toQt(detail.flags);
+    out.rules = toQt(detail.rules);
+    out.autominirootKnown = detail.autominiroot_known;
+    out.autominiroot = toQt(detail.autominiroot);
+    return out;
+}
+
 } // namespace
 
 BackendWorker::BackendWorker(QObject *parent)
@@ -78,10 +232,35 @@ void BackendWorker::commitCandidate()
     if (m_candidate.has_value()) {
         m_backend = std::move(*m_candidate);
         m_candidate.reset();
+        // The GUI keeps its tree interaction locked until this signal
+        // arrives, so no detail query can be issued against object
+        // ids the committed backend does not serve yet.
+        emit candidateCommitted();
     }
 }
 
 void BackendWorker::discardCandidate()
 {
     m_candidate.reset();
+}
+
+void BackendWorker::detailRequested(quint64 requestId, quint64 objectId, HierarchyKind kind)
+{
+    // Detail queries only ever talk to the committed backend; a
+    // pending candidate is not queryable by definition.
+    try {
+        switch (kind) {
+        case HierarchyKind::Product:
+            emit productDetailReady(requestId, toQt(m_backend->product_detail(objectId)));
+            break;
+        case HierarchyKind::Image:
+            emit imageDetailReady(requestId, toQt(m_backend->image_detail(objectId)));
+            break;
+        case HierarchyKind::Subsystem:
+            emit subsystemDetailReady(requestId, toQt(m_backend->subsystem_detail(objectId)));
+            break;
+        }
+    } catch (const rust::Error &error) {
+        emit detailFailed(requestId, QString::fromUtf8(error.what()));
+    }
 }

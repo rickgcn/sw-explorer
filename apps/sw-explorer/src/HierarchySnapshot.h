@@ -37,5 +37,6 @@ struct HierarchyNodeSnapshot {
 
 using HierarchySnapshot = QList<HierarchyNodeSnapshot>;
 
+Q_DECLARE_METATYPE(HierarchyKind)
 Q_DECLARE_METATYPE(HierarchyNodeSnapshot)
 Q_DECLARE_METATYPE(HierarchySnapshot)

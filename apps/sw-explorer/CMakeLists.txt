@@ -226,6 +226,9 @@ message(STATUS "Rust staticlib native dependencies (after driver-runtime filter)
 qt_add_executable(sw-explorer
     src/main.cpp
     src/HierarchySnapshot.h
+    src/InspectorSnapshot.h
+    src/InspectorWidget.h
+    src/InspectorWidget.cpp
     src/MainWindow.h
     src/MainWindow.cpp
     src/BackendWorker.h
