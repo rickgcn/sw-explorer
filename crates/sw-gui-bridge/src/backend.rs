@@ -12,7 +12,8 @@ use crate::bridge::ffi;
 use crate::detail;
 use crate::entry;
 use sw_core::distribution::Distribution;
-use sw_core::idb::EntryId;
+use sw_core::idb::{Entry, EntryId};
+use sw_core::query::Query;
 
 /// Identifies one domain object of the loaded distribution by its
 /// position: product index, image index and subsystem index into
@@ -57,6 +58,20 @@ impl std::fmt::Display for ObjectDetailError {
 }
 
 impl std::error::Error for ObjectDetailError {}
+
+/// Error for entry searches: no distribution loaded, or a query the
+/// search policy rejects (an empty query is never a "match
+/// everything" search).
+#[derive(Debug)]
+pub(crate) struct SearchError(String);
+
+impl std::fmt::Display for SearchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SearchError {}
 
 /// Rust-side backend state behind the opaque CXX handle.
 pub(crate) struct Backend {
@@ -313,6 +328,70 @@ impl Backend {
             .into_iter()
             .map(|entry| entry::entry_summary(product_id, entry))
             .collect())
+    }
+
+    pub(crate) fn search_entries(
+        &self,
+        query: &str,
+    ) -> Result<Vec<ffi::EntrySummary>, SearchError> {
+        let distribution = self
+            .distribution
+            .as_ref()
+            .ok_or_else(|| SearchError("no distribution loaded".to_string()))?;
+        // An empty query means "no search", never "match everything":
+        // a UI glitch must not dump the whole corpus.
+        if query.is_empty() {
+            return Err(SearchError("search query is empty".to_string()));
+        }
+
+        // The CLI query policy: plain text is a substring search; a
+        // query carrying its own wildcard characters reaches the core
+        // matcher unchanged.
+        let pattern = if query.contains(['*', '?']) {
+            query.to_string()
+        } else {
+            format!("*{query}*")
+        };
+        // Distribution::find yields hits in distribution product
+        // order, each product in exact IDB order, and never
+        // deduplicates duplicate paths.
+        let found = distribution.find(&Query::path(pattern));
+
+        // Maps each hit to the object id of the product that actually
+        // owns the entry. Ownership is pointer identity into a
+        // product's entry list — never the product segment of the
+        // record's subsystem name: an IDB record may name a foreign
+        // subsystem and still belong to the product whose IDB carries
+        // it, and entry_detail resolves keys against that owner's
+        // entry list. The lookup is built once per search and never
+        // cached.
+        let mut owners: std::collections::HashMap<*const Entry, u64> =
+            std::collections::HashMap::with_capacity(
+                distribution
+                    .products()
+                    .iter()
+                    .map(|product| product.entries.len())
+                    .sum(),
+            );
+        for (product_index, product) in distribution.products().iter().enumerate() {
+            let product_id = self
+                .product_object_id(product_index)
+                .map_err(|error| SearchError(error.to_string()))?;
+            for entry in &product.entries {
+                owners.insert(std::ptr::from_ref(entry), product_id);
+            }
+        }
+
+        found
+            .entries
+            .iter()
+            .map(|entry| {
+                let product_id = owners
+                    .get(&std::ptr::from_ref(*entry))
+                    .ok_or_else(|| SearchError("search hit has no owning product".to_string()))?;
+                Ok(entry::entry_summary(*product_id, entry))
+            })
+            .collect()
     }
 
     pub(crate) fn entry_detail(

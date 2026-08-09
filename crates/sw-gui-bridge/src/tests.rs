@@ -1594,3 +1594,503 @@ fn real_dist_entries_smoke() {
         }
     }
 }
+
+/// Writes the standard search test distribution: two IDB-only
+/// products, `alpha` and `beta`, whose records exercise global
+/// scope, distribution ordering, duplicate paths, MACH variants and
+/// unresolved MACH payloads.
+///
+/// `alpha` carries five records: `usr/bin/tool` in `alpha.sw.unix`,
+/// three `usr/lib/libx.so` variants split over `alpha.sw.unix` and
+/// `alpha.sw.extra` (two parsed MACH conditions, one unresolved),
+/// and the path `libx` in `alpha.man.man`. `beta` carries a fourth
+/// `usr/lib/libx.so` record and `usr/bin/other`, both in
+/// `beta.sw.unix`.
+///
+/// Object ids: 1 = product `alpha`, 2 = image `alpha.sw`, 3 =
+/// `unix`, 4 = `extra`, 5 = image `alpha.man`, 6 = `man`,
+/// 7 = product `beta`, 8 = image `beta.sw`, 9 = `unix`.
+fn write_search_dist(root: &Path) {
+    write_raw_idb(
+        root,
+        "alpha",
+        "f 0755 root sys usr/bin/tool src/tool alpha.sw.unix sum(1) size(10) cmpsize(0)\n\
+         f 0644 root sys usr/lib/libx.so src/libx1 alpha.sw.unix sum(2) size(20) cmpsize(0) mach(CPUBOARD=IP22)\n\
+         f 0644 root sys usr/lib/libx.so src/libx2 alpha.sw.extra sum(3) size(30) cmpsize(0) mach(CPUBOARD=IP26)\n\
+         f 0644 root sys usr/lib/libx.so src/libx3 alpha.sw.extra sum(4) size(40) cmpsize(10) mach(=GARBAGE)\n\
+         f 0644 root sys libx src/libx alpha.man.man sum(5) size(50) cmpsize(0)\n",
+    );
+    write_raw_idb(
+        root,
+        "beta",
+        "f 0644 root sys usr/lib/libx.so src/libxb beta.sw.unix sum(6) size(60) cmpsize(0)\n\
+         f 0644 root sys usr/bin/other src/other beta.sw.unix sum(7) size(70) cmpsize(0)\n",
+    );
+}
+
+#[test]
+fn search_requires_loaded_distribution() {
+    let backend = new_backend();
+    assert_eq!(
+        backend.search_entries("libx").err().unwrap().to_string(),
+        "no distribution loaded"
+    );
+}
+
+#[test]
+fn search_rejects_empty_query() {
+    let root = temp_root("search-empty");
+    write_search_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+    assert_eq!(
+        backend.search_entries("").err().unwrap().to_string(),
+        "search query is empty"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_plain_text_is_a_substring_match() {
+    let root = temp_root("search-substring");
+    write_search_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // Plain text matches as *libx*: the three libx.so variants, the
+    // path that is exactly "libx", and the beta record.
+    let rows = backend.search_entries("libx").unwrap();
+    let keys: Vec<(u64, u64)> = rows
+        .iter()
+        .map(|row| (row.product_id, row.entry_id))
+        .collect();
+    assert_eq!(keys, vec![(1, 1), (1, 2), (1, 3), (1, 4), (7, 0)]);
+
+    let paths: Vec<&str> = rows.iter().map(|row| row.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "usr/lib/libx.so",
+            "usr/lib/libx.so",
+            "usr/lib/libx.so",
+            "libx",
+            "usr/lib/libx.so",
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_spans_products_images_and_subsystems() {
+    let root = temp_root("search-global");
+    write_search_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // The query hits every image and every subsystem of alpha, plus
+    // beta: a search is never scoped to the tree selection.
+    let rows = backend.search_entries("libx").unwrap();
+    let subsystems: Vec<&str> = rows.iter().map(|row| row.subsystem.as_str()).collect();
+    assert_eq!(
+        subsystems,
+        vec![
+            "alpha.sw.unix",
+            "alpha.sw.extra",
+            "alpha.sw.extra",
+            "alpha.man.man",
+            "beta.sw.unix",
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_explicit_star_is_not_wrapped() {
+    let root = temp_root("search-star");
+    write_search_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // A pattern with its own wildcard reaches the matcher unchanged:
+    // "libx*" requires the path to *start* with libx, so only the
+    // bare "libx" record matches; a wrapped "*libx**" would match
+    // every libx.so path as well.
+    let rows = backend.search_entries("libx*").unwrap();
+    let keys: Vec<(u64, u64)> = rows
+        .iter()
+        .map(|row| (row.product_id, row.entry_id))
+        .collect();
+    assert_eq!(keys, vec![(1, 4)]);
+    assert_eq!(rows[0].path, "libx");
+
+    // "*.so" matches only paths ending in .so: the bare "libx"
+    // record, which a substring search would include, stays out.
+    let rows = backend.search_entries("*.so").unwrap();
+    let ids: Vec<u64> = rows.iter().map(|row| row.entry_id).collect();
+    assert_eq!(ids, vec![1, 2, 3, 0]);
+    assert!(rows.iter().all(|row| row.path.ends_with(".so")));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_explicit_question_mark_is_not_wrapped() {
+    let root = temp_root("search-question");
+    write_search_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // "?ibx" matches exactly one leading character: only the bare
+    // "libx" path qualifies. A wrapped "*?ibx*" would also match
+    // every "usr/lib/libx.so" record.
+    let rows = backend.search_entries("?ibx").unwrap();
+    let keys: Vec<(u64, u64)> = rows
+        .iter()
+        .map(|row| (row.product_id, row.entry_id))
+        .collect();
+    assert_eq!(keys, vec![(1, 4)]);
+    assert_eq!(rows[0].path, "libx");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_keeps_product_and_idb_order() {
+    let root = temp_root("search-order");
+    write_search_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // Product order first: every alpha hit precedes the beta hit.
+    // Within a product the original IDB order is exact, never an
+    // alphabetical or subsystem-grouped rearrangement.
+    let rows = backend.search_entries("libx").unwrap();
+    for pair in rows.windows(2) {
+        assert!(pair[0].product_id <= pair[1].product_id);
+        if pair[0].product_id == pair[1].product_id {
+            assert!(pair[0].entry_id < pair[1].entry_id);
+        }
+    }
+    let ids: Vec<u64> = rows
+        .iter()
+        .filter(|row| row.product_id == 1)
+        .map(|row| row.entry_id)
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3, 4]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_never_deduplicates_duplicate_paths() {
+    let root = temp_root("search-duplicates");
+    write_search_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // Four IDB records share the path usr/lib/libx.so across the two
+    // products: all four stay, each its own row.
+    let rows = backend.search_entries("usr/lib/libx.so").unwrap();
+    assert_eq!(rows.len(), 4);
+    assert!(rows.iter().all(|row| row.path == "usr/lib/libx.so"));
+    let keys: Vec<(u64, u64)> = rows
+        .iter()
+        .map(|row| (row.product_id, row.entry_id))
+        .collect();
+    assert_eq!(keys, vec![(1, 1), (1, 2), (1, 3), (7, 0)]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_keeps_mach_variants_and_unresolved_payloads() {
+    let root = temp_root("search-mach");
+    write_search_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    let rows = backend.search_entries("usr/lib/libx.so").unwrap();
+    // Every hardware-conditional variant survives the search, parsed
+    // and unresolved payloads side by side.
+    assert_eq!(rows[0].mach, vec!["CPUBOARD=IP22".to_string()]);
+    assert!(rows[0].unresolved_mach.is_empty());
+    assert_eq!(rows[1].mach, vec!["CPUBOARD=IP26".to_string()]);
+    assert!(rows[1].unresolved_mach.is_empty());
+    assert!(rows[2].mach.is_empty());
+    assert_eq!(rows[2].unresolved_mach, vec!["=GARBAGE".to_string()]);
+    assert!(rows[3].mach.is_empty());
+    assert!(rows[3].unresolved_mach.is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_rows_share_summary_field_semantics() {
+    let root = temp_root("search-fields");
+    write_search_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // A search row is the same EntrySummary the scope listing
+    // produces: same key, same decoded fields.
+    let searched = backend.search_entries("usr/bin/tool").unwrap();
+    assert_eq!(searched.len(), 1);
+    let scoped = backend.entries(1).unwrap();
+    let listed = &scoped[0];
+
+    let row = &searched[0];
+    assert_eq!(row.product_id, listed.product_id);
+    assert_eq!(row.entry_id, listed.entry_id);
+    assert_eq!(row.entry_id, 0);
+    assert_eq!(row.path, listed.path);
+    assert_eq!(row.subsystem, listed.subsystem);
+    assert_eq!(row.file_type_raw, listed.file_type_raw);
+    assert_eq!(row.size_known, listed.size_known);
+    assert_eq!(row.size, listed.size);
+    assert_eq!(row.stored_size_known, listed.stored_size_known);
+    assert_eq!(row.stored_size, listed.stored_size);
+    assert_eq!(row.mach, listed.mach);
+    assert_eq!(row.unresolved_mach, listed.unresolved_mach);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_result_keys_resolve_through_entry_detail() {
+    let root = temp_root("search-keys");
+    write_search_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // Every search row carries a (product_id, entry_id) key the
+    // inspector API resolves back to the same record.
+    for row in backend.search_entries("libx").unwrap() {
+        let detail = backend.entry_detail(row.product_id, row.entry_id).unwrap();
+        assert_eq!(detail.product_id, row.product_id);
+        assert_eq!(detail.entry_id, row.entry_id);
+        assert_eq!(detail.path, row.path);
+        assert_eq!(detail.subsystem, row.subsystem);
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_zero_results_is_not_an_error() {
+    let root = temp_root("search-zero");
+    write_search_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    let rows = backend.search_entries("definitely-not-a-file").unwrap();
+    assert!(rows.is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_attributes_entries_to_their_owning_product() {
+    let root = temp_root("search-ownership");
+    // alpha's IDB carries a record naming a *foreign* subsystem:
+    // sw-core keeps the record in alpha's entry list and derives
+    // alpha's tree from the foreign name. The owner of entry id 0 is
+    // alpha regardless of the beta.sw.unix text — and entry_detail
+    // resolves keys against the owner's entry list.
+    write_raw_idb(
+        &root,
+        "alpha",
+        "f 0644 root sys usr/bin/foreign src/foreign beta.sw.unix sum(1) size(1) cmpsize(0)\n",
+    );
+    write_raw_idb(
+        &root,
+        "beta",
+        "f 0644 root sys usr/bin/actual-beta src/actual beta.sw.unix sum(2) size(2) cmpsize(0)\n",
+    );
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    let nodes = backend.hierarchy().unwrap();
+    let product_id = |name: &str| {
+        nodes
+            .iter()
+            .find(|node| matches!(node.kind, ffi::ObjectKind::Product) && node.name == name)
+            .unwrap()
+            .id
+    };
+    let alpha_id = product_id("alpha");
+    let beta_id = product_id("beta");
+    assert_ne!(alpha_id, beta_id);
+
+    // The hit must carry the owning product's key: resolving it
+    // through the inspector API reads alpha's first record, never
+    // beta's.
+    let rows = backend.search_entries("foreign").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].product_id, alpha_id);
+    assert_eq!(rows[0].entry_id, 0);
+    // The record's content is untouched: it still names beta.sw.unix.
+    assert_eq!(rows[0].subsystem, "beta.sw.unix");
+
+    let detail = backend
+        .entry_detail(rows[0].product_id, rows[0].entry_id)
+        .unwrap();
+    assert_eq!(detail.path, "usr/bin/foreign");
+    assert_eq!(detail.subsystem, "beta.sw.unix");
+
+    // Beta's own record keeps resolving to beta.
+    let rows = backend.search_entries("actual-beta").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].product_id, beta_id);
+    assert_eq!(rows[0].entry_id, 0);
+    let detail = backend
+        .entry_detail(rows[0].product_id, rows[0].entry_id)
+        .unwrap();
+    assert_eq!(detail.path, "usr/bin/actual-beta");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn failed_open_keeps_previous_search_results() {
+    let root = temp_root("search-keep");
+    write_search_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+    let before = backend.search_entries("libx").unwrap();
+
+    let missing = root.join("missing");
+    assert!(
+        backend
+            .open_distribution(missing.to_str().unwrap())
+            .is_err()
+    );
+
+    // The failed open touched nothing: the same search still answers
+    // from the previously loaded distribution.
+    let after = backend.search_entries("libx").unwrap();
+    let before_keys: Vec<(u64, u64)> = before
+        .iter()
+        .map(|row| (row.product_id, row.entry_id))
+        .collect();
+    let after_keys: Vec<(u64, u64)> = after
+        .iter()
+        .map(|row| (row.product_id, row.entry_id))
+        .collect();
+    assert_eq!(before_keys, after_keys);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn successful_reopen_searches_the_new_distribution() {
+    let root_a = temp_root("search-reopen-a");
+    write_search_dist(&root_a);
+    let root_b = temp_root("search-reopen-b");
+    write_idb(&root_b, "beta2", &[("beta2.sw.unix", "only")]);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root_a.to_str().unwrap()).unwrap();
+    assert_eq!(backend.search_entries("libx").unwrap().len(), 5);
+
+    backend.open_distribution(root_b.to_str().unwrap()).unwrap();
+    assert!(backend.search_entries("libx").unwrap().is_empty());
+    let rows = backend.search_entries("only").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].product_id, 1);
+    assert_eq!(rows[0].entry_id, 0);
+    assert_eq!(rows[0].subsystem, "beta2.sw.unix");
+
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
+}
+
+/// Search smoke test against a real distribution directory, using the
+/// same `SW_EXPLORER_TEST_DIST` opt-in as the other smoke tests.
+///
+/// Every query is cross-checked against the core query the CLI runs
+/// for the same text, so the bridge can never drift from `sw find`.
+#[test]
+fn real_dist_search_smoke() {
+    let Some(raw) = std::env::var_os("SW_EXPLORER_TEST_DIST") else {
+        eprintln!("SW_EXPLORER_TEST_DIST not set; skipping");
+        return;
+    };
+    let path = PathBuf::from(raw);
+    assert!(
+        path.is_dir(),
+        "SW_EXPLORER_TEST_DIST is set but not a directory: {}",
+        path.display()
+    );
+
+    let mut backend = new_backend();
+    backend.open_distribution(path.to_str().unwrap()).unwrap();
+    let distribution = sw_core::distribution::Distribution::open(&path).unwrap();
+
+    for text in ["Xsgi", "libGL"] {
+        let hits = backend.search_entries(text).unwrap();
+        assert!(!hits.is_empty(), "expected {text} hits in a full media set");
+        // Plain text is a substring search: every hit contains the text.
+        assert!(hits.iter().all(|row| row.path.contains(text)));
+
+        // Distribution product order, per-product IDB order: product
+        // ids never decrease, entry ids strictly increase within one.
+        for pair in hits.windows(2) {
+            assert!(pair[0].product_id <= pair[1].product_id);
+            if pair[0].product_id == pair[1].product_id {
+                assert!(pair[0].entry_id < pair[1].entry_id);
+            }
+        }
+
+        // The bridge must return exactly what the core query
+        // returns — the same semantics the CLI exposes; the explicit
+        // wildcard spelling of the same pattern agrees as well.
+        let expected = distribution
+            .find(&sw_core::query::Query::path(format!("*{text}*")))
+            .entries
+            .len();
+        assert_eq!(hits.len(), expected, "substring count mismatch for {text}");
+        let wildcard = backend.search_entries(&format!("*{text}*")).unwrap();
+        assert_eq!(
+            wildcard.len(),
+            expected,
+            "wildcard count mismatch for {text}"
+        );
+    }
+
+    // An explicit path wildcard behaves like `sw find usr/lib/*.so`.
+    let so_hits = backend.search_entries("usr/lib/*.so").unwrap();
+    assert!(!so_hits.is_empty());
+    assert!(
+        so_hits
+            .iter()
+            .all(|row| row.path.starts_with("usr/lib/") && row.path.ends_with(".so"))
+    );
+    let expected_so = distribution
+        .find(&sw_core::query::Query::path("usr/lib/*.so"))
+        .entries
+        .len();
+    assert_eq!(so_hits.len(), expected_so);
+
+    // Every hit resolves through the inspector API.
+    let first = backend.search_entries("Xsgi").unwrap();
+    let row = first.first().unwrap();
+    let detail = backend.entry_detail(row.product_id, row.entry_id).unwrap();
+    assert_eq!(detail.path, row.path);
+    assert_eq!(detail.subsystem, row.subsystem);
+}

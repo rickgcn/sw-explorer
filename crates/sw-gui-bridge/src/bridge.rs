@@ -520,6 +520,27 @@ pub(crate) mod ffi {
         /// is zero or unknown.
         fn entries(self: &Backend, scope_id: u64) -> Result<Vec<EntrySummary>>;
 
+        /// Searches the whole distribution for entries whose path
+        /// matches `query`, across every product, image and
+        /// subsystem. Rows come back in distribution product order,
+        /// each product in exact IDB order; duplicate paths
+        /// (hardware-conditional variants) are never deduplicated.
+        ///
+        /// Query policy, identical to the CLI: plain text is a
+        /// substring search (`foo` matches as `*foo*`); a query
+        /// containing `*` or `?` is handed to the core wildcard
+        /// matcher unchanged.
+        ///
+        /// Every row carries the object id of the product that owns
+        /// the entry — the product whose entry list holds the record,
+        /// which may name a foreign subsystem — so `entry_detail`
+        /// can resolve it directly.
+        ///
+        /// Fails when no distribution is loaded or when `query` is
+        /// empty; an empty query is never a "match everything"
+        /// search.
+        fn search_entries(self: &Backend, query: &str) -> Result<Vec<EntrySummary>>;
+
         /// Returns the detail snapshot of one entry.
         ///
         /// `product_id` must identify a product and `entry_id` must
