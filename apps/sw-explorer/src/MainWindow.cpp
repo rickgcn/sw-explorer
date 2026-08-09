@@ -2,6 +2,7 @@
 
 #include "BackendWorker.h"
 #include "EntryBrowserWidget.h"
+#include "HardwareProfileDialog.h"
 #include "InspectorWidget.h"
 #include "models/DistributionTreeModel.h"
 
@@ -20,6 +21,7 @@
 #include <QThread>
 #include <QTimer>
 #include <QToolBar>
+#include <QToolButton>
 #include <QTreeView>
 
 MainWindow::MainWindow()
@@ -37,6 +39,18 @@ MainWindow::MainWindow()
     toolbar->setObjectName(QStringLiteral("mainToolBar"));
     toolbar->setMovable(false);
     toolbar->addAction(m_openAction);
+
+    // The hardware profile editor is always available, even with no
+    // distribution loaded: the profile can be configured first and is
+    // evaluated once a distribution is committed.
+    m_hardwareButton = new QToolButton(toolbar);
+    m_hardwareButton->setObjectName(QStringLiteral("hardwareButton"));
+    connect(m_hardwareButton,
+            &QToolButton::clicked,
+            this,
+            &MainWindow::openHardwareProfileDialog);
+    toolbar->addWidget(m_hardwareButton);
+    updateHardwareButton();
 
     auto *spacer = new QWidget(toolbar);
     spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
@@ -118,6 +132,9 @@ MainWindow::MainWindow()
             &MainWindow::openDistributionRequested,
             m_worker,
             &BackendWorker::openDistribution);
+    // The hardware lockdown rides along with every open request,
+    // including ones not coming from the file dialog.
+    connect(this, &MainWindow::openDistributionRequested, this, &MainWindow::onOpenStarted);
     connect(this,
             &MainWindow::candidateAccepted,
             m_worker,
@@ -142,6 +159,14 @@ MainWindow::MainWindow()
             &MainWindow::entryDetailRequested,
             m_worker,
             &BackendWorker::entryDetailRequested);
+    connect(this,
+            &MainWindow::hardwareCandidatesRequested,
+            m_worker,
+            &BackendWorker::hardwareCandidatesRequested);
+    connect(this,
+            &MainWindow::selectionRequested,
+            m_worker,
+            &BackendWorker::selectionRequested);
     connect(m_worker, &BackendWorker::candidateReady, this, &MainWindow::onCandidateReady);
     connect(m_worker,
             &BackendWorker::distributionOpenFailed,
@@ -170,6 +195,16 @@ MainWindow::MainWindow()
             &BackendWorker::entryDetailReady,
             this,
             &MainWindow::onEntryDetailReady);
+    connect(m_worker,
+            &BackendWorker::hardwareCandidatesReady,
+            this,
+            &MainWindow::onHardwareCandidatesReady);
+    connect(m_worker,
+            &BackendWorker::hardwareCandidatesFailed,
+            this,
+            &MainWindow::onHardwareCandidatesFailed);
+    connect(m_worker, &BackendWorker::selectionReady, this, &MainWindow::onSelectionReady);
+    connect(m_worker, &BackendWorker::selectionFailed, this, &MainWindow::onSelectionFailed);
     m_workerThread->start();
 }
 
@@ -191,6 +226,57 @@ void MainWindow::chooseDistribution()
     emit openDistributionRequested(path);
 }
 
+void MainWindow::onOpenStarted()
+{
+    // No profile change may straddle the candidate/commit window;
+    // the button unlocks when the open resolves (commit, rejection
+    // or failure).
+    m_hardwareButton->setEnabled(false);
+}
+
+void MainWindow::openHardwareProfileDialog()
+{
+    HardwareProfileDialog dialog(this);
+    dialog.setCandidates(m_candidates);
+    dialog.setProfile(m_profile);
+    connect(&dialog,
+            &HardwareProfileDialog::profileApplied,
+            this,
+            &MainWindow::applyHardwareProfile);
+    dialog.exec();
+}
+
+void MainWindow::applyHardwareProfile(const HardwareProfileSnapshot &profile)
+{
+    m_profile = profile;
+    updateHardwareButton();
+
+    // A new profile invalidates the selection in flight and the
+    // overlay on screen; the Files rows, search results and the
+    // inspector are not reloaded for a profile change.
+    ++m_activeSelectionRequestId;
+    m_entries->clearSelectionOverlay();
+    m_selectedRecordCount = 0;
+    m_conflictGroupCount = 0;
+    m_selectionError.clear();
+
+    if (m_profile.isEmpty()) {
+        m_selectionState = SelectionState::Inactive;
+        restoreLoadedStatus();
+        return;
+    }
+    if (m_hasDistribution) {
+        m_selectionState = SelectionState::Pending;
+        restoreLoadedStatus();
+        emit selectionRequested(m_activeSelectionRequestId, m_profile);
+        return;
+    }
+    // No distribution yet: the profile is stored and evaluated as
+    // soon as one is committed.
+    m_selectionState = SelectionState::Inactive;
+    restoreLoadedStatus();
+}
+
 void MainWindow::onCandidateReady(quint64 productCount,
                                   quint64 diagnosticCount,
                                   const HierarchySnapshot &hierarchy)
@@ -203,8 +289,8 @@ void MainWindow::onCandidateReady(quint64 productCount,
         // candidate: the worker drops it and keeps the previously
         // committed backend, which still matches the tree on screen.
         emit candidateRejected();
-        statusBar()->showMessage(m_hasDistribution ? m_loadedStatusText
-                                                   : tr("No distribution loaded."));
+        m_hardwareButton->setEnabled(true);
+        restoreLoadedStatus();
         QMessageBox::critical(this,
                               tr("Failed to Open Distribution"),
                               tr("The backend returned an invalid hierarchy: %1").arg(error));
@@ -224,7 +310,21 @@ void MainWindow::onCandidateReady(quint64 productCount,
     // Only now — with the candidate validated and accepted — is the
     // old distribution's search state cleared; a failed or rejected
     // open never touches it.
+    //
+    // The hardware profile survives, but everything derived from the
+    // old distribution dies with it: the selection overlay, the
+    // selection request in flight and the candidate suggestions. The
+    // hardware button stays locked until the commit lands.
     exitSearch();
+    ++m_activeSelectionRequestId;
+    ++m_activeHardwareCandidatesRequestId;
+    m_entries->clearSelectionOverlay();
+    m_candidates.clear();
+    m_selectionError.clear();
+    m_selectedRecordCount = 0;
+    m_conflictGroupCount = 0;
+    m_selectionState =
+        m_profile.isEmpty() ? SelectionState::Inactive : SelectionState::Pending;
     m_treeView->setEnabled(false);
     m_searchEdit->setEnabled(false);
     emit candidateAccepted();
@@ -242,10 +342,11 @@ void MainWindow::onCandidateReady(quint64 productCount,
 void MainWindow::onDistributionOpenFailed(const QString &message)
 {
     setOpenInProgress(false);
+    m_hardwareButton->setEnabled(true);
     // The backend kept the previously loaded distribution; the GUI
-    // must keep showing it too.
-    statusBar()->showMessage(m_hasDistribution ? m_loadedStatusText
-                                               : tr("No distribution loaded."));
+    // must keep showing it too — tree, entries, inspector, hardware
+    // profile, selection overlay and suggestions included.
+    restoreLoadedStatus();
     QMessageBox::critical(this, tr("Failed to Open Distribution"), message);
 }
 
@@ -254,6 +355,21 @@ void MainWindow::onCandidateCommitted()
     // The backend now serves the object ids the tree carries.
     m_treeView->setEnabled(true);
     m_searchEdit->setEnabled(true);
+    m_hardwareButton->setEnabled(true);
+
+    // Fresh hardware candidate suggestions for the newly committed
+    // distribution.
+    ++m_activeHardwareCandidatesRequestId;
+    emit hardwareCandidatesRequested(m_activeHardwareCandidatesRequestId);
+
+    // A stored profile is evaluated against the new distribution;
+    // until the result arrives, no stale overlay is shown.
+    if (!m_profile.isEmpty()) {
+        m_selectionState = SelectionState::Pending;
+        ++m_activeSelectionRequestId;
+        emit selectionRequested(m_activeSelectionRequestId, m_profile);
+    }
+    restoreLoadedStatus();
 }
 
 void MainWindow::onTreeSelectionChanged(const QModelIndex &current, const QModelIndex &previous)
@@ -472,8 +588,103 @@ void MainWindow::onEntriesFailed(quint64 requestId, const QString &message)
 
 void MainWindow::restoreLoadedStatus()
 {
-    // A successful detail render also clears any earlier detail error
-    // from the status bar, back to the normal distribution state.
-    statusBar()->showMessage(m_hasDistribution ? m_loadedStatusText
-                                               : tr("No distribution loaded."));
+    // A successful render clears any earlier detail or entries error
+    // from the status bar, back to the distribution state — including
+    // the current hardware selection state, which survives ordinary
+    // renders until the next profile change or distribution commit.
+    QString text =
+        m_hasDistribution ? m_loadedStatusText : tr("No distribution loaded.");
+    switch (m_selectionState) {
+    case SelectionState::Inactive:
+        break;
+    case SelectionState::Pending:
+        text += tr(" · Evaluating hardware profile...");
+        break;
+    case SelectionState::Ready:
+        text += tr(" · %1 selected records · %2 conflict groups")
+                    .arg(m_selectedRecordCount)
+                    .arg(m_conflictGroupCount);
+        break;
+    case SelectionState::Error:
+        text += tr(" · Hardware selection unavailable: %1").arg(m_selectionError);
+        break;
+    }
+    statusBar()->showMessage(text);
+}
+
+void MainWindow::onSelectionReady(quint64 requestId, const SelectionSnapshot &selection)
+{
+    if (requestId != m_activeSelectionRequestId) {
+        // A profile the user has already replaced: drop it silently.
+        return;
+    }
+    m_selectionState = SelectionState::Ready;
+    m_selectedRecordCount = static_cast<quint64>(selection.selected.size());
+    m_conflictGroupCount = static_cast<quint64>(selection.conflicts.size());
+    m_entries->setSelectionOverlay(selection);
+    restoreLoadedStatus();
+}
+
+void MainWindow::onSelectionFailed(quint64 requestId, const QString &message)
+{
+    if (requestId != m_activeSelectionRequestId) {
+        return;
+    }
+    // The profile stays applied and the overlay stays cleared; the
+    // error is reflected in the status bar until the state changes.
+    m_selectionState = SelectionState::Error;
+    m_selectionError = message;
+    restoreLoadedStatus();
+}
+
+void MainWindow::onHardwareCandidatesReady(quint64 requestId,
+                                           const HardwareCandidatesSnapshot &candidates)
+{
+    if (requestId != m_activeHardwareCandidatesRequestId) {
+        return;
+    }
+    m_candidates = candidates;
+}
+
+void MainWindow::onHardwareCandidatesFailed(quint64 requestId, const QString &message)
+{
+    Q_UNUSED(message);
+    if (requestId != m_activeHardwareCandidatesRequestId) {
+        return;
+    }
+    // Suggestions are a convenience, never a gate: the profile
+    // editor keeps working with whatever candidates remain (and
+    // always allows hand-typed values).
+}
+
+void MainWindow::updateHardwareButton()
+{
+    if (m_profile.isEmpty()) {
+        m_hardwareButton->setText(tr("Hardware: Off"));
+        m_hardwareButton->setToolTip(
+            tr("No hardware profile applied. Every IDB record is shown without a "
+               "selection status."));
+        return;
+    }
+
+    // The summary shows values only (the empty value as a visible
+    // "(empty)" placeholder); the tooltip carries the full
+    // attribute=value list verbatim, one pair per line.
+    QStringList values;
+    QStringList lines;
+    values.reserve(m_profile.size());
+    lines.reserve(m_profile.size());
+    for (const HardwareValueSnapshot &pair : m_profile) {
+        values.append(pair.value.isEmpty() ? tr("(empty)") : pair.value);
+        lines.append(QStringLiteral("%1=%2").arg(pair.attribute, pair.value));
+    }
+    QString summary;
+    if (values.size() <= 4) {
+        summary = values.join(QStringLiteral(" / "));
+    } else {
+        summary = values.mid(0, 3).join(QStringLiteral(" / "))
+            + QStringLiteral(" / +%1").arg(values.size() - 3);
+    }
+    m_hardwareButton->setText(tr("Hardware: %1").arg(summary));
+    m_hardwareButton->setToolTip(lines.join(QLatin1Char('\n')));
 }

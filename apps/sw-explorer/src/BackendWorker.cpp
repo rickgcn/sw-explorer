@@ -225,6 +225,36 @@ EntryListSnapshot toQt(const rust::Vec<sw::EntrySummary> &entries)
     return out;
 }
 
+HardwareCandidatesSnapshot toQt(const rust::Vec<sw::HardwareCandidateSet> &sets)
+{
+    HardwareCandidatesSnapshot out;
+    out.reserve(static_cast<qsizetype>(sets.size()));
+    for (const sw::HardwareCandidateSet &set : sets) {
+        out.append({toQString(set.attribute), toQStringList(set.values)});
+    }
+    return out;
+}
+
+SelectionSnapshot toQt(const sw::SelectionSnapshot &selection)
+{
+    SelectionSnapshot out;
+    out.selected.reserve(static_cast<qsizetype>(selection.selected.size()));
+    for (const sw::SelectionEntryKey &key : selection.selected) {
+        out.selected.append({key.product_id, key.entry_id});
+    }
+    out.conflicts.reserve(static_cast<qsizetype>(selection.conflicts.size()));
+    for (const sw::SelectionConflictDetail &conflict : selection.conflicts) {
+        SelectionConflictSnapshot item;
+        item.path = toQString(conflict.path);
+        item.candidates.reserve(static_cast<qsizetype>(conflict.candidates.size()));
+        for (const sw::SelectionEntryKey &key : conflict.candidates) {
+            item.candidates.append({key.product_id, key.entry_id});
+        }
+        out.conflicts.append(item);
+    }
+    return out;
+}
+
 EntryDetailSnapshot toQt(const sw::EntryDetail &detail)
 {
     EntryDetailSnapshot out;
@@ -392,5 +422,40 @@ void BackendWorker::entryDetailRequested(quint64 requestId, quint64 productId, q
         emit entryDetailReady(requestId, toQt(m_backend->entry_detail(productId, entryId)));
     } catch (const rust::Error &error) {
         emit detailFailed(requestId, QString::fromUtf8(error.what()));
+    }
+}
+
+void BackendWorker::hardwareCandidatesRequested(quint64 requestId)
+{
+    // Candidate suggestions describe the committed distribution; a
+    // pending candidate is not queryable.
+    try {
+        emit hardwareCandidatesReady(requestId, toQt(m_backend->hardware_candidates()));
+    } catch (const rust::Error &error) {
+        emit hardwareCandidatesFailed(requestId, QString::fromUtf8(error.what()));
+    }
+}
+
+void BackendWorker::selectionRequested(quint64 requestId, const HardwareProfileSnapshot &profile)
+{
+    // Selection is a whole-distribution query against the committed
+    // backend, like every other query; a pending candidate is not
+    // queryable.
+    //
+    // QString -> rust::String goes through an explicit UTF-8 byte
+    // array; the current locale is never involved.
+    rust::Vec<sw::HardwareValue> values;
+    values.reserve(static_cast<std::size_t>(profile.size()));
+    for (const HardwareValueSnapshot &pair : profile) {
+        const QByteArray attribute = pair.attribute.toUtf8();
+        const QByteArray value = pair.value.toUtf8();
+        values.push_back(sw::HardwareValue{
+            rust::String(attribute.constData(), static_cast<std::size_t>(attribute.size())),
+            rust::String(value.constData(), static_cast<std::size_t>(value.size()))});
+    }
+    try {
+        emit selectionReady(requestId, toQt(m_backend->select_entries(std::move(values))));
+    } catch (const rust::Error &error) {
+        emit selectionFailed(requestId, QString::fromUtf8(error.what()));
     }
 }

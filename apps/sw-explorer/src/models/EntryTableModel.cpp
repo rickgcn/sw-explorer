@@ -2,7 +2,6 @@
 
 #include "ByteFormat.h"
 
-#include <QSet>
 #include <QStringList>
 
 EntryTableModel::EntryTableModel(QObject *parent)
@@ -22,14 +21,10 @@ bool EntryTableModel::setEntries(const EntryListSnapshot &snapshot, QString *err
     // Validate the whole snapshot before anything is replaced: entry
     // keys must be unique. Duplicate paths are perfectly legal (IDB
     // records, not a unique filesystem) and are never rejected.
-    //
-    // The key is the full (productId, entryId) pair, never a
-    // hand-packed u64: both ids are 64-bit, and folding them into
-    // one value would make distinct keys collidable in principle.
-    QSet<QPair<quint64, quint64>> seenKeys;
+    QSet<EntryKey> seenKeys;
     seenKeys.reserve(snapshot.size());
     for (const EntrySummarySnapshot &entry : snapshot) {
-        const QPair<quint64, quint64> key{entry.productId, entry.entryId};
+        const EntryKey key{entry.productId, entry.entryId};
         if (seenKeys.contains(key)) {
             return fail(tr("duplicate entry key (product %1, entry %2)")
                             .arg(entry.productId)
@@ -42,6 +37,98 @@ bool EntryTableModel::setEntries(const EntryListSnapshot &snapshot, QString *err
     m_entries = snapshot;
     endResetModel();
     return true;
+}
+
+void EntryTableModel::setSelectionOverlay(const SelectionSnapshot &selection)
+{
+    // Membership sets only: the rows themselves are never touched,
+    // so the overlay cannot reorder, filter or duplicate anything.
+    QSet<EntryKey> selected;
+    selected.reserve(selection.selected.size());
+    for (const EntryKey &key : selection.selected) {
+        selected.insert(key);
+    }
+    QHash<EntryKey, QStringList> conflictPaths;
+    for (const SelectionConflictSnapshot &conflict : selection.conflicts) {
+        for (const EntryKey &key : conflict.candidates) {
+            conflictPaths[key].append(conflict.path);
+        }
+    }
+
+    m_selected = std::move(selected);
+    m_conflictPaths = std::move(conflictPaths);
+    m_overlayActive = true;
+    emitStatusChanged();
+}
+
+void EntryTableModel::clearSelectionOverlay()
+{
+    m_selected.clear();
+    m_conflictPaths.clear();
+    m_overlayActive = false;
+    emitStatusChanged();
+}
+
+bool EntryTableModel::hasSelectionOverlay() const
+{
+    return m_overlayActive;
+}
+
+EntrySelectionStatus EntryTableModel::statusForKey(const EntryKey &key) const
+{
+    if (!m_overlayActive) {
+        return EntrySelectionStatus::NotSelected;
+    }
+    const bool selected = m_selected.contains(key);
+    const bool conflicted = m_conflictPaths.contains(key);
+    if (selected && conflicted) {
+        return EntrySelectionStatus::SelectedConflict;
+    }
+    if (selected) {
+        return EntrySelectionStatus::Selected;
+    }
+    if (conflicted) {
+        return EntrySelectionStatus::Unresolved;
+    }
+    return EntrySelectionStatus::NotSelected;
+}
+
+int EntryTableModel::selectedRowCount() const
+{
+    if (!m_overlayActive) {
+        return 0;
+    }
+    int count = 0;
+    for (const EntrySummarySnapshot &entry : m_entries) {
+        if (m_selected.contains({entry.productId, entry.entryId})) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+int EntryTableModel::conflictedRowCount() const
+{
+    if (!m_overlayActive) {
+        return 0;
+    }
+    int count = 0;
+    for (const EntrySummarySnapshot &entry : m_entries) {
+        if (m_conflictPaths.contains({entry.productId, entry.entryId})) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+void EntryTableModel::emitStatusChanged()
+{
+    if (m_entries.isEmpty()) {
+        return;
+    }
+    emit dataChanged(index(0, StatusColumn),
+                     index(static_cast<int>(m_entries.size()) - 1, StatusColumn),
+                     {Qt::DisplayRole, Qt::ToolTipRole, SelectionStatusRole});
 }
 
 EntryKey EntryTableModel::entryKey(const QModelIndex &index) const
@@ -73,6 +160,11 @@ QVariant EntryTableModel::data(const QModelIndex &index, int role) const
     switch (role) {
     case Qt::DisplayRole:
         switch (index.column()) {
+        case StatusColumn:
+            if (m_overlayActive) {
+                return statusText(statusForKey({entry.productId, entry.entryId}));
+            }
+            return {};
         case PathColumn:
             return entry.path;
         case TypeColumn:
@@ -98,6 +190,11 @@ QVariant EntryTableModel::data(const QModelIndex &index, int role) const
         }
     case Qt::ToolTipRole:
         switch (index.column()) {
+        case StatusColumn:
+            if (m_overlayActive) {
+                return statusToolTip(entry);
+            }
+            return {};
         case SizeColumn:
             return entry.sizeKnown ? tr("%1 bytes").arg(entry.size) : QVariant();
         case StoredColumn:
@@ -121,6 +218,9 @@ QVariant EntryTableModel::data(const QModelIndex &index, int role) const
         return entry.sizeKnown ? QVariant::fromValue(entry.size) : QVariant();
     case StoredBytesRole:
         return entry.storedSizeKnown ? QVariant::fromValue(entry.storedSize) : QVariant();
+    case SelectionStatusRole:
+        return QVariant::fromValue(
+            static_cast<int>(statusForKey({entry.productId, entry.entryId})));
     default:
         return {};
     }
@@ -132,6 +232,8 @@ QVariant EntryTableModel::headerData(int section, Qt::Orientation orientation, i
         return {};
     }
     switch (section) {
+    case StatusColumn:
+        return tr("Status");
     case PathColumn:
         return tr("Path");
     case TypeColumn:
@@ -147,6 +249,45 @@ QVariant EntryTableModel::headerData(int section, Qt::Orientation orientation, i
     default:
         return {};
     }
+}
+
+QString EntryTableModel::statusText(EntrySelectionStatus status) const
+{
+    switch (status) {
+    case EntrySelectionStatus::Selected:
+        return tr("Selected");
+    case EntrySelectionStatus::SelectedConflict:
+        return tr("Selected / conflict");
+    case EntrySelectionStatus::Unresolved:
+        return tr("Unresolved");
+    case EntrySelectionStatus::NotSelected:
+        return tr("Not selected");
+    }
+    Q_UNREACHABLE();
+}
+
+QString EntryTableModel::statusToolTip(const EntrySummarySnapshot &entry) const
+{
+    const EntryKey key{entry.productId, entry.entryId};
+    switch (statusForKey(key)) {
+    case EntrySelectionStatus::Selected:
+        return tr("This IDB record is selected for the current hardware profile.");
+    case EntrySelectionStatus::SelectedConflict: {
+        const QStringList paths = m_conflictPaths.value(key);
+        return tr("This IDB record is selected for the current hardware profile, but "
+                  "participates in a selection conflict for %1.")
+            .arg(paths.join(QStringLiteral(", ")));
+    }
+    case EntrySelectionStatus::Unresolved: {
+        const QStringList paths = m_conflictPaths.value(key);
+        return tr("The hardware applicability of this record cannot be determined: it "
+                  "participates in a selection conflict for %1 and is not selected.")
+            .arg(paths.join(QStringLiteral(", ")));
+    }
+    case EntrySelectionStatus::NotSelected:
+        return tr("This IDB record does not apply to the current hardware profile.");
+    }
+    Q_UNREACHABLE();
 }
 
 QString EntryTableModel::typeText(const EntrySummarySnapshot &entry) const

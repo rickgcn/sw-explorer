@@ -228,11 +228,16 @@ qt_add_executable(sw-explorer
     src/HierarchySnapshot.h
     src/InspectorSnapshot.h
     src/EntrySnapshot.h
+    src/HardwareSnapshot.h
     src/ByteFormat.h
     src/InspectorWidget.h
     src/InspectorWidget.cpp
     src/EntryBrowserWidget.h
     src/EntryBrowserWidget.cpp
+    src/HardwareProfileDelegate.h
+    src/HardwareProfileDelegate.cpp
+    src/HardwareProfileDialog.h
+    src/HardwareProfileDialog.cpp
     src/MainWindow.h
     src/MainWindow.cpp
     src/BackendWorker.h
@@ -241,6 +246,8 @@ qt_add_executable(sw-explorer
     src/models/DistributionTreeModel.cpp
     src/models/EntryTableModel.h
     src/models/EntryTableModel.cpp
+    src/models/HardwareProfileModel.h
+    src/models/HardwareProfileModel.cpp
     "${SW_GENERATED_SOURCE}"
 )
 

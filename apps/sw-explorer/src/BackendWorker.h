@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "EntrySnapshot.h"
+#include "HardwareSnapshot.h"
 #include "HierarchySnapshot.h"
 #include "InspectorSnapshot.h"
 #include "sw_gui_bridge.h"
@@ -21,13 +22,13 @@
 // every query, so a rejected snapshot can never desynchronize the GUI
 // tree from the Rust-side object ids.
 //
-// Queries — details, scope entries and global path searches — are
-// answered only by the committed backend; the candidate is never
-// queried. Every request carries a requestId that the response
-// echoes back unchanged, so the GUI can drop responses that arrive
-// after the selection moved on. Search results reuse the entries
-// signals: a search hit list is the same EntryListSnapshot shape the
-// scope listing produces.
+// Queries — details, scope entries, global path searches, hardware
+// candidates and hardware selections — are answered only by the
+// committed backend; the candidate is never queried. Every request
+// carries a requestId that the response echoes back unchanged, so
+// the GUI can drop responses that arrive after the selection moved
+// on. Search results reuse the entries signals: a search hit list is
+// the same EntryListSnapshot shape the scope listing produces.
 class BackendWorker : public QObject
 {
     Q_OBJECT
@@ -43,6 +44,8 @@ public slots:
     void entriesRequested(quint64 requestId, quint64 scopeId);
     void searchEntriesRequested(quint64 requestId, const QString &query);
     void entryDetailRequested(quint64 requestId, quint64 productId, quint64 entryId);
+    void hardwareCandidatesRequested(quint64 requestId);
+    void selectionRequested(quint64 requestId, const HardwareProfileSnapshot &profile);
 
 signals:
     void candidateReady(quint64 productCount,
@@ -64,6 +67,12 @@ signals:
     // Entry detail failures reuse detailFailed: the requestId keeps
     // the two inspector request families apart on the GUI side.
     void entryDetailReady(quint64 requestId, const EntryDetailSnapshot &detail);
+
+    void hardwareCandidatesReady(quint64 requestId,
+                                 const HardwareCandidatesSnapshot &candidates);
+    void hardwareCandidatesFailed(quint64 requestId, const QString &message);
+    void selectionReady(quint64 requestId, const SelectionSnapshot &selection);
+    void selectionFailed(quint64 requestId, const QString &message);
 
 private:
     // The committed backend: what every future query talks to.

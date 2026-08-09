@@ -28,6 +28,29 @@ enum class EntryFileType {
     Other,
 };
 
+// Backend identity of one entry row: the product's hierarchy object
+// id plus the sw-core entry id inside that product. EntryId 0 is a
+// perfectly valid first entry; it is never an error marker.
+struct EntryKey {
+    quint64 productId = 0;
+    quint64 entryId = 0;
+};
+
+inline bool operator==(const EntryKey &lhs, const EntryKey &rhs)
+{
+    return lhs.productId == rhs.productId && lhs.entryId == rhs.entryId;
+}
+
+inline bool operator!=(const EntryKey &lhs, const EntryKey &rhs)
+{
+    return !(lhs == rhs);
+}
+
+inline size_t qHash(const EntryKey &key, size_t seed = 0) noexcept
+{
+    return qHashMulti(seed, key.productId, key.entryId);
+}
+
 // One row of the entry browser: one IDB record.
 struct EntrySummarySnapshot {
     // Object id of the containing product.
@@ -124,6 +147,7 @@ struct EntryDetailSnapshot {
 };
 
 Q_DECLARE_METATYPE(EntryFileType)
+Q_DECLARE_METATYPE(EntryKey)
 Q_DECLARE_METATYPE(EntrySummarySnapshot)
 Q_DECLARE_METATYPE(EntryListSnapshot)
 Q_DECLARE_METATYPE(EntryDetailSnapshot)

@@ -87,12 +87,16 @@ EntryBrowserWidget::EntryBrowserWidget(QWidget *parent)
     m_tableView->setAlternatingRowColors(true);
     m_tableView->setTextElideMode(Qt::ElideMiddle);
     m_tableView->verticalHeader()->setVisible(false);
+    // The Status column stays hidden until a hardware selection is
+    // applied; it only ever overlays the rows, never changes them.
+    m_tableView->setColumnHidden(EntryTableModel::StatusColumn, true);
     m_tableView->horizontalHeader()->setSectionResizeMode(EntryTableModel::PathColumn,
                                                           QHeaderView::Stretch);
-    for (int column = EntryTableModel::TypeColumn; column < EntryTableModel::ColumnCount;
-         ++column) {
-        m_tableView->horizontalHeader()->setSectionResizeMode(column,
-                                                              QHeaderView::ResizeToContents);
+    for (int column = 0; column < EntryTableModel::ColumnCount; ++column) {
+        if (column != EntryTableModel::PathColumn) {
+            m_tableView->horizontalHeader()->setSectionResizeMode(column,
+                                                                  QHeaderView::ResizeToContents);
+        }
     }
     tableLayout->addWidget(m_tableView, 1);
 
@@ -135,7 +139,7 @@ void EntryBrowserWidget::showEntries(const EntryListSnapshot &entries)
         showError(tr("The backend returned an invalid entry list: %1").arg(error));
         return;
     }
-    m_countLabel->setText(tr("%n entries", nullptr, static_cast<int>(entries.size())));
+    updateFooter();
     m_stack->setCurrentWidget(m_tablePage);
 }
 
@@ -143,6 +147,33 @@ void EntryBrowserWidget::showError(const QString &message)
 {
     m_errorMessage->setText(message);
     m_stack->setCurrentWidget(m_errorPage);
+}
+
+void EntryBrowserWidget::setSelectionOverlay(const SelectionSnapshot &selection)
+{
+    m_model->setSelectionOverlay(selection);
+    m_tableView->setColumnHidden(EntryTableModel::StatusColumn, false);
+    updateFooter();
+}
+
+void EntryBrowserWidget::clearSelectionOverlay()
+{
+    m_model->clearSelectionOverlay();
+    m_tableView->setColumnHidden(EntryTableModel::StatusColumn, true);
+    updateFooter();
+}
+
+void EntryBrowserWidget::updateFooter()
+{
+    // The model's selection overlay survives row reloads, so the
+    // footer simply reflects the current rows and the overlay state.
+    QString text = tr("%n entries", nullptr, m_model->rowCount());
+    if (m_model->hasSelectionOverlay()) {
+        text += tr(" · %1 selected · %2 conflicted records")
+                    .arg(m_model->selectedRowCount())
+                    .arg(m_model->conflictedRowCount());
+    }
+    m_countLabel->setText(text);
 }
 
 void EntryBrowserWidget::onCurrentRowChanged(const QModelIndex &current,

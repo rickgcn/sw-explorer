@@ -1,6 +1,7 @@
 #pragma once
 
 #include "EntrySnapshot.h"
+#include "HardwareSnapshot.h"
 
 #include <QWidget>
 
@@ -19,6 +20,11 @@ class EntryTableModel;
 //
 // The widget is a QStackedWidget with Empty / Loading / Table /
 // Error pages. Plain Qt Widgets in the native style.
+//
+// The hardware selection is an overlay over the table: while a
+// selection is applied the Status column is visible and the footer
+// counts selected and conflicted records. Applying or clearing the
+// overlay never reloads, reorders or filters the rows.
 class EntryBrowserWidget : public QWidget
 {
     Q_OBJECT
@@ -36,6 +42,14 @@ public:
     void showEntries(const EntryListSnapshot &entries);
     void showError(const QString &message);
 
+    // Overlays a hardware selection: the Status column becomes
+    // visible and the footer counts the selected and conflicted
+    // records among the current rows. The rows themselves are
+    // untouched.
+    void setSelectionOverlay(const SelectionSnapshot &selection);
+    // Clears the selection overlay and hides the Status column.
+    void clearSelectionOverlay();
+
 signals:
     // Emitted only for explicit row picks. A model reset that drops
     // the selection emits nothing, so reloading the files never
@@ -44,6 +58,8 @@ signals:
 
 private:
     void onCurrentRowChanged(const QModelIndex &current, const QModelIndex &previous);
+    // Rebuilds the footer from the current rows and overlay state.
+    void updateFooter();
 
     QStackedWidget *m_stack = nullptr;
     QWidget *m_emptyPage = nullptr;

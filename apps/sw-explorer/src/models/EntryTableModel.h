@@ -1,15 +1,29 @@
 #pragma once
 
 #include "EntrySnapshot.h"
+#include "HardwareSnapshot.h"
 
 #include <QAbstractTableModel>
+#include <QHash>
+#include <QSet>
 
-// Backend identity of one entry row: the product's hierarchy object
-// id plus the sw-core entry id inside that product. EntryId 0 is a
-// perfectly valid first entry; it is never an error marker.
-struct EntryKey {
-    quint64 productId = 0;
-    quint64 entryId = 0;
+// The four hardware-selection states of one entry row, defined
+// purely by set membership in the current SelectionSnapshot:
+//
+//   selected     conflict   status
+//   yes          no         Selected
+//   yes          yes        SelectedConflict
+//   no           yes        Unresolved
+//   no           no         NotSelected
+//
+// A conflict candidate is not automatically "not selected": the core
+// keeps conflict candidates in the selected set, so a three-state
+// model would lose semantics.
+enum class EntrySelectionStatus {
+    Selected,
+    SelectedConflict,
+    Unresolved,
+    NotSelected,
 };
 
 // Presents the entries of one hierarchy scope (product, image or
@@ -21,25 +35,34 @@ struct EntryKey {
 // Rows are IDB records: duplicate paths are legal and never
 // rejected. Sorting stays off everywhere — the view order is the
 // IDB order.
+//
+// The hardware selection is a pure overlay: setSelectionOverlay()
+// only changes what the Status column reports for the existing rows,
+// never the rows themselves. The overlay survives setEntries(), so a
+// reloaded scope or a fresh search result picks the current
+// selection up automatically.
 class EntryTableModel : public QAbstractTableModel
 {
     Q_OBJECT
 
 public:
     enum Column {
-        PathColumn = 0,
-        TypeColumn = 1,
-        SizeColumn = 2,
-        StoredColumn = 3,
-        MachColumn = 4,
-        SubsystemColumn = 5,
-        ColumnCount = 6,
+        StatusColumn = 0,
+        PathColumn = 1,
+        TypeColumn = 2,
+        SizeColumn = 3,
+        StoredColumn = 4,
+        MachColumn = 5,
+        SubsystemColumn = 6,
+        ColumnCount = 7,
     };
 
     // Custom roles carrying the raw values behind the display text.
     enum Role {
         SizeBytesRole = Qt::UserRole,
         StoredBytesRole,
+        // The EntrySelectionStatus of the row, as int.
+        SelectionStatusRole,
     };
 
     explicit EntryTableModel(QObject *parent = nullptr);
@@ -51,7 +74,28 @@ public:
     // current rows are kept untouched, false is returned and, when
     // errorMessage is not null, a description of the problem is
     // stored there.
+    //
+    // The selection overlay is kept and applies to the new rows.
     bool setEntries(const EntryListSnapshot &snapshot, QString *errorMessage = nullptr);
+
+    // Overlays a hardware selection on the current rows. Only the
+    // Status column changes: no rows are added, removed, reordered or
+    // reset.
+    void setSelectionOverlay(const SelectionSnapshot &selection);
+    // Removes the selection overlay; the Status column reports
+    // nothing until the next setSelectionOverlay().
+    void clearSelectionOverlay();
+    // Whether a selection overlay is currently applied.
+    bool hasSelectionOverlay() const;
+
+    // The selection status of one entry key under the current
+    // overlay; NotSelected when no overlay is applied.
+    EntrySelectionStatus statusForKey(const EntryKey &key) const;
+    // Number of current rows whose key is in the selected set.
+    int selectedRowCount() const;
+    // Number of current rows whose key is a candidate of any
+    // conflict.
+    int conflictedRowCount() const;
 
     // Backend identity behind an index, taken from the row's own
     // data — never derived from the row number.
@@ -65,8 +109,17 @@ public:
                         int role = Qt::DisplayRole) const override;
 
 private:
+    QString statusText(EntrySelectionStatus status) const;
+    QString statusToolTip(const EntrySummarySnapshot &entry) const;
     QString typeText(const EntrySummarySnapshot &entry) const;
     QString machToolTip(const EntrySummarySnapshot &entry) const;
+    // Emits dataChanged for the whole Status column.
+    void emitStatusChanged();
 
     EntryListSnapshot m_entries;
+
+    bool m_overlayActive = false;
+    QSet<EntryKey> m_selected;
+    // Entry key -> the paths it conflicts over (for the tooltip).
+    QHash<EntryKey, QStringList> m_conflictPaths;
 };
