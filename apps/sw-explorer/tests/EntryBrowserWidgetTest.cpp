@@ -28,6 +28,10 @@ private slots:
     void overlayShowsStatusColumnAndFooterCounts();
     void clearedOverlayHidesStatusColumn();
     void reloadKeepsOverlayAndSelection();
+    void entryKeysReflectVisibleRowsInOrder();
+    void duplicatePathsKeepDistinctEntryKeys();
+    void currentEntryKeyFollowsSelection();
+    void hiddenOrEmptyViewsExposeNoEntries();
 };
 
 namespace {
@@ -281,6 +285,79 @@ void EntryBrowserWidgetTest::reloadKeepsOverlayAndSelection()
              QStringLiteral("Not selected"));
     QCOMPARE(widget.findChild<QLabel *>(QStringLiteral("countLabel"))->text(),
              QStringLiteral("2 entries · 1 selected · 1 conflicted records"));
+}
+
+void EntryBrowserWidgetTest::entryKeysReflectVisibleRowsInOrder()
+{
+    EntryBrowserWidget widget;
+    widget.showEntries({makeEntry(1, 0, QStringLiteral("usr/bin/Xsgi")),
+                        makeEntry(1, 1, QStringLiteral("usr/lib/libGL.so")),
+                        makeEntry(2, 0, QStringLiteral("etc/conf"))});
+
+    const QList<EntryKey> keys = widget.entryKeys();
+    QCOMPARE(keys, (QList<EntryKey>{{1, 0}, {1, 1}, {2, 0}}));
+    QVERIFY(widget.hasVisibleEntries());
+}
+
+void EntryBrowserWidgetTest::duplicatePathsKeepDistinctEntryKeys()
+{
+    EntryBrowserWidget widget;
+    // Hardware variants share one path; each row is its own key.
+    widget.showEntries({makeEntry(1, 0, QStringLiteral("usr/bin/tool")),
+                        makeEntry(1, 1, QStringLiteral("usr/bin/tool"))});
+
+    const QList<EntryKey> keys = widget.entryKeys();
+    QCOMPARE(keys.size(), 2);
+    QVERIFY(keys.at(0) != keys.at(1));
+}
+
+void EntryBrowserWidgetTest::currentEntryKeyFollowsSelection()
+{
+    EntryBrowserWidget widget;
+    widget.showEntries(twoEntries());
+
+    // Nothing selected yet.
+    QVERIFY(!widget.currentEntryKey().has_value());
+
+    auto *table = widget.findChild<QTableView *>(QStringLiteral("entryTable"));
+    table->setCurrentIndex(table->model()->index(1, 0));
+    const std::optional<EntryKey> key = widget.currentEntryKey();
+    QVERIFY(key.has_value());
+    QCOMPARE(key->productId, 1);
+    QCOMPARE(key->entryId, 1);
+    QCOMPARE(widget.currentEntryPath(), QStringLiteral("usr/lib/libGL.so"));
+}
+
+void EntryBrowserWidgetTest::hiddenOrEmptyViewsExposeNoEntries()
+{
+    EntryBrowserWidget widget;
+    // The empty page.
+    QVERIFY(!widget.hasVisibleEntries());
+    QVERIFY(widget.entryKeys().isEmpty());
+    QVERIFY(!widget.currentEntryKey().has_value());
+
+    // Loading hides any previously shown rows: a stale model must
+    // never feed an extraction.
+    widget.showEntries(twoEntries());
+    QVERIFY(widget.hasVisibleEntries());
+    widget.showLoading(QStringLiteral("eoe.sw.gfx"));
+    QVERIFY(!widget.hasVisibleEntries());
+    QVERIFY(widget.entryKeys().isEmpty());
+    QVERIFY(!widget.currentEntryKey().has_value());
+
+    // The error page, same invariant.
+    widget.showEntries(twoEntries());
+    widget.showError(QStringLiteral("boom"));
+    QVERIFY(!widget.hasVisibleEntries());
+
+    // A table with zero rows is not an extraction scope either.
+    widget.showEntries({});
+    QCOMPARE(currentPageName(widget), QStringLiteral("tablePage"));
+    QVERIFY(!widget.hasVisibleEntries());
+    QVERIFY(widget.entryKeys().isEmpty());
+
+    widget.showEmpty();
+    QVERIFY(!widget.hasVisibleEntries());
 }
 
 QTEST_MAIN(EntryBrowserWidgetTest)

@@ -548,3 +548,82 @@ add_test(NAME MainWindowHardwareTest COMMAND MainWindowHardwareTest)
 set_tests_properties(MainWindowHardwareTest PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
 )
+
+# The extraction dialog tests are QWidget tests (QTEST_MAIN); the
+# dialog never talks to a backend itself, so no staticlib is needed;
+# the offscreen platform keeps them headless on every CI platform.
+add_executable(ExtractionDialogTest
+    tests/ExtractionDialogTest.cpp
+    src/EntrySnapshot.h
+    src/HardwareSnapshot.h
+    src/ExtractionSnapshot.h
+    src/ExtractionDialog.h
+    src/ExtractionDialog.cpp
+)
+
+target_include_directories(ExtractionDialogTest PRIVATE src)
+
+target_link_libraries(ExtractionDialogTest PRIVATE
+    Qt6::Widgets
+    Qt6::Test
+)
+
+add_test(NAME ExtractionDialogTest COMMAND ExtractionDialogTest)
+set_tests_properties(ExtractionDialogTest PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+)
+
+# The main-window extraction tests are QWidget tests (QTEST_MAIN)
+# driving the real backend through the worker thread, so they link
+# the staticlib exactly like the application; the offscreen platform
+# keeps them headless on every CI platform.
+add_executable(MainWindowExtractionTest
+    tests/MainWindowExtractionTest.cpp
+    src/HierarchySnapshot.h
+    src/InspectorSnapshot.h
+    src/EntrySnapshot.h
+    src/HardwareSnapshot.h
+    src/ExtractionSnapshot.h
+    src/ByteFormat.h
+    src/InspectorWidget.h
+    src/InspectorWidget.cpp
+    src/EntryBrowserWidget.h
+    src/EntryBrowserWidget.cpp
+    src/HardwareProfileDelegate.h
+    src/HardwareProfileDelegate.cpp
+    src/HardwareProfileDialog.h
+    src/HardwareProfileDialog.cpp
+    src/ExtractionDialog.h
+    src/ExtractionDialog.cpp
+    src/MainWindow.h
+    src/MainWindow.cpp
+    src/BackendWorker.h
+    src/BackendWorker.cpp
+    src/models/DistributionTreeModel.h
+    src/models/DistributionTreeModel.cpp
+    src/models/EntryTableModel.h
+    src/models/EntryTableModel.cpp
+    src/models/HardwareProfileModel.h
+    src/models/HardwareProfileModel.cpp
+    "${SW_GENERATED_SOURCE}"
+)
+
+target_include_directories(MainWindowExtractionTest PRIVATE src "${SW_GENERATED_DIR}")
+
+add_dependencies(MainWindowExtractionTest sw_gui_bridge_staticlib)
+
+target_link_libraries(MainWindowExtractionTest PRIVATE
+    Qt6::Widgets
+    Qt6::Test
+    sw_gui_bridge
+    ${SW_NATIVE_LIBS}
+)
+
+if(SW_NATIVE_LIB_DIRS)
+    target_link_directories(MainWindowExtractionTest PRIVATE ${SW_NATIVE_LIB_DIRS})
+endif()
+
+add_test(NAME MainWindowExtractionTest COMMAND MainWindowExtractionTest)
+set_tests_properties(MainWindowExtractionTest PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+)

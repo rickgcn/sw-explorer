@@ -1,6 +1,8 @@
 #include "BackendWorker.h"
 
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QSet>
 #include <QSignalSpy>
 #include <QTemporaryDir>
@@ -50,6 +52,18 @@ private slots:
     void selectionRejectsEmptyAttributeName();
     void selectionWithoutDistributionFails();
     void selectionKeysResolveEntryDetail();
+    void extractionPlanRoundTripsSnapshot();
+    void extractionExtractRoundTripsReport();
+    void extractionRejectsInvalidKeys();
+    void extractionRejectsDuplicateKey();
+    void extractionRejectsBadOutputDir();
+    void extractionRejectsBadRelativeTo();
+    void extractionRejectsEmptyHardwareAttribute();
+    void extractionEmptyHardwareValuePasses();
+    void extractionWithoutDistributionFails();
+    void extractionCandidateIsInvisibleAndCommitSwitches();
+    void extractionRefuseKeepsExistingFile();
+    void extractionAllowOverwriteReplacesRegularFile();
 };
 
 namespace {
@@ -144,6 +158,55 @@ bool writeEmptyValueHardwareDist(QTemporaryDir &dir)
     return true;
 }
 
+void appendArchiveRecord(QFile &archive, const QByteArray &name, const QByteArray &payload)
+{
+    const quint16 length = static_cast<quint16>(name.size());
+    const char header[2] = {static_cast<char>(length >> 8), static_cast<char>(length & 0xff)};
+    archive.write(header, 2);
+    archive.write(name);
+    archive.write(payload);
+}
+
+// One product `ext` with a real image archive: directory `bin`,
+// hello.txt ("hello"), bin/tool x3 (IP22 / IP99 / fallback) and an
+// explicitly empty empty.txt. Object ids: 1 = product `ext`,
+// 2 = image `ext.sw`, 3 = `unix`. Entry ids 0..=5 in IDB order.
+bool writeExtractionDist(QTemporaryDir &dir)
+{
+    QFile idb(dir.filePath(QStringLiteral("ext.idb")));
+    if (!idb.open(QIODevice::WriteOnly)) {
+        return false;
+    }
+    idb.write(
+        "d 0755 root sys bin src ext.sw.unix\n"
+        "f 0644 root sys hello.txt src/hello.txt ext.sw.unix sum(1) size(5) cmpsize(0)\n"
+        "f 0755 root sys bin/tool src/tool1 ext.sw.unix sum(2) size(4) cmpsize(0) mach(CPUBOARD=IP22)\n"
+        "f 0755 root sys bin/tool src/tool2 ext.sw.unix sum(3) size(4) cmpsize(0) mach(CPUBOARD=IP99)\n"
+        "f 0755 root sys bin/tool src/tool3 ext.sw.unix sum(4) size(4) cmpsize(0)\n"
+        "f 0644 root sys empty.txt src/empty ext.sw.unix sum(5) size(0)\n");
+    idb.close();
+
+    QFile archive(dir.filePath(QStringLiteral("ext.sw")));
+    if (!archive.open(QIODevice::WriteOnly)) {
+        return false;
+    }
+    archive.write("im001V999P00\0", 13);
+    appendArchiveRecord(archive, "hello.txt", "hello");
+    appendArchiveRecord(archive, "bin/tool", "IP22");
+    appendArchiveRecord(archive, "bin/tool", "IP99");
+    appendArchiveRecord(archive, "bin/tool", "FBCK");
+    return true;
+}
+
+// A Full/Auto/no-overwrite request for the given keys.
+ExtractionRequestSnapshot extractionRequest(const QList<EntryKey> &keys, const QString &outDir)
+{
+    ExtractionRequestSnapshot request;
+    request.entries = keys;
+    request.outputDir = outDir;
+    return request;
+}
+
 // "productId/entryId" per key, for readable QCOMPARE diffs.
 QStringList keyTexts(const QList<EntryKey> &keys)
 {
@@ -169,6 +232,9 @@ void BackendWorkerTest::initTestCase()
     qRegisterMetaType<HardwareProfileSnapshot>("HardwareProfileSnapshot");
     qRegisterMetaType<HardwareCandidatesSnapshot>("HardwareCandidatesSnapshot");
     qRegisterMetaType<SelectionSnapshot>("SelectionSnapshot");
+    qRegisterMetaType<ExtractionRequestSnapshot>("ExtractionRequestSnapshot");
+    qRegisterMetaType<ExtractionPlanSnapshot>("ExtractionPlanSnapshot");
+    qRegisterMetaType<ExtractionReportSnapshot>("ExtractionReportSnapshot");
 }
 
 void BackendWorkerTest::candidateCarriesHierarchySnapshot()
@@ -1116,6 +1182,323 @@ void BackendWorkerTest::selectionKeysResolveEntryDetail()
     QCOMPARE(detailSpy.count(), keys.size());
     QCOMPARE(qvariant_cast<EntryDetailSnapshot>(detailSpy.first().at(1)).path,
              QStringLiteral("usr/bin/plain"));
+}
+
+void BackendWorkerTest::extractionPlanRoundTripsSnapshot()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeExtractionDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy readySpy(&worker, &BackendWorker::extractionPlanReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::extractionPlanFailed);
+
+    const QString out = dir.filePath(QStringLiteral("out"));
+    worker.planExtractionRequested(200, extractionRequest({{1, 1}}, out));
+    QCOMPARE(failSpy.count(), 0);
+    QCOMPARE(readySpy.count(), 1);
+    QCOMPARE(readySpy.first().at(0).toULongLong(), 200);
+
+    const auto plan = qvariant_cast<ExtractionPlanSnapshot>(readySpy.first().at(1));
+    QCOMPARE(plan.requestedRecords, 1);
+    QCOMPARE(plan.omittedRecords, 0);
+    QCOMPARE(plan.hardwareExcludedRecords, 0);
+    QCOMPARE(plan.plannedRecords, 1);
+    QCOMPARE(plan.outputPaths, 1);
+    QCOMPARE(plan.existingOutputs, 0);
+    // Preflight planning never touches the filesystem.
+    QVERIFY(!QFile::exists(out));
+}
+
+void BackendWorkerTest::extractionExtractRoundTripsReport()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeExtractionDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy finishSpy(&worker, &BackendWorker::extractionFinished);
+    QSignalSpy failSpy(&worker, &BackendWorker::extractionFailed);
+
+    const QString out = dir.filePath(QStringLiteral("out"));
+    // hello.txt, the bin directory and the explicitly empty file.
+    worker.extractEntriesRequested(201, extractionRequest({{1, 1}, {1, 0}, {1, 5}}, out));
+    QCOMPARE(failSpy.count(), 0);
+    QCOMPARE(finishSpy.count(), 1);
+    QCOMPARE(finishSpy.first().at(0).toULongLong(), 201);
+
+    const auto report = qvariant_cast<ExtractionReportSnapshot>(finishSpy.first().at(1));
+    QCOMPARE(report.extracted, 3);
+    QCOMPARE(report.skipped, 0);
+    QVERIFY(report.failures.isEmpty());
+    QVERIFY(report.recoveries.isEmpty());
+
+    QFile extracted(dir.filePath(QStringLiteral("out/hello.txt")));
+    QVERIFY(extracted.open(QIODevice::ReadOnly));
+    QCOMPARE(extracted.readAll(), QByteArray("hello"));
+    QVERIFY(QFile::exists(dir.filePath(QStringLiteral("out/empty.txt"))));
+    QVERIFY(QFileInfo(dir.filePath(QStringLiteral("out/bin"))).isDir());
+}
+
+void BackendWorkerTest::extractionRejectsInvalidKeys()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeExtractionDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy readySpy(&worker, &BackendWorker::extractionPlanReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::extractionPlanFailed);
+    const QString out = dir.filePath(QStringLiteral("out"));
+
+    // Object id 0 is never valid.
+    worker.planExtractionRequested(202, extractionRequest({{0, 1}}, out));
+    QCOMPARE(failSpy.count(), 1);
+    QVERIFY(failSpy.first().at(1).toString().contains(QStringLiteral("object id 0")));
+
+    // Unknown object id.
+    worker.planExtractionRequested(203, extractionRequest({{999, 1}}, out));
+    QCOMPARE(failSpy.count(), 2);
+
+    // A product id pointing at the image (object 2) instead.
+    worker.planExtractionRequested(204, extractionRequest({{2, 1}}, out));
+    QCOMPARE(failSpy.count(), 3);
+    QVERIFY(failSpy.at(2).at(1).toString().contains(QStringLiteral("does not identify a product")));
+
+    // Entry id out of range.
+    worker.planExtractionRequested(205, extractionRequest({{1, 999}}, out));
+    QCOMPARE(failSpy.count(), 4);
+    QVERIFY(failSpy.at(3).at(1).toString().contains(QStringLiteral("does not exist")));
+
+    QCOMPARE(readySpy.count(), 0);
+}
+
+void BackendWorkerTest::extractionRejectsDuplicateKey()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeExtractionDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy failSpy(&worker, &BackendWorker::extractionPlanFailed);
+    worker.planExtractionRequested(
+        206,
+        extractionRequest({{1, 1}, {1, 1}}, dir.filePath(QStringLiteral("out"))));
+    QCOMPARE(failSpy.count(), 1);
+    QVERIFY(failSpy.first().at(1).toString().contains(QStringLiteral("duplicate entry key")));
+}
+
+void BackendWorkerTest::extractionRejectsBadOutputDir()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeExtractionDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy failSpy(&worker, &BackendWorker::extractionPlanFailed);
+
+    // An empty output directory.
+    worker.planExtractionRequested(207, extractionRequest({{1, 1}}, QString()));
+    QCOMPARE(failSpy.count(), 1);
+    QVERIFY(failSpy.first().at(1).toString().contains(QStringLiteral("output directory is empty")));
+
+    // The bridge requires an absolute host path.
+    worker.planExtractionRequested(208,
+                                   extractionRequest({{1, 1}}, QStringLiteral("relative/out")));
+    QCOMPARE(failSpy.count(), 2);
+    QVERIFY(failSpy.at(1).at(1).toString().contains(QStringLiteral("not an absolute host path")));
+}
+
+void BackendWorkerTest::extractionRejectsBadRelativeTo()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeExtractionDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    ExtractionRequestSnapshot request =
+        extractionRequest({{1, 1}}, dir.filePath(QStringLiteral("out")));
+    request.pathMode = ExtractionPathMode::RelativeTo;
+    // The Rust IrixPath parser is the authority: escapes above the
+    // root are rejected.
+    request.relativeTo = QStringLiteral("../escape");
+
+    QSignalSpy failSpy(&worker, &BackendWorker::extractionPlanFailed);
+    worker.planExtractionRequested(209, request);
+    QCOMPARE(failSpy.count(), 1);
+    QVERIFY(failSpy.first().at(1).toString().contains(QStringLiteral("invalid relative-to prefix")));
+}
+
+void BackendWorkerTest::extractionRejectsEmptyHardwareAttribute()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeExtractionDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    ExtractionRequestSnapshot request =
+        extractionRequest({{1, 1}}, dir.filePath(QStringLiteral("out")));
+    request.hardware = {{QString(), QStringLiteral("IP22")}};
+
+    QSignalSpy failSpy(&worker, &BackendWorker::extractionPlanFailed);
+    worker.planExtractionRequested(210, request);
+    QCOMPARE(failSpy.count(), 1);
+    QVERIFY(failSpy.first().at(1).toString().contains(QStringLiteral("hardware attribute name is empty")));
+}
+
+void BackendWorkerTest::extractionEmptyHardwareValuePasses()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeExtractionDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    // An empty value is a genuine fact (`GFXBOARD=`); with IP22 the
+    // board-specific bin/tool variant is selected.
+    ExtractionRequestSnapshot request =
+        extractionRequest({{1, 2}, {1, 3}, {1, 4}}, dir.filePath(QStringLiteral("out")));
+    request.hardware = {{QStringLiteral("CPUBOARD"), QStringLiteral("IP22")},
+                        {QStringLiteral("GFXBOARD"), QString()}};
+
+    QSignalSpy readySpy(&worker, &BackendWorker::extractionPlanReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::extractionPlanFailed);
+    worker.planExtractionRequested(211, request);
+    QCOMPARE(failSpy.count(), 0);
+    QCOMPARE(readySpy.count(), 1);
+    const auto plan = qvariant_cast<ExtractionPlanSnapshot>(readySpy.first().at(1));
+    QCOMPARE(plan.plannedRecords, 1);
+    QCOMPARE(plan.hardwareExcludedRecords, 2);
+}
+
+void BackendWorkerTest::extractionWithoutDistributionFails()
+{
+    BackendWorker worker;
+    QSignalSpy failSpy(&worker, &BackendWorker::extractionPlanFailed);
+    QSignalSpy extractFailSpy(&worker, &BackendWorker::extractionFailed);
+
+    worker.planExtractionRequested(212, extractionRequest({{1, 1}}, QStringLiteral("/tmp/x")));
+    QCOMPARE(failSpy.count(), 1);
+    QVERIFY(failSpy.first().at(1).toString().contains(QStringLiteral("no distribution loaded")));
+
+    worker.extractEntriesRequested(213, extractionRequest({{1, 1}}, QStringLiteral("/tmp/x")));
+    QCOMPARE(extractFailSpy.count(), 1);
+}
+
+void BackendWorkerTest::extractionCandidateIsInvisibleAndCommitSwitches()
+{
+    QTemporaryDir dirA;
+    QVERIFY(writeExtractionDist(dirA));
+    QTemporaryDir dirB;
+    QVERIFY(writeGammaDist(dirB));
+
+    BackendWorker worker;
+    worker.openDistribution(dirA.path());
+    worker.commitCandidate();
+    // Open B: it is only a candidate until the GUI commits it.
+    worker.openDistribution(dirB.path());
+
+    QSignalSpy readySpy(&worker, &BackendWorker::extractionPlanReady);
+    QSignalSpy failSpy(&worker, &BackendWorker::extractionPlanFailed);
+
+    // Key (1,1) is hello.txt in committed A; in candidate B it does
+    // not exist (gamma has entry 0 only). Planning must use A.
+    worker.planExtractionRequested(214,
+                                   extractionRequest({{1, 1}}, dirA.filePath(QStringLiteral("out"))));
+    QCOMPARE(failSpy.count(), 0);
+    QCOMPARE(readySpy.count(), 1);
+
+    // Once B is committed the same key is out of range there.
+    worker.commitCandidate();
+    worker.planExtractionRequested(215,
+                                   extractionRequest({{1, 1}}, dirB.filePath(QStringLiteral("out"))));
+    QCOMPARE(failSpy.count(), 1);
+    QCOMPARE(readySpy.count(), 1);
+}
+
+void BackendWorkerTest::extractionRefuseKeepsExistingFile()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeExtractionDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    // The GUI default: no overwriting. Preflight refuses before any
+    // write, and the target content is untouched.
+    QDir().mkpath(dir.filePath(QStringLiteral("out")));
+    QFile target(dir.filePath(QStringLiteral("out/hello.txt")));
+    QVERIFY(target.open(QIODevice::WriteOnly));
+    target.write("KEEP ME");
+    target.close();
+
+    QSignalSpy planFailSpy(&worker, &BackendWorker::extractionPlanFailed);
+    QSignalSpy extractFailSpy(&worker, &BackendWorker::extractionFailed);
+    QSignalSpy finishSpy(&worker, &BackendWorker::extractionFinished);
+
+    const auto request = extractionRequest({{1, 1}}, dir.filePath(QStringLiteral("out")));
+    worker.planExtractionRequested(216, request);
+    QCOMPARE(planFailSpy.count(), 1);
+    QVERIFY(planFailSpy.first().at(1).toString().contains(QStringLiteral("would overwrite existing files")));
+
+    worker.extractEntriesRequested(217, request);
+    QCOMPARE(extractFailSpy.count(), 1);
+    QCOMPARE(finishSpy.count(), 0);
+
+    QVERIFY(target.open(QIODevice::ReadOnly));
+    QCOMPARE(target.readAll(), QByteArray("KEEP ME"));
+}
+
+void BackendWorkerTest::extractionAllowOverwriteReplacesRegularFile()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeExtractionDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QDir().mkpath(dir.filePath(QStringLiteral("out")));
+    QFile target(dir.filePath(QStringLiteral("out/hello.txt")));
+    QVERIFY(target.open(QIODevice::WriteOnly));
+    target.write("KEEP ME");
+    target.close();
+
+    auto request = extractionRequest({{1, 1}}, dir.filePath(QStringLiteral("out")));
+    request.allowOverwrite = true;
+
+    QSignalSpy readySpy(&worker, &BackendWorker::extractionPlanReady);
+    worker.planExtractionRequested(218, request);
+    QCOMPARE(readySpy.count(), 1);
+    const auto plan = qvariant_cast<ExtractionPlanSnapshot>(readySpy.first().at(1));
+    QCOMPARE(plan.existingOutputs, 1);
+
+    QSignalSpy finishSpy(&worker, &BackendWorker::extractionFinished);
+    worker.extractEntriesRequested(219, request);
+    QCOMPARE(finishSpy.count(), 1);
+    const auto report = qvariant_cast<ExtractionReportSnapshot>(finishSpy.first().at(1));
+    QCOMPARE(report.extracted, 1);
+    QVERIFY(report.failures.isEmpty());
+
+    QVERIFY(target.open(QIODevice::ReadOnly));
+    QCOMPARE(target.readAll(), QByteArray("hello"));
 }
 
 QTEST_GUILESS_MAIN(BackendWorkerTest)
