@@ -775,7 +775,10 @@ fn non_directory_planned_ancestor_refuses() {
         message.contains("extraction would write through a non-directory output"),
         "{message}"
     );
-    assert!(message.contains("blk/inner"), "{message}");
+    // The message renders host output paths, whose separators are
+    // platform-native.
+    let inner = Path::new("blk").join("inner");
+    assert!(message.contains(&inner.display().to_string()), "{message}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
