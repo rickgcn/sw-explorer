@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "EntrySnapshot.h"
+#include "ExtractionSnapshot.h"
 #include "HardwareSnapshot.h"
 #include "HierarchySnapshot.h"
 #include "InspectorSnapshot.h"
@@ -46,6 +47,12 @@ public slots:
     void entryDetailRequested(quint64 requestId, quint64 productId, quint64 entryId);
     void hardwareCandidatesRequested(quint64 requestId);
     void selectionRequested(quint64 requestId, const HardwareProfileSnapshot &profile);
+    // Extraction preflight and execution. Both take the same request
+    // shape; execution re-plans inside the backend, so a preflight
+    // result is never an execution input. A running extraction blocks
+    // this worker thread; the GUI thread stays responsive.
+    void planExtractionRequested(quint64 requestId, const ExtractionRequestSnapshot &request);
+    void extractEntriesRequested(quint64 requestId, const ExtractionRequestSnapshot &request);
 
 signals:
     void candidateReady(quint64 productCount,
@@ -73,6 +80,12 @@ signals:
     void hardwareCandidatesFailed(quint64 requestId, const QString &message);
     void selectionReady(quint64 requestId, const SelectionSnapshot &selection);
     void selectionFailed(quint64 requestId, const QString &message);
+
+    // The extraction request family, with its own request ids.
+    void extractionPlanReady(quint64 requestId, const ExtractionPlanSnapshot &plan);
+    void extractionPlanFailed(quint64 requestId, const QString &message);
+    void extractionFinished(quint64 requestId, const ExtractionReportSnapshot &report);
+    void extractionFailed(quint64 requestId, const QString &message);
 
 private:
     // The committed backend: what every future query talks to.

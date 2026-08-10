@@ -2,6 +2,7 @@
 
 #include "BackendWorker.h"
 #include "EntryBrowserWidget.h"
+#include "ExtractionDialog.h"
 #include "HardwareProfileDialog.h"
 #include "InspectorWidget.h"
 #include "models/DistributionTreeModel.h"
@@ -30,8 +31,18 @@ MainWindow::MainWindow()
     resize(1200, 700);
 
     m_openAction = new QAction(tr("Open Distribution..."), this);
+    m_openAction->setObjectName(QStringLiteral("openAction"));
     connect(m_openAction, &QAction::triggered, this, &MainWindow::chooseDistribution);
-    menuBar()->addMenu(tr("&File"))->addAction(m_openAction);
+    QMenu *fileMenu = menuBar()->addMenu(tr("&File"));
+    fileMenu->addAction(m_openAction);
+
+    // Extract shares the action between menu and toolbar; it is only
+    // enabled with visible Files rows and no open/commit/extraction
+    // in flight (updateExtractAction()).
+    m_extractAction = new QAction(tr("Extract..."), this);
+    m_extractAction->setObjectName(QStringLiteral("extractAction"));
+    connect(m_extractAction, &QAction::triggered, this, &MainWindow::openExtractionDialog);
+    fileMenu->addAction(m_extractAction);
 
     // The toolbar carries the same open action as the menu on the
     // left and the global path search on the right.
@@ -39,6 +50,7 @@ MainWindow::MainWindow()
     toolbar->setObjectName(QStringLiteral("mainToolBar"));
     toolbar->setMovable(false);
     toolbar->addAction(m_openAction);
+    toolbar->addAction(m_extractAction);
 
     // The hardware profile editor is always available, even with no
     // distribution loaded: the profile can be configured first and is
@@ -205,7 +217,33 @@ MainWindow::MainWindow()
             &MainWindow::onHardwareCandidatesFailed);
     connect(m_worker, &BackendWorker::selectionReady, this, &MainWindow::onSelectionReady);
     connect(m_worker, &BackendWorker::selectionFailed, this, &MainWindow::onSelectionFailed);
+    connect(this,
+            &MainWindow::planExtractionRequested,
+            m_worker,
+            &BackendWorker::planExtractionRequested);
+    connect(this,
+            &MainWindow::extractEntriesRequested,
+            m_worker,
+            &BackendWorker::extractEntriesRequested);
+    connect(m_worker,
+            &BackendWorker::extractionPlanReady,
+            this,
+            &MainWindow::onExtractionPlanReady);
+    connect(m_worker,
+            &BackendWorker::extractionPlanFailed,
+            this,
+            &MainWindow::onExtractionPlanFailed);
+    connect(m_worker,
+            &BackendWorker::extractionFinished,
+            this,
+            &MainWindow::onExtractionFinished);
+    connect(m_worker,
+            &BackendWorker::extractionFailed,
+            this,
+            &MainWindow::onExtractionFailed);
     m_workerThread->start();
+
+    updateExtractAction();
 }
 
 MainWindow::~MainWindow()
@@ -246,6 +284,122 @@ void MainWindow::openHardwareProfileDialog()
     dialog.exec();
 }
 
+void MainWindow::updateExtractAction()
+{
+    // With a hardware profile the selection must be Ready before the
+    // dialog opens; the planner re-evaluates it authoritatively anyway,
+    // so this only keeps the user from writing while the UI itself
+    // reports the selection as unresolved.
+    const bool selectionReady = m_profile.isEmpty() || m_selectionState == SelectionState::Ready;
+    m_extractAction->setEnabled(m_hasDistribution && m_entries->hasVisibleEntries()
+                                && !m_openInProgress && !m_commitInProgress
+                                && !m_extractionInProgress && selectionReady);
+}
+
+void MainWindow::setExtractionInProgress(bool inProgress)
+{
+    m_extractionInProgress = inProgress;
+    m_openAction->setEnabled(!inProgress && !m_openInProgress);
+    m_treeView->setEnabled(!inProgress);
+    m_entries->setEnabled(!inProgress);
+    m_searchEdit->setEnabled(!inProgress && m_hasDistribution && !m_openInProgress);
+    m_hardwareButton->setEnabled(!inProgress);
+    updateExtractAction();
+}
+
+void MainWindow::openExtractionDialog()
+{
+    if (!m_extractAction->isEnabled()) {
+        return;
+    }
+    ExtractionDialog dialog(this);
+    m_extractionDialog = &dialog;
+    // The scope is exactly what the Files view shows right now: its
+    // entry keys, never a re-queried search text or hierarchy scope.
+    const std::optional<EntryKey> selected = m_entries->currentEntryKey();
+    QString selectedPath;
+    if (selected.has_value()) {
+        selectedPath = m_entries->currentEntryPath();
+    }
+    dialog.setScope(m_entries->entryKeys(), selected, selectedPath);
+    dialog.setHardwareProfile(m_profile);
+    connect(&dialog,
+            &ExtractionDialog::preflightRequested,
+            this,
+            &MainWindow::onExtractionPreflightRequested);
+    connect(&dialog,
+            &ExtractionDialog::extractRequested,
+            this,
+            &MainWindow::onExtractionRequested);
+    connect(&dialog,
+            &ExtractionDialog::requestInvalidated,
+            this,
+            &MainWindow::onExtractionInvalidated);
+    dialog.exec();
+    // The dialog is gone: a preflight in flight was invalidated by its
+    // reject, and a running extraction cannot be closed out of.
+    m_extractionDialog = nullptr;
+}
+
+void MainWindow::onExtractionPreflightRequested(const ExtractionRequestSnapshot &request)
+{
+    ++m_activeExtractionRequestId;
+    emit planExtractionRequested(m_activeExtractionRequestId, request);
+}
+
+void MainWindow::onExtractionRequested(const ExtractionRequestSnapshot &request)
+{
+    ++m_activeExtractionRequestId;
+    setExtractionInProgress(true);
+    emit extractEntriesRequested(m_activeExtractionRequestId, request);
+}
+
+void MainWindow::onExtractionInvalidated()
+{
+    // The request changed after (or during) a preflight, or the dialog
+    // was closed mid-check: anything in flight for it is stale.
+    ++m_activeExtractionRequestId;
+}
+
+void MainWindow::onExtractionPlanReady(quint64 requestId, const ExtractionPlanSnapshot &plan)
+{
+    if (requestId != m_activeExtractionRequestId || m_extractionDialog == nullptr) {
+        // A preflight the user has already moved on from: dropped.
+        return;
+    }
+    m_extractionDialog->showPlan(plan);
+}
+
+void MainWindow::onExtractionPlanFailed(quint64 requestId, const QString &message)
+{
+    if (requestId != m_activeExtractionRequestId || m_extractionDialog == nullptr) {
+        return;
+    }
+    m_extractionDialog->showPlanFailure(message);
+}
+
+void MainWindow::onExtractionFinished(quint64 requestId, const ExtractionReportSnapshot &report)
+{
+    if (requestId != m_activeExtractionRequestId) {
+        return;
+    }
+    setExtractionInProgress(false);
+    if (m_extractionDialog != nullptr) {
+        m_extractionDialog->showReport(report);
+    }
+}
+
+void MainWindow::onExtractionFailed(quint64 requestId, const QString &message)
+{
+    if (requestId != m_activeExtractionRequestId) {
+        return;
+    }
+    setExtractionInProgress(false);
+    if (m_extractionDialog != nullptr) {
+        m_extractionDialog->showExtractionFailure(message);
+    }
+}
+
 void MainWindow::applyHardwareProfile(const HardwareProfileSnapshot &profile)
 {
     m_profile = profile;
@@ -262,11 +416,13 @@ void MainWindow::applyHardwareProfile(const HardwareProfileSnapshot &profile)
 
     if (m_profile.isEmpty()) {
         m_selectionState = SelectionState::Inactive;
+        updateExtractAction();
         restoreLoadedStatus();
         return;
     }
     if (m_hasDistribution) {
         m_selectionState = SelectionState::Pending;
+        updateExtractAction();
         restoreLoadedStatus();
         emit selectionRequested(m_activeSelectionRequestId, m_profile);
         return;
@@ -274,6 +430,7 @@ void MainWindow::applyHardwareProfile(const HardwareProfileSnapshot &profile)
     // No distribution yet: the profile is stored and evaluated as
     // soon as one is committed.
     m_selectionState = SelectionState::Inactive;
+    updateExtractAction();
     restoreLoadedStatus();
 }
 
@@ -327,6 +484,8 @@ void MainWindow::onCandidateReady(quint64 productCount,
         m_profile.isEmpty() ? SelectionState::Inactive : SelectionState::Pending;
     m_treeView->setEnabled(false);
     m_searchEdit->setEnabled(false);
+    m_commitInProgress = true;
+    updateExtractAction();
     emit candidateAccepted();
 
     QString text = tr("Loaded %1 products").arg(productCount);
@@ -353,6 +512,7 @@ void MainWindow::onDistributionOpenFailed(const QString &message)
 void MainWindow::onCandidateCommitted()
 {
     // The backend now serves the object ids the tree carries.
+    m_commitInProgress = false;
     m_treeView->setEnabled(true);
     m_searchEdit->setEnabled(true);
     m_hardwareButton->setEnabled(true);
@@ -369,6 +529,7 @@ void MainWindow::onCandidateCommitted()
         ++m_activeSelectionRequestId;
         emit selectionRequested(m_activeSelectionRequestId, m_profile);
     }
+    updateExtractAction();
     restoreLoadedStatus();
 }
 
@@ -417,6 +578,9 @@ void MainWindow::activateHierarchySelection(const QModelIndex &index)
     m_entries->showLoading(
         m_model->data(m_model->index(index.row(), DistributionTreeModel::NameColumn, index.parent()))
             .toString());
+    // While the scope loads, the Files view is not an extraction
+    // scope.
+    updateExtractAction();
     emit entriesRequested(m_activeEntriesRequestId, objectId);
 }
 
@@ -444,6 +608,9 @@ void MainWindow::onSearchTextChanged(const QString &text)
     ++m_activeInspectorRequestId;
     m_inspector->showEmpty();
     m_entries->showLoading(tr("Search: %1").arg(text));
+    // While the search loads, the Files view is not an extraction
+    // scope.
+    updateExtractAction();
     m_searchDebounce->start();
 }
 
@@ -499,6 +666,7 @@ void MainWindow::clearSelection()
     ++m_activeEntriesRequestId;
     m_inspector->showEmpty();
     m_entries->showEmpty();
+    updateExtractAction();
 }
 
 void MainWindow::onEntrySelected(quint64 productId, quint64 entryId)
@@ -512,10 +680,12 @@ void MainWindow::onEntrySelected(quint64 productId, quint64 entryId)
 
 void MainWindow::setOpenInProgress(bool inProgress)
 {
+    m_openInProgress = inProgress;
     m_openAction->setEnabled(!inProgress);
     // No search while an open is in flight; a failed open hands the
     // previous distribution's search box back.
     m_searchEdit->setEnabled(!inProgress && m_hasDistribution);
+    updateExtractAction();
 }
 
 void MainWindow::onProductDetailReady(quint64 requestId, const ProductDetailSnapshot &detail)
@@ -574,6 +744,7 @@ void MainWindow::onEntriesReady(quint64 requestId, const EntryListSnapshot &entr
     m_entries->showEntries(entries);
     // A successful render also clears any earlier entries or search
     // error from the status bar, back to the distribution state.
+    updateExtractAction();
     restoreLoadedStatus();
 }
 
@@ -583,6 +754,7 @@ void MainWindow::onEntriesFailed(quint64 requestId, const QString &message)
         return;
     }
     m_entries->showError(message);
+    updateExtractAction();
     statusBar()->showMessage(tr("Unable to load entries: %1").arg(message));
 }
 
@@ -622,6 +794,7 @@ void MainWindow::onSelectionReady(quint64 requestId, const SelectionSnapshot &se
     m_selectedRecordCount = static_cast<quint64>(selection.selected.size());
     m_conflictGroupCount = static_cast<quint64>(selection.conflicts.size());
     m_entries->setSelectionOverlay(selection);
+    updateExtractAction();
     restoreLoadedStatus();
 }
 
@@ -634,6 +807,7 @@ void MainWindow::onSelectionFailed(quint64 requestId, const QString &message)
     // error is reflected in the status bar until the state changes.
     m_selectionState = SelectionState::Error;
     m_selectionError = message;
+    updateExtractAction();
     restoreLoadedStatus();
 }
 

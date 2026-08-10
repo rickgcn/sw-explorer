@@ -298,6 +298,97 @@ EntryDetailSnapshot toQt(const sw::EntryDetail &detail)
     return out;
 }
 
+ExtractionPlanSnapshot toQt(const sw::ExtractionPlanSummary &summary)
+{
+    ExtractionPlanSnapshot out;
+    out.requestedRecords = summary.requested_records;
+    out.omittedRecords = summary.omitted_records;
+    out.hardwareExcludedRecords = summary.hardware_excluded_records;
+    out.plannedRecords = summary.planned_records;
+    out.outputPaths = summary.output_paths;
+    out.existingOutputs = summary.existing_outputs;
+    return out;
+}
+
+ExtractionReportSnapshot toQt(const sw::ExtractionReportDetail &report)
+{
+    ExtractionReportSnapshot out;
+    out.extracted = report.extracted;
+    out.skipped = report.skipped;
+    out.failures.reserve(static_cast<qsizetype>(report.failures.size()));
+    for (const sw::ExtractionFailureDetail &failure : report.failures) {
+        ExtractionFailureSnapshot item;
+        item.path = toQString(failure.path);
+        item.message = toQString(failure.message);
+        out.failures.append(item);
+    }
+    out.recoveries.reserve(static_cast<qsizetype>(report.recoveries.size()));
+    for (const sw::ExtractionRecoveryDetail &recovery : report.recoveries) {
+        ExtractionRecoverySnapshot item;
+        item.path = toQString(recovery.path);
+        item.expectedKnown = recovery.expected_known;
+        item.expectedOffset = recovery.expected_offset;
+        item.actualOffset = recovery.actual_offset;
+        switch (recovery.kind) {
+        case sw::ExtractionRecoveryKind::Delta:
+            item.kind = ExtractionRecoveryKind::Delta;
+            break;
+        case sw::ExtractionRecoveryKind::Resynced:
+            item.kind = ExtractionRecoveryKind::Resynced;
+            break;
+        case sw::ExtractionRecoveryKind::Scanned:
+            item.kind = ExtractionRecoveryKind::Scanned;
+            break;
+        }
+        item.deltaKnown = recovery.delta_known;
+        item.delta = recovery.delta;
+        out.recoveries.append(item);
+    }
+    return out;
+}
+
+// QString -> rust::String goes through an explicit UTF-8 byte array;
+// the current locale is never involved.
+sw::ExtractionRequest toRust(const ExtractionRequestSnapshot &request)
+{
+    sw::ExtractionRequest out{};
+    out.entries.reserve(static_cast<std::size_t>(request.entries.size()));
+    for (const EntryKey &key : request.entries) {
+        out.entries.push_back(sw::ExtractionEntryKey{key.productId, key.entryId});
+    }
+    out.hardware.reserve(static_cast<std::size_t>(request.hardware.size()));
+    for (const HardwareValueSnapshot &pair : request.hardware) {
+        const QByteArray attribute = pair.attribute.toUtf8();
+        const QByteArray value = pair.value.toUtf8();
+        out.hardware.push_back(sw::HardwareValue{
+            rust::String(attribute.constData(), static_cast<std::size_t>(attribute.size())),
+            rust::String(value.constData(), static_cast<std::size_t>(value.size()))});
+    }
+    const QByteArray outputDir = request.outputDir.toUtf8();
+    out.output_dir =
+        rust::String(outputDir.constData(), static_cast<std::size_t>(outputDir.size()));
+    switch (request.pathMode) {
+    case ExtractionPathMode::Full:
+        out.path_mode = sw::ExtractionPathMode::Full;
+        break;
+    case ExtractionPathMode::Flat:
+        out.path_mode = sw::ExtractionPathMode::Flat;
+        break;
+    case ExtractionPathMode::RelativeTo:
+        out.path_mode = sw::ExtractionPathMode::RelativeTo;
+        break;
+    }
+    const QByteArray relativeTo = request.relativeTo.toUtf8();
+    out.relative_to =
+        rust::String(relativeTo.constData(), static_cast<std::size_t>(relativeTo.size()));
+    out.decode = request.decode == ExtractionDecodeMode::Auto ? sw::ExtractionDecodeMode::Auto
+                                                              : sw::ExtractionDecodeMode::Never;
+    out.keep_stored = request.keepStored;
+    out.continue_on_error = request.continueOnError;
+    out.allow_overwrite = request.allowOverwrite;
+    return out;
+}
+
 } // namespace
 
 BackendWorker::BackendWorker(QObject *parent)
@@ -457,5 +548,31 @@ void BackendWorker::selectionRequested(quint64 requestId, const HardwareProfileS
         emit selectionReady(requestId, toQt(m_backend->select_entries(std::move(values))));
     } catch (const rust::Error &error) {
         emit selectionFailed(requestId, QString::fromUtf8(error.what()));
+    }
+}
+
+void BackendWorker::planExtractionRequested(quint64 requestId,
+                                            const ExtractionRequestSnapshot &request)
+{
+    // Preflight planning only ever talks to the committed backend; a
+    // pending candidate is not queryable. Planning never mutates the
+    // filesystem.
+    try {
+        emit extractionPlanReady(requestId, toQt(m_backend->plan_extraction(toRust(request))));
+    } catch (const rust::Error &error) {
+        emit extractionPlanFailed(requestId, QString::fromUtf8(error.what()));
+    }
+}
+
+void BackendWorker::extractEntriesRequested(quint64 requestId,
+                                            const ExtractionRequestSnapshot &request)
+{
+    // Execution re-plans inside the backend immediately before writing;
+    // the preflight result is never an execution input. The batch runs
+    // synchronously on this worker thread.
+    try {
+        emit extractionFinished(requestId, toQt(m_backend->extract_entries(toRust(request))));
+    } catch (const rust::Error &error) {
+        emit extractionFailed(requestId, QString::fromUtf8(error.what()));
     }
 }

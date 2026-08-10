@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include "EntrySnapshot.h"
+#include "ExtractionSnapshot.h"
 #include "HardwareSnapshot.h"
 #include "HierarchySnapshot.h"
 #include "InspectorSnapshot.h"
@@ -22,6 +23,9 @@ int main(int argc, char *argv[])
     qRegisterMetaType<HardwareProfileSnapshot>("HardwareProfileSnapshot");
     qRegisterMetaType<HardwareCandidatesSnapshot>("HardwareCandidatesSnapshot");
     qRegisterMetaType<SelectionSnapshot>("SelectionSnapshot");
+    qRegisterMetaType<ExtractionRequestSnapshot>("ExtractionRequestSnapshot");
+    qRegisterMetaType<ExtractionPlanSnapshot>("ExtractionPlanSnapshot");
+    qRegisterMetaType<ExtractionReportSnapshot>("ExtractionReportSnapshot");
 
     QApplication app(argc, argv);
 

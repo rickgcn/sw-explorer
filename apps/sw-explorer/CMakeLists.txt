@@ -229,6 +229,7 @@ qt_add_executable(sw-explorer
     src/InspectorSnapshot.h
     src/EntrySnapshot.h
     src/HardwareSnapshot.h
+    src/ExtractionSnapshot.h
     src/ByteFormat.h
     src/InspectorWidget.h
     src/InspectorWidget.cpp
@@ -238,6 +239,8 @@ qt_add_executable(sw-explorer
     src/HardwareProfileDelegate.cpp
     src/HardwareProfileDialog.h
     src/HardwareProfileDialog.cpp
+    src/ExtractionDialog.h
+    src/ExtractionDialog.cpp
     src/MainWindow.h
     src/MainWindow.cpp
     src/BackendWorker.h
@@ -365,6 +368,7 @@ add_executable(BackendWorkerTest
     src/InspectorSnapshot.h
     src/EntrySnapshot.h
     src/HardwareSnapshot.h
+    src/ExtractionSnapshot.h
     src/BackendWorker.h
     src/BackendWorker.cpp
     "${SW_GENERATED_SOURCE}"
@@ -445,6 +449,7 @@ add_executable(MainWindowSearchTest
     src/InspectorSnapshot.h
     src/EntrySnapshot.h
     src/HardwareSnapshot.h
+    src/ExtractionSnapshot.h
     src/ByteFormat.h
     src/InspectorWidget.h
     src/InspectorWidget.cpp
@@ -454,6 +459,8 @@ add_executable(MainWindowSearchTest
     src/HardwareProfileDelegate.cpp
     src/HardwareProfileDialog.h
     src/HardwareProfileDialog.cpp
+    src/ExtractionDialog.h
+    src/ExtractionDialog.cpp
     src/MainWindow.h
     src/MainWindow.cpp
     src/BackendWorker.h
@@ -497,6 +504,7 @@ add_executable(MainWindowHardwareTest
     src/InspectorSnapshot.h
     src/EntrySnapshot.h
     src/HardwareSnapshot.h
+    src/ExtractionSnapshot.h
     src/ByteFormat.h
     src/InspectorWidget.h
     src/InspectorWidget.cpp
@@ -506,6 +514,8 @@ add_executable(MainWindowHardwareTest
     src/HardwareProfileDelegate.cpp
     src/HardwareProfileDialog.h
     src/HardwareProfileDialog.cpp
+    src/ExtractionDialog.h
+    src/ExtractionDialog.cpp
     src/MainWindow.h
     src/MainWindow.cpp
     src/BackendWorker.h

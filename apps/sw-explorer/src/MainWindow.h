@@ -1,6 +1,7 @@
 #pragma once
 
 #include "EntrySnapshot.h"
+#include "ExtractionSnapshot.h"
 #include "HardwareSnapshot.h"
 #include "HierarchySnapshot.h"
 #include "InspectorSnapshot.h"
@@ -20,17 +21,18 @@ QT_END_NAMESPACE
 class BackendWorker;
 class DistributionTreeModel;
 class EntryBrowserWidget;
+class ExtractionDialog;
 class InspectorWidget;
 
 // Main window: the distribution hierarchy tree on the left, the
 // entry browser in the middle and the inspector on the right, split
 // by a QSplitter. All backend work runs on the BackendWorker thread.
 //
-// Inspector, entry-list and hardware requests each carry their own
-// monotonically increasing requestId; only the response matching the
-// newest request of its family is accepted, everything older is
-// dropped silently. Selection changes, model resets and newly opened
-// distributions all invalidate the pending requests.
+// Inspector, entry-list, hardware and extraction requests each carry
+// their own monotonically increasing requestId; only the response
+// matching the newest request of its family is accepted, everything
+// older is dropped silently. Selection changes, model resets and
+// newly opened distributions all invalidate the pending requests.
 //
 // The toolbar search box switches the entry browser between two
 // exclusive content sources: a non-empty query is a global path
@@ -45,6 +47,13 @@ class InspectorWidget;
 // search or detail reload. The profile survives opening another
 // distribution; the selection results and the candidate suggestions
 // do not.
+//
+// Extraction goes through the ExtractionDialog: its scope is exactly
+// the entry keys the Files view displays (never a re-queried search
+// or hierarchy scope), preflight runs as an async backend request,
+// and the actual extraction re-plans inside the backend before
+// anything is written. While an extraction runs, every other
+// interaction is locked.
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
@@ -63,6 +72,8 @@ signals:
     void entryDetailRequested(quint64 requestId, quint64 productId, quint64 entryId);
     void hardwareCandidatesRequested(quint64 requestId);
     void selectionRequested(quint64 requestId, const HardwareProfileSnapshot &profile);
+    void planExtractionRequested(quint64 requestId, const ExtractionRequestSnapshot &request);
+    void extractEntriesRequested(quint64 requestId, const ExtractionRequestSnapshot &request);
 
 public slots:
     // Applies a hardware profile: stores it, refreshes the toolbar
@@ -75,6 +86,7 @@ public slots:
 private slots:
     void chooseDistribution();
     void openHardwareProfileDialog();
+    void openExtractionDialog();
     // Lockdown at the start of every open, whoever triggered it: the
     // hardware profile must not change across the candidate/commit
     // window.
@@ -101,6 +113,16 @@ private slots:
     void onHardwareCandidatesReady(quint64 requestId,
                                    const HardwareCandidatesSnapshot &candidates);
     void onHardwareCandidatesFailed(quint64 requestId, const QString &message);
+    // The dialog's extraction signals, routed into the extraction
+    // request family.
+    void onExtractionPreflightRequested(const ExtractionRequestSnapshot &request);
+    void onExtractionRequested(const ExtractionRequestSnapshot &request);
+    void onExtractionInvalidated();
+    // The worker's extraction responses, routed back to the dialog.
+    void onExtractionPlanReady(quint64 requestId, const ExtractionPlanSnapshot &plan);
+    void onExtractionPlanFailed(quint64 requestId, const QString &message);
+    void onExtractionFinished(quint64 requestId, const ExtractionReportSnapshot &report);
+    void onExtractionFailed(quint64 requestId, const QString &message);
 
 private:
     // The lifecycle of the hardware selection overlay.
@@ -116,6 +138,15 @@ private:
     };
 
     void setOpenInProgress(bool inProgress);
+    // Locks (or releases) every interaction while an extraction runs:
+    // Open, the tree, the Files pane, search, hardware and the Extract
+    // action itself. The modal dialog blocks most input anyway; this
+    // keeps the state explicit.
+    void setExtractionInProgress(bool inProgress);
+    // Recomputes the Extract action's enabled state: a distribution,
+    // at least one visible Files row, no open/commit/extraction in
+    // flight, and — with a hardware profile — a Ready selection.
+    void updateExtractAction();
     void clearSelection();
     void restoreLoadedStatus();
     // Issues the detail and entries requests for one hierarchy index.
@@ -133,6 +164,7 @@ private:
     void updateHardwareButton();
 
     QAction *m_openAction = nullptr;
+    QAction *m_extractAction = nullptr;
     QToolButton *m_hardwareButton = nullptr;
 
     QTreeView *m_treeView = nullptr;
@@ -159,6 +191,9 @@ private:
     quint64 m_activeSelectionRequestId = 0;
     // The newest hardware candidate suggestion request.
     quint64 m_activeHardwareCandidatesRequestId = 0;
+    // The newest extraction request (preflight or execution); a
+    // separate family, so extraction never collides with browsing.
+    quint64 m_activeExtractionRequestId = 0;
 
     // The applied hardware profile: facts about the simulated target
     // machine. Kept for the whole run, across distributions.
@@ -175,6 +210,14 @@ private:
     // sides showing the old distribution.
     bool m_hasDistribution = false;
     QString m_loadedStatusText;
+
+    bool m_openInProgress = false;
+    // Between accepting a candidate and the commit landing, tree
+    // interaction is locked.
+    bool m_commitInProgress = false;
+    bool m_extractionInProgress = false;
+    // The live extraction dialog, while one is exec'd.
+    ExtractionDialog *m_extractionDialog = nullptr;
 
     QThread *m_workerThread = nullptr;
     BackendWorker *m_worker = nullptr;

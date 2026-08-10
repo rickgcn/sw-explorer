@@ -163,6 +163,50 @@ void EntryBrowserWidget::clearSelectionOverlay()
     updateFooter();
 }
 
+QList<EntryKey> EntryBrowserWidget::entryKeys() const
+{
+    QList<EntryKey> keys;
+    if (!hasVisibleEntries()) {
+        return keys;
+    }
+    keys.reserve(m_model->rowCount());
+    for (int row = 0; row < m_model->rowCount(); ++row) {
+        keys.append(m_model->entryKey(m_model->index(row, EntryTableModel::PathColumn)));
+    }
+    return keys;
+}
+
+std::optional<EntryKey> EntryBrowserWidget::currentEntryKey() const
+{
+    if (!hasVisibleEntries()) {
+        return std::nullopt;
+    }
+    const QModelIndex current = m_tableView->currentIndex();
+    if (!current.isValid()) {
+        return std::nullopt;
+    }
+    return m_model->entryKey(current);
+}
+
+QString EntryBrowserWidget::currentEntryPath() const
+{
+    if (!hasVisibleEntries()) {
+        return {};
+    }
+    const QModelIndex current = m_tableView->currentIndex();
+    if (!current.isValid()) {
+        return {};
+    }
+    return m_model->data(m_model->index(current.row(), EntryTableModel::PathColumn)).toString();
+}
+
+bool EntryBrowserWidget::hasVisibleEntries() const
+{
+    // The model may still hold rows of a previous scope while the
+    // Loading or Error page is up; only a visible table counts.
+    return m_stack->currentWidget() == m_tablePage && m_model->rowCount() > 0;
+}
+
 void EntryBrowserWidget::updateFooter()
 {
     // The model's selection overlay survives row reloads, so the

@@ -5,6 +5,8 @@
 
 #include <QWidget>
 
+#include <optional>
+
 QT_BEGIN_NAMESPACE
 class QLabel;
 class QModelIndex;
@@ -49,6 +51,19 @@ public:
     void setSelectionOverlay(const SelectionSnapshot &selection);
     // Clears the selection overlay and hides the Status column.
     void clearSelectionOverlay();
+
+    // The extraction scope of the current view: the keys of every row
+    // being displayed, in exact display order. Empty when no rows are
+    // visible (Empty / Loading / Error page, or a table without
+    // rows): a stale model must never feed an extraction.
+    QList<EntryKey> entryKeys() const;
+    // The key of the currently selected row, if one is visible.
+    std::optional<EntryKey> currentEntryKey() const;
+    // The path of the currently selected row, for scope labels;
+    // empty when nothing is selected.
+    QString currentEntryPath() const;
+    // Whether the table page is showing at least one row right now.
+    bool hasVisibleEntries() const;
 
 signals:
     // Emitted only for explicit row picks. A model reset that drops
