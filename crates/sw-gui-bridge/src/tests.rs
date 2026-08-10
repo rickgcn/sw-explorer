@@ -3064,3 +3064,577 @@ fn real_dist_hardware_smoke() {
         assert_eq!(alt_snapshot.conflicts.len(), alt_core.conflicts.len());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Extraction: request validation, key resolution, planning and execution
+// ---------------------------------------------------------------------------
+
+/// Writes one image archive from `(record name, payload)` pairs, in the
+/// given order (which must match the IDB order of payload entries).
+fn write_archive(root: &Path, product: &str, records: &[(&str, &[u8])]) {
+    let mut archive = b"im001V999P00\0".to_vec();
+    for (name, payload) in records {
+        archive.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        archive.extend_from_slice(name.as_bytes());
+        archive.extend_from_slice(payload);
+    }
+    std::fs::write(root.join(format!("{product}.sw")), archive).unwrap();
+}
+
+/// Writes the extraction test distribution: two IDB-only products with
+/// real image archives, plus one product without an archive.
+///
+/// * `xa` — `bin` dir, `hello.txt`, `bin/tool` x3 (IP22 / IP99 /
+///   fallback), explicitly empty `empty.txt`, `old/order.txt` naming a
+///   foreign subsystem (its payload record lives in the foreign image
+///   archive), `cshrc` with a (fake but plannable) compressed payload.
+///   Entry ids 0..=7 in IDB order.
+/// * `xb` — `world.txt`. Entry id 0. Its archive also carries the
+///   `old/order.txt` record the `xa` IDB references.
+/// * `xc` — `xc.txt`, no image archive at all.
+fn write_extraction_dist(root: &Path) {
+    write_raw_idb(
+        root,
+        "xa",
+        "d 0755 root sys bin src xa.sw.unix\n\
+         f 0644 root sys hello.txt src/hello.txt xa.sw.unix sum(1) size(5) cmpsize(0)\n\
+         f 0755 root sys bin/tool src/tool1 xa.sw.unix sum(2) size(4) cmpsize(0) mach(CPUBOARD=IP22)\n\
+         f 0755 root sys bin/tool src/tool2 xa.sw.unix sum(3) size(4) cmpsize(0) mach(CPUBOARD=IP99)\n\
+         f 0755 root sys bin/tool src/tool3 xa.sw.unix sum(4) size(4) cmpsize(0)\n\
+         f 0644 root sys empty.txt src/empty xa.sw.unix sum(5) size(0)\n\
+         f 0644 root sys old/order.txt src/old xb.sw.unix sum(6) size(4) cmpsize(0)\n\
+         f 0644 root sys cshrc src/cshrc xa.sw.unix sum(7) size(10) cmpsize(5)\n",
+    );
+    write_archive(
+        root,
+        "xa",
+        &[
+            ("hello.txt", b"hello".as_slice()),
+            ("bin/tool", b"IP22".as_slice()),
+            ("bin/tool", b"IP99".as_slice()),
+            ("bin/tool", b"FBCK".as_slice()),
+            ("cshrc", b"12345".as_slice()),
+        ],
+    );
+    write_idb(root, "xb", &[("xb.sw.unix", "world.txt")]);
+    write_archive(
+        root,
+        "xb",
+        &[
+            ("world.txt", b"world".as_slice()),
+            ("old/order.txt", b"old!".as_slice()),
+        ],
+    );
+    write_idb(root, "xc", &[("xc.sw.unix", "xc.txt")]);
+}
+
+/// Builds a Full/Auto/no-overwrite extraction request for the given
+/// (product id, entry id) pairs.
+fn extraction_request(entries: &[(u64, u64)], out: &Path) -> ffi::ExtractionRequest {
+    ffi::ExtractionRequest {
+        entries: entries
+            .iter()
+            .map(|(product_id, entry_id)| ffi::ExtractionEntryKey {
+                product_id: *product_id,
+                entry_id: *entry_id,
+            })
+            .collect(),
+        hardware: Vec::new(),
+        output_dir: out.to_str().unwrap().to_string(),
+        path_mode: ffi::ExtractionPathMode::Full,
+        relative_to: String::new(),
+        decode: ffi::ExtractionDecodeMode::Auto,
+        keep_stored: false,
+        continue_on_error: true,
+        allow_overwrite: false,
+    }
+}
+
+/// Opens a backend on the extraction test distribution.
+fn open_extraction_backend(root: &Path) -> crate::backend::Backend {
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+    *backend
+}
+
+#[test]
+fn extraction_plan_round_trips_summary() {
+    let root = temp_root("ext-plan");
+    write_extraction_dist(&root);
+    let backend = open_extraction_backend(&root);
+    let xa = product_object_id(&backend, "xa");
+
+    let out = root.join("out");
+    let summary = backend
+        .plan_extraction(&extraction_request(&[(xa, 1)], &out))
+        .unwrap();
+    assert_eq!(summary.requested_records, 1);
+    assert_eq!(summary.omitted_records, 0);
+    assert_eq!(summary.hardware_excluded_records, 0);
+    assert_eq!(summary.planned_records, 1);
+    assert_eq!(summary.output_paths, 1);
+    assert_eq!(summary.existing_outputs, 0);
+    // Planning never touches the filesystem.
+    assert!(!out.exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn extraction_resolves_keys_across_products() {
+    let root = temp_root("ext-multi");
+    write_extraction_dist(&root);
+    let backend = open_extraction_backend(&root);
+    let xa = product_object_id(&backend, "xa");
+    let xb = product_object_id(&backend, "xb");
+
+    // A "current view" mixing products: hello.txt from xa plus entry
+    // id 0 (perfectly valid) world.txt from xb.
+    let out = root.join("out");
+    let request = extraction_request(&[(xa, 1), (xb, 0)], &out);
+    let summary = backend.plan_extraction(&request).unwrap();
+    assert_eq!(summary.planned_records, 2);
+    assert_eq!(summary.output_paths, 2);
+
+    let report = backend.extract_entries(&request).unwrap();
+    assert_eq!(report.extracted, 2);
+    assert!(report.failures.is_empty());
+    assert_eq!(std::fs::read(out.join("hello.txt")).unwrap(), b"hello");
+    assert_eq!(std::fs::read(out.join("world.txt")).unwrap(), b"world");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn extraction_key_resolves_against_the_actual_owning_product() {
+    let root = temp_root("ext-owner");
+    write_extraction_dist(&root);
+    let backend = open_extraction_backend(&root);
+    let xa = product_object_id(&backend, "xa");
+
+    // old/order.txt lives in xa's IDB but names `xb.sw.unix`; it is
+    // owned by xa, and the key must resolve against xa — never against
+    // a product guessed from the record's subsystem name.
+    let detail = backend.entry_detail(xa, 6).unwrap();
+    assert_eq!(detail.path, "old/order.txt");
+    let out = root.join("out");
+    let summary = backend
+        .plan_extraction(&extraction_request(&[(xa, 6)], &out))
+        .unwrap();
+    assert_eq!(summary.planned_records, 1);
+    let report = backend
+        .extract_entries(&extraction_request(&[(xa, 6)], &out))
+        .unwrap();
+    assert_eq!(report.extracted, 1);
+    assert_eq!(std::fs::read(out.join("old/order.txt")).unwrap(), b"old!");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn extraction_duplicate_key_refused() {
+    let root = temp_root("ext-dup");
+    write_extraction_dist(&root);
+    let backend = open_extraction_backend(&root);
+    let xa = product_object_id(&backend, "xa");
+
+    let error = backend
+        .plan_extraction(&extraction_request(&[(xa, 1), (xa, 1)], &root.join("out")))
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("duplicate entry key"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn extraction_same_path_under_different_keys_is_legal() {
+    let root = temp_root("ext-variants");
+    write_extraction_dist(&root);
+    let backend = open_extraction_backend(&root);
+    let xa = product_object_id(&backend, "xa");
+
+    // The three bin/tool variants share one path under three different
+    // keys; the profile selects exactly one of them.
+    let mut request = extraction_request(&[(xa, 2), (xa, 3), (xa, 4)], &root.join("out"));
+    request.hardware = vec![hw("CPUBOARD", "IP22")];
+    let summary = backend.plan_extraction(&request).unwrap();
+    assert_eq!(summary.requested_records, 3);
+    assert_eq!(summary.hardware_excluded_records, 2);
+    assert_eq!(summary.planned_records, 1);
+    assert_eq!(summary.output_paths, 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn extraction_rejects_bad_keys() {
+    let root = temp_root("ext-badkey");
+    write_extraction_dist(&root);
+    let backend = open_extraction_backend(&root);
+    let xa = product_object_id(&backend, "xa");
+
+    // Object id 0 is never valid.
+    let error = backend
+        .plan_extraction(&extraction_request(&[(0, 1)], &root.join("out")))
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("object id 0"));
+
+    // Unknown object id.
+    let error = backend
+        .plan_extraction(&extraction_request(&[(999, 1)], &root.join("out")))
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("does not exist"));
+
+    // A product id pointing at an image instead.
+    let image_id = backend
+        .hierarchy()
+        .unwrap()
+        .iter()
+        .find(|node| matches!(node.kind, ffi::ObjectKind::Image))
+        .map(|node| node.id)
+        .unwrap();
+    let error = backend
+        .plan_extraction(&extraction_request(&[(image_id, 1)], &root.join("out")))
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("does not identify a product"));
+
+    // Entry id out of range.
+    let error = backend
+        .plan_extraction(&extraction_request(&[(xa, 999)], &root.join("out")))
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("does not exist"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn extraction_rejects_an_empty_scope() {
+    let root = temp_root("ext-empty");
+    write_extraction_dist(&root);
+    let backend = open_extraction_backend(&root);
+
+    let error = backend
+        .plan_extraction(&extraction_request(&[], &root.join("out")))
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), "no entries requested");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn extraction_validates_the_output_directory() {
+    let root = temp_root("ext-outdir");
+    write_extraction_dist(&root);
+    let backend = open_extraction_backend(&root);
+    let xa = product_object_id(&backend, "xa");
+
+    // Empty output directory.
+    let mut request = extraction_request(&[(xa, 1)], &root.join("out"));
+    request.output_dir = String::new();
+    let error = backend.plan_extraction(&request).err().unwrap();
+    assert_eq!(error.to_string(), "output directory is empty");
+
+    // A relative host path is never accepted.
+    request.output_dir = "relative/out".to_string();
+    let error = backend.plan_extraction(&request).err().unwrap();
+    assert!(error.to_string().contains("not an absolute host path"));
+
+    // A nonexistent absolute directory is legitimate and is not
+    // created by planning.
+    let out = root.join("does-not-exist-yet");
+    let request = extraction_request(&[(xa, 1)], &out);
+    backend.plan_extraction(&request).unwrap();
+    assert!(!out.exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn extraction_relative_to_prefix_is_validated_by_the_core_parser() {
+    let root = temp_root("ext-relto");
+    write_extraction_dist(&root);
+    let backend = open_extraction_backend(&root);
+    let xa = product_object_id(&backend, "xa");
+
+    // Full mode ignores the prefix field entirely.
+    let mut request = extraction_request(&[(xa, 1)], &root.join("out"));
+    request.relative_to = "not a prefix: ../escape".to_string();
+    backend.plan_extraction(&request).unwrap();
+
+    // RelativeTo mode hands the prefix to the authoritative parser,
+    // which rejects escapes above the root.
+    request.path_mode = ffi::ExtractionPathMode::RelativeTo;
+    request.relative_to = "../escape".to_string();
+    let error = backend.plan_extraction(&request).err().unwrap();
+    assert!(error.to_string().contains("invalid relative-to prefix"));
+
+    // A valid prefix strips cleanly: bin/tool becomes tool. A single
+    // variant scope is unambiguous even without a profile.
+    let mut request = extraction_request(&[(xa, 4)], &root.join("out"));
+    request.path_mode = ffi::ExtractionPathMode::RelativeTo;
+    request.relative_to = "bin".to_string();
+    let summary = backend.plan_extraction(&request).unwrap();
+    assert_eq!(summary.planned_records, 1);
+    assert_eq!(summary.output_paths, 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn extraction_decode_and_option_conversion() {
+    let root = temp_root("ext-options");
+    write_extraction_dist(&root);
+    let backend = open_extraction_backend(&root);
+    let xa = product_object_id(&backend, "xa");
+
+    // Auto decode of a compressed payload: one output path; with
+    // keep_stored the `.Z` sidecar adds a second one.
+    let request = extraction_request(&[(xa, 7)], &root.join("out"));
+    let summary = backend.plan_extraction(&request).unwrap();
+    assert_eq!(summary.output_paths, 1);
+    let mut request = extraction_request(&[(xa, 7)], &root.join("out"));
+    request.keep_stored = true;
+    let summary = backend.plan_extraction(&request).unwrap();
+    assert_eq!(summary.output_paths, 2);
+
+    // Never decode: the stored bytes go to `cshrc.Z` only.
+    let mut request = extraction_request(&[(xa, 7)], &root.join("out"));
+    request.decode = ffi::ExtractionDecodeMode::Never;
+    let summary = backend.plan_extraction(&request).unwrap();
+    assert_eq!(summary.output_paths, 1);
+
+    // Flat mode drops directories: bin/tool lands at out/tool.
+    let mut request = extraction_request(&[(xa, 4)], &root.join("out"));
+    request.path_mode = ffi::ExtractionPathMode::Flat;
+    let out = root.join("out");
+    request.output_dir = out.to_str().unwrap().to_string();
+    backend.plan_extraction(&request).unwrap();
+    let report = backend.extract_entries(&request).unwrap();
+    assert_eq!(report.extracted, 1);
+    assert_eq!(std::fs::read(out.join("tool")).unwrap(), b"FBCK");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn extraction_hardware_pairs_validation() {
+    let root = temp_root("ext-hw");
+    write_extraction_dist(&root);
+    let backend = open_extraction_backend(&root);
+    let xa = product_object_id(&backend, "xa");
+
+    // An empty attribute name is malformed.
+    let mut request = extraction_request(&[(xa, 1)], &root.join("out"));
+    request.hardware = vec![hw("", "IP22")];
+    let error = backend.plan_extraction(&request).err().unwrap();
+    assert_eq!(error.to_string(), "hardware attribute name is empty");
+
+    // An empty value is a genuine fact (`GFXBOARD=`).
+    request.hardware = vec![hw("CPUBOARD", "IP22"), hw("GFXBOARD", "")];
+    backend.plan_extraction(&request).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn extraction_refuse_and_allow_overwrite_policies() {
+    let root = temp_root("ext-overwrite");
+    write_extraction_dist(&root);
+    let backend = open_extraction_backend(&root);
+    let xa = product_object_id(&backend, "xa");
+
+    let out = root.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("hello.txt"), b"KEEP").unwrap();
+
+    // The GUI default refuses overwrites, before any write.
+    let request = extraction_request(&[(xa, 1)], &out);
+    let error = backend.plan_extraction(&request).err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("extraction would overwrite existing files")
+    );
+    assert_eq!(std::fs::read(out.join("hello.txt")).unwrap(), b"KEEP");
+
+    // An explicit opt-in allows overwriting existing regular files and
+    // reports them in the plan.
+    let mut request = extraction_request(&[(xa, 1)], &out);
+    request.allow_overwrite = true;
+    let summary = backend.plan_extraction(&request).unwrap();
+    assert_eq!(summary.existing_outputs, 1);
+    let report = backend.extract_entries(&request).unwrap();
+    assert_eq!(report.extracted, 1);
+    assert_eq!(std::fs::read(out.join("hello.txt")).unwrap(), b"hello");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn extraction_runtime_failures_are_report_data_not_errors() {
+    let root = temp_root("ext-runtime");
+    write_extraction_dist(&root);
+    let backend = open_extraction_backend(&root);
+    let xa = product_object_id(&backend, "xa");
+    let xb = product_object_id(&backend, "xb");
+
+    // The distribution is committed; then xb's archive disappears, so
+    // world.txt fails at read time — a runtime failure, not a refusal.
+    std::fs::remove_file(root.join("xb.sw")).unwrap();
+    let request = extraction_request(&[(xa, 1), (xb, 0)], &root.join("out"));
+    let report = backend.extract_entries(&request).unwrap();
+    assert_eq!(report.extracted, 1);
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].path, "world.txt");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn extraction_report_conversion_surfaces_recoveries() {
+    use sw_core::extract::{ExtractFailure, ExtractRecovery, ExtractReport};
+    use sw_core::image::PayloadResolution;
+
+    let report = ExtractReport {
+        extracted: 2,
+        skipped: 1,
+        failures: vec![ExtractFailure {
+            path: "bad".to_string(),
+            message: "broken".to_string(),
+        }],
+        recoveries: vec![
+            ExtractRecovery {
+                path: "delta".to_string(),
+                expected_record_offset: Some(0x1234),
+                actual_record_offset: 0x1240,
+                resolution: PayloadResolution::Delta { delta: 12 },
+            },
+            ExtractRecovery {
+                path: "resync".to_string(),
+                expected_record_offset: None,
+                actual_record_offset: 7,
+                resolution: PayloadResolution::Resynced { delta: None },
+            },
+            ExtractRecovery {
+                path: "scan".to_string(),
+                expected_record_offset: Some(1),
+                actual_record_offset: 2,
+                resolution: PayloadResolution::Scanned,
+            },
+            ExtractRecovery {
+                // Never a recovery: exact reads are not reported.
+                path: "exact".to_string(),
+                expected_record_offset: None,
+                actual_record_offset: 0,
+                resolution: PayloadResolution::Exact,
+            },
+        ],
+    };
+    let detail = crate::extraction::report_detail(report);
+    assert_eq!(detail.extracted, 2);
+    assert_eq!(detail.skipped, 1);
+    assert_eq!(detail.failures.len(), 1);
+    assert_eq!(detail.failures[0].message, "broken");
+    assert_eq!(detail.recoveries.len(), 3);
+
+    let delta = &detail.recoveries[0];
+    assert_eq!(delta.path, "delta");
+    assert!(delta.expected_known);
+    assert_eq!(delta.expected_offset, 0x1234);
+    assert_eq!(delta.actual_offset, 0x1240);
+    assert!(matches!(delta.kind, ffi::ExtractionRecoveryKind::Delta));
+    assert!(delta.delta_known);
+    assert_eq!(delta.delta, 12);
+
+    let resync = &detail.recoveries[1];
+    assert!(!resync.expected_known);
+    assert!(matches!(resync.kind, ffi::ExtractionRecoveryKind::Resynced));
+    assert!(!resync.delta_known);
+
+    let scan = &detail.recoveries[2];
+    assert!(matches!(scan.kind, ffi::ExtractionRecoveryKind::Scanned));
+}
+
+#[test]
+fn extraction_matches_the_core_planner_exactly() {
+    let root = temp_root("ext-crosscheck");
+    write_extraction_dist(&root);
+    let backend = open_extraction_backend(&root);
+    let xa = product_object_id(&backend, "xa");
+
+    // The same scope, options and profile through the bridge and
+    // through the core directly must agree on every summary count:
+    // frontend safety semantics never drift apart.
+    let mut request = extraction_request(&[(xa, 1), (xa, 2), (xa, 3), (xa, 4)], &root.join("out"));
+    request.hardware = vec![hw("CPUBOARD", "IP22")];
+    let bridge_summary = backend.plan_extraction(&request).unwrap();
+
+    let distribution = sw_core::distribution::Distribution::open(&root).unwrap();
+    let product = distribution.product("xa").unwrap();
+    let requested: Vec<&sw_core::idb::Entry> = product.entries.iter().skip(1).take(4).collect();
+    let profile = HardwareProfile::builder().add("CPUBOARD", "IP22").build();
+    let options = sw_core::extract::ExtractOptions {
+        existing_output: sw_core::extract::ExistingOutputPolicy::Refuse,
+        ..sw_core::extract::ExtractOptions::default()
+    };
+    let core_plan = sw_core::plan::plan_extraction(
+        &distribution,
+        &requested,
+        &root.join("out"),
+        &options,
+        Some(&profile),
+    )
+    .unwrap();
+
+    assert_eq!(
+        bridge_summary.requested_records,
+        core_plan.summary.requested_records as u64
+    );
+    assert_eq!(
+        bridge_summary.omitted_records,
+        core_plan.summary.omitted_records as u64
+    );
+    assert_eq!(
+        bridge_summary.hardware_excluded_records,
+        core_plan.summary.hardware_excluded_records as u64
+    );
+    assert_eq!(
+        bridge_summary.planned_records,
+        core_plan.summary.planned_records as u64
+    );
+    assert_eq!(
+        bridge_summary.output_paths,
+        core_plan.summary.output_paths as u64
+    );
+    assert_eq!(
+        bridge_summary.existing_outputs,
+        core_plan.summary.existing_outputs as u64
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn extraction_real_dist_smoke() {
+    let Some(path) = std::env::var_os("SW_EXPLORER_TEST_DIST") else {
+        eprintln!("SW_EXPLORER_TEST_DIST not set; skipping real-dist extraction smoke");
+        return;
+    };
+    let mut backend = new_backend();
+    backend.open_distribution(path.to_str().unwrap()).unwrap();
+
+    // Find the first product with entries and take its first row key,
+    // exactly as a current-view scope would.
+    let hierarchy = backend.hierarchy().unwrap();
+    let product_id = hierarchy
+        .iter()
+        .find(|node| matches!(node.kind, ffi::ObjectKind::Product) && node.entry_count > 0)
+        .map(|node| node.id)
+        .expect("a product with entries");
+    let rows = backend.entries(product_id).unwrap();
+    let out = temp_root("ext-real-out");
+    let mut planned = None;
+    for row in rows.iter().take(50) {
+        let request = extraction_request(&[(row.product_id, row.entry_id)], &out);
+        if let Ok(summary) = backend.plan_extraction(&request) {
+            planned = Some(summary);
+            break;
+        }
+    }
+    let summary = planned.expect("a real distribution offers a plannable entry");
+    assert_eq!(summary.planned_records, 1);
+    assert_eq!(summary.requested_records, 1);
+    let _ = std::fs::remove_dir_all(&out);
+}

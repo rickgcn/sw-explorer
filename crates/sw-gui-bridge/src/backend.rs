@@ -11,6 +11,7 @@
 use crate::bridge::ffi;
 use crate::detail;
 use crate::entry;
+use crate::extraction;
 use crate::hardware;
 use sw_core::distribution::Distribution;
 use sw_core::idb::{Entry, EntryId};
@@ -87,6 +88,35 @@ impl std::fmt::Display for SelectionError {
 }
 
 impl std::error::Error for SelectionError {}
+
+/// Error for extraction planning and execution: no distribution
+/// loaded, an invalid request (empty scope, duplicate or unresolvable
+/// entry keys, a non-absolute output directory, an invalid `relative_to`
+/// prefix, an empty hardware attribute name), or a planner refusal.
+#[derive(Debug)]
+pub(crate) struct ExtractionError(String);
+
+impl std::fmt::Display for ExtractionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ExtractionError {}
+
+/// Everything an extraction request resolves to: the concrete entries,
+/// the validated options, the output directory and the hardware
+/// profile.
+struct ResolvedExtraction<'a> {
+    /// Entries to extract, resolved against their owning products.
+    entries: Vec<&'a Entry>,
+    /// Validated core extraction options.
+    options: sw_core::extract::ExtractOptions,
+    /// Absolute output directory.
+    out_dir: std::path::PathBuf,
+    /// The hardware profile, or none.
+    profile: Option<HardwareProfile>,
+}
 
 /// Rust-side backend state behind the opaque CXX handle.
 pub(crate) struct Backend {
@@ -482,5 +512,122 @@ impl Backend {
             .entry_owner_map(distribution)
             .map_err(|error| SelectionError(error.to_string()))?;
         hardware::selection_snapshot(&selection, &owners).map_err(SelectionError)
+    }
+
+    /// Resolves the entry keys of an extraction request against the
+    /// loaded distribution. Each key resolves directly in the product
+    /// its object id identifies — the owning product, never a product
+    /// guessed from the record's subsystem name. Exact duplicates are
+    /// rejected; the same path under different keys is legitimate.
+    fn resolve_entries<'a>(
+        &self,
+        distribution: &'a Distribution,
+        request: &ffi::ExtractionRequest,
+    ) -> Result<Vec<&'a Entry>, ExtractionError> {
+        if request.entries.is_empty() {
+            return Err(ExtractionError("no entries requested".to_string()));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut entries = Vec::with_capacity(request.entries.len());
+        for key in &request.entries {
+            if !seen.insert((key.product_id, key.entry_id)) {
+                return Err(ExtractionError(format!(
+                    "duplicate entry key {}:{}",
+                    key.product_id, key.entry_id
+                )));
+            }
+            let (reference, _) = self
+                .resolve_object(key.product_id)
+                .map_err(|error| ExtractionError(error.to_string()))?;
+            let ObjectRef::Product(product_index) = *reference else {
+                return Err(ExtractionError(format!(
+                    "object {} does not identify a product",
+                    key.product_id
+                )));
+            };
+            let product = &distribution.products()[product_index];
+            // Checked conversion first, then a bounds-checked lookup;
+            // entry id 0 is a perfectly valid first entry.
+            let index = usize::try_from(key.entry_id).map_err(|_| {
+                ExtractionError(format!(
+                    "entry id {} does not exist in product {}",
+                    key.entry_id,
+                    product.name.as_str()
+                ))
+            })?;
+            let entry = product.entry(EntryId(index)).ok_or_else(|| {
+                ExtractionError(format!(
+                    "entry id {} does not exist in product {}",
+                    key.entry_id,
+                    product.name.as_str()
+                ))
+            })?;
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    /// Everything an extraction request resolves to: the concrete
+    /// entries, the validated options, the output directory and the
+    /// hardware profile.
+    fn resolve_extraction<'a>(
+        &self,
+        distribution: &'a Distribution,
+        request: &ffi::ExtractionRequest,
+    ) -> Result<ResolvedExtraction<'a>, ExtractionError> {
+        let entries = self.resolve_entries(distribution, request)?;
+        let (options, out_dir) = extraction::extract_options(request).map_err(ExtractionError)?;
+        let profile = extraction::hardware_profile(request).map_err(ExtractionError)?;
+        Ok(ResolvedExtraction {
+            entries,
+            options,
+            out_dir,
+            profile,
+        })
+    }
+
+    pub(crate) fn plan_extraction(
+        &self,
+        request: &ffi::ExtractionRequest,
+    ) -> Result<ffi::ExtractionPlanSummary, ExtractionError> {
+        let distribution = self
+            .distribution
+            .as_ref()
+            .ok_or_else(|| ExtractionError("no distribution loaded".to_string()))?;
+        let resolved = self.resolve_extraction(distribution, request)?;
+        // All safety semantics come from the shared core planner; the
+        // bridge only resolves keys and converts the summary.
+        let plan = sw_core::plan::plan_extraction(
+            distribution,
+            &resolved.entries,
+            &resolved.out_dir,
+            &resolved.options,
+            resolved.profile.as_ref(),
+        )
+        .map_err(|error| ExtractionError(error.to_string()))?;
+        Ok(extraction::plan_summary(plan.summary))
+    }
+
+    pub(crate) fn extract_entries(
+        &self,
+        request: &ffi::ExtractionRequest,
+    ) -> Result<ffi::ExtractionReportDetail, ExtractionError> {
+        let distribution = self
+            .distribution
+            .as_ref()
+            .ok_or_else(|| ExtractionError("no distribution loaded".to_string()))?;
+        let resolved = self.resolve_extraction(distribution, request)?;
+        // Checked execution re-plans immediately before writing; a
+        // refusal means zero writes, and individual runtime failures
+        // arrive as report data.
+        let checked = sw_core::plan::extract_checked(
+            distribution,
+            &resolved.entries,
+            &resolved.out_dir,
+            &resolved.options,
+            resolved.profile.as_ref(),
+        )
+        .map_err(|error| ExtractionError(error.to_string()))?;
+        Ok(extraction::report_detail(checked.report))
     }
 }

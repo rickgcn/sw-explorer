@@ -521,6 +521,140 @@ pub(crate) mod ffi {
         conflicts: Vec<SelectionConflictDetail>,
     }
 
+    /// How entry paths are mapped below the output directory.
+    enum ExtractionPathMode {
+        /// Rebuild the full IRIX hierarchy.
+        Full,
+        /// Write every entry directly into the output directory.
+        Flat,
+        /// Strip the `relative_to` prefix from entry paths.
+        RelativeTo,
+    }
+
+    /// Whether compressed payloads are decoded during extraction.
+    enum ExtractionDecodeMode {
+        /// Decode `.Z` payloads to their plain contents.
+        Auto,
+        /// Write payloads exactly as stored.
+        Never,
+    }
+
+    /// The backend identity of one entry to extract: the object id of
+    /// the product whose entry list actually holds the record, plus the
+    /// sw-core entry id inside that product. Never re-derived from a
+    /// row, a path or a subsystem name.
+    struct ExtractionEntryKey {
+        /// Object id of the owning product.
+        product_id: u64,
+        /// The sw-core entry id; zero is a perfectly valid id.
+        entry_id: u64,
+    }
+
+    /// Everything one extraction needs, for both preflight planning and
+    /// execution. The scope arrives as concrete entry keys — the bridge
+    /// knows nothing about hierarchy scopes, search modes or selection
+    /// overlays.
+    struct ExtractionRequest {
+        /// The entries to extract, in display order.
+        entries: Vec<ExtractionEntryKey>,
+        /// The hardware profile to apply, as attribute/value pairs; an
+        /// empty list means no profile. An empty attribute name is
+        /// rejected; an empty value is a genuine fact (`GFXBOARD=`).
+        hardware: Vec<HardwareValue>,
+        /// The output directory; must be an absolute host path and need
+        /// not exist yet.
+        output_dir: String,
+        /// How entry paths are mapped below the output directory.
+        path_mode: ExtractionPathMode,
+        /// The prefix for `RelativeTo`; ignored by the other modes.
+        relative_to: String,
+        /// Whether compressed payloads are decoded.
+        decode: ExtractionDecodeMode,
+        /// With `Auto`, additionally write the stored `.Z` bytes.
+        keep_stored: bool,
+        /// Continue past individual failures instead of aborting.
+        continue_on_error: bool,
+        /// Allow overwriting existing regular files. Symbolic links,
+        /// directories and special files are never treated as
+        /// overwriteable regular files regardless of this flag.
+        allow_overwrite: bool,
+    }
+
+    /// Counts describing a confirmed extraction plan, for user
+    /// confirmation. The planned entries themselves never cross the
+    /// bridge; execution always re-plans from the request.
+    struct ExtractionPlanSummary {
+        /// Entries the frontend handed to the planner.
+        requested_records: u64,
+        /// Entries that deliberately produce no output (path-mode
+        /// exclusions, devices, FIFOs, symbolic links without a
+        /// recorded target).
+        omitted_records: u64,
+        /// Entries that would produce output but were excluded by the
+        /// hardware profile selection. Zero without a profile.
+        hardware_excluded_records: u64,
+        /// Entries that will be handed to the extraction.
+        planned_records: u64,
+        /// Projected output paths of the planned entries.
+        output_paths: u64,
+        /// Existing regular files that will be overwritten with
+        /// `allow_overwrite`.
+        existing_outputs: u64,
+    }
+
+    /// A single entry that failed to extract.
+    struct ExtractionFailureDetail {
+        /// Entry path.
+        path: String,
+        /// What went wrong.
+        message: String,
+    }
+
+    /// How a payload record was located when it was not at its expected
+    /// offset. `Exact` never appears here: exact reads are not
+    /// recoveries.
+    enum ExtractionRecoveryKind {
+        /// Found at a known offset delta.
+        Delta,
+        /// Found by resynchronizing the archive walk.
+        Resynced,
+        /// Found by scanning the archive.
+        Scanned,
+    }
+
+    /// A payload that was not found exactly at its expected offset: an
+    /// honest success the user must see, not a silent one.
+    struct ExtractionRecoveryDetail {
+        /// Entry path.
+        path: String,
+        /// Whether an expected record offset is known.
+        expected_known: bool,
+        /// Expected record offset; valid only when `expected_known`.
+        expected_offset: u64,
+        /// Offset the record was actually found at.
+        actual_offset: u64,
+        /// How the record was located.
+        kind: ExtractionRecoveryKind,
+        /// Whether a delta is known.
+        delta_known: bool,
+        /// Offset delta; valid only when `delta_known`.
+        delta: i64,
+    }
+
+    /// The outcome of an executed extraction. Individual failures are
+    /// data, not errors: a refusal (the plan rejected the extraction
+    /// before any write) is the method error instead.
+    struct ExtractionReportDetail {
+        /// Entries successfully written.
+        extracted: u64,
+        /// Entries deliberately not written.
+        skipped: u64,
+        /// Entries that failed.
+        failures: Vec<ExtractionFailureDetail>,
+        /// Payloads that needed recovery to be located.
+        recoveries: Vec<ExtractionRecoveryDetail>,
+    }
+
     extern "Rust" {
         /// Opaque handle to the Rust backend state.
         type Backend;
@@ -631,5 +765,39 @@ pub(crate) mod ffi {
         ///
         /// Fails when no distribution is loaded.
         fn select_entries(self: &Backend, values: Vec<HardwareValue>) -> Result<SelectionSnapshot>;
+
+        /// Plans an extraction without touching the filesystem.
+        ///
+        /// Every check — hardware selection, ambiguity, output
+        /// collisions, output topology, existing ancestors and existing
+        /// outputs — comes from the shared `sw-core` planner; the
+        /// bridge only resolves entry keys and converts the summary.
+        /// Planning never creates or modifies anything, including the
+        /// output directory itself.
+        ///
+        /// Fails when no distribution is loaded; when the request has
+        /// no entries, a duplicate entry key, a key whose product id is
+        /// zero, unknown or not a product, or an entry id out of range;
+        /// when the output directory is empty or not absolute; when the
+        /// `relative_to` prefix is not a valid IRIX path; when a
+        /// hardware attribute name is empty; or when the planner
+        /// refuses the extraction.
+        fn plan_extraction(
+            self: &Backend,
+            request: &ExtractionRequest,
+        ) -> Result<ExtractionPlanSummary>;
+
+        /// Executes an extraction.
+        ///
+        /// The plan is recomputed inside, immediately before writing;
+        /// a refusal here means zero files were written by this call.
+        /// Runtime failures of individual entries are reported through
+        /// the returned report, not as errors.
+        ///
+        /// Fails under the same conditions as `plan_extraction`.
+        fn extract_entries(
+            self: &Backend,
+            request: &ExtractionRequest,
+        ) -> Result<ExtractionReportDetail>;
     }
 }

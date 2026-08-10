@@ -17,10 +17,14 @@
 //! * `hardware` extracts hardware attribute candidates from the loaded
 //!   distribution and converts `sw-core` entry selections into the
 //!   selection DTOs declared by `bridge`.
+//! * `extraction` converts extraction requests into `sw-core` options
+//!   and profiles, and `sw-core` plan/report results into the
+//!   extraction DTOs declared by `bridge`.
 mod backend;
 mod bridge;
 mod detail;
 mod entry;
+mod extraction;
 mod hardware;
 #[cfg(test)]
 mod tests;
