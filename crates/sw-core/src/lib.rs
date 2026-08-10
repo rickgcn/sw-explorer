@@ -49,5 +49,6 @@ pub mod image;
 pub mod mach;
 pub mod names;
 pub mod path;
+pub mod plan;
 pub mod query;
 pub mod selection;

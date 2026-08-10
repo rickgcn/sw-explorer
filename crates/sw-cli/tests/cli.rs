@@ -151,6 +151,9 @@ fn write_archive(path: &Path, records: &[(&[u8], &[u8])]) {
 ///   extraction of the product is statically known to fail.
 /// * `mv` — like `miss`, but the payload-less entry only applies to
 ///   IP30, so a `--mach IP22` extraction must not be blocked by it.
+/// * `topo` — a regular file `blk` that is also the ancestor of
+///   `blk/inner`, and a symbolic link `linkdir` that is the ancestor of
+///   `linkdir/inner`: the shared planner's output-topology gate.
 fn build_dist() -> PathBuf {
     let root = temp_dir("dist");
 
@@ -288,6 +291,26 @@ f 0644 root sys bad.txt src/bad miss.sw.unix sum(2) size(3)\n",
         root.join("mv.idb"),
         "f 0644 root sys good.txt src/good mv.sw.unix sum(1) size(4) cmpsize(0) mach(CPUBOARD=IP22)\n\
 f 0644 root sys bad.txt src/bad mv.sw.unix sum(2) size(3) mach(CPUBOARD=IP30)\n",
+    )
+    .unwrap();
+
+    write_archive(
+        &root.join("topo.sw"),
+        &[
+            (b"blk", b"blk!".as_slice()),
+            (b"blk/inner", b"inner".as_slice()),
+            (b"linkdir/inner", b"linne".as_slice()),
+        ],
+    );
+    std::fs::write(root.join("topo"), descriptor_bytes("topo", false, &[])).unwrap();
+    // A regular file that is also the ancestor of another output, and a
+    // symbolic link that is one: the shared planner's topology gate.
+    std::fs::write(
+        root.join("topo.idb"),
+        "f 0644 root sys blk src/blk topo.sw.unix sum(1) size(4) cmpsize(0)\n\
+f 0644 root sys blk/inner src/inner topo.sw.unix sum(2) size(5) cmpsize(0)\n\
+l 0777 root sys linkdir src topo.sw.unix symval(/tmp/outside)\n\
+f 0644 root sys linkdir/inner src/linner topo.sw.unix sum(3) size(5) cmpsize(0)\n",
     )
     .unwrap();
 
@@ -503,7 +526,7 @@ fn select_specific_beats_fallback() {
     let (code, stdout, _) = run(sw(&dist).args(["select", "--mach", "IP22", "--list"]));
     assert_eq!(code, 0);
     assert!(stdout.contains("Hardware profile:\n  CPUBOARD = IP22"));
-    assert!(stdout.contains("Selected entries: 23"), "{stdout}");
+    assert!(stdout.contains("Selected entries: 27"), "{stdout}");
     // `broken` (unparsable mach) and `bin/side` (unresolvable subsystem
     // applicability) can never be selected.
     assert!(stdout.contains("Conflicts:        2"));
@@ -827,7 +850,9 @@ fn extract_refuses_multiple_variants_without_mach() {
     assert_eq!(code, 1);
     assert!(stderr.contains("extraction is ambiguous"));
     assert!(stderr.contains("bin/tool has multiple applicable variants."));
-    assert!(stderr.contains("Specify a hardware profile using --mach."));
+    // The hint comes from the shared sw-core planner, which is
+    // frontend-neutral: the CLI's `--mach` flag is not named in it.
+    assert!(stderr.contains("Specify a hardware profile."));
     assert!(!out.join("bin").exists());
 }
 
@@ -887,6 +912,66 @@ fn extract_refuses_unresolvable_subsystem_applicability() {
         assert!(stderr.contains("ambiguous"));
         assert!(!out.join("bin").exists());
     }
+}
+
+#[test]
+fn extract_refuses_non_directory_planned_ancestor() {
+    let dist = build_dist();
+    let out = temp_dir("out");
+    let (code, _, stderr) = run(sw(&dist).args(["extract", "--path", "blk", "-o"]).arg(&out));
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("write through a non-directory output"),
+        "{stderr}"
+    );
+    assert!(!out.join("blk").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn extract_refuses_planned_symlink_ancestor() {
+    let dist = build_dist();
+    let out = temp_dir("out");
+    let (code, _, stderr) = run(sw(&dist)
+        .args(["extract", "--path", "linkdir", "-o"])
+        .arg(&out));
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("write through a non-directory output"),
+        "{stderr}"
+    );
+    assert!(!out.join("linkdir").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn extract_refuses_existing_symlink_target() {
+    let dist = build_dist();
+    let out = temp_dir("out");
+    std::fs::create_dir_all(out.join("bin")).unwrap();
+    std::os::unix::fs::symlink("/tmp/elsewhere", out.join("bin/clean.txt")).unwrap();
+    let (code, _, stderr) = run(sw(&dist)
+        .args(["extract", "--product", "clean", "-o"])
+        .arg(&out));
+    assert_eq!(code, 1);
+    // A naive overwrite would follow the link outside the output root.
+    assert!(stderr.contains("existing symbolic link"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn extract_refuses_output_root_that_is_a_file() {
+    let dist = build_dist();
+    let out = temp_dir("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let file = out.join("not-a-dir");
+    std::fs::write(&file, b"x").unwrap();
+    let (code, _, stderr) = run(sw(&dist)
+        .args(["extract", "--product", "clean", "-o"])
+        .arg(&file));
+    assert_eq!(code, 1);
+    assert!(stderr.contains("is not a directory"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&out);
 }
 
 #[test]

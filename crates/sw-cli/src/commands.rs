@@ -6,17 +6,17 @@
 use crate::cli::{Cli, Command, ExtractArgs, FindArgs, SelectArgs, ShowArgs, TreeArgs};
 use crate::output;
 use anyhow::{Context, Result, anyhow, bail};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
 use sw_core::descriptor::model::Subsystem;
 use sw_core::diagnostic::{Diagnostic, Severity};
 use sw_core::distribution::{Distribution, Product};
 use sw_core::error::Error as CoreError;
-use sw_core::extract::{self, DecodeMode, ExtractOptions, PathMode};
-use sw_core::idb::{Entry, FileType};
+use sw_core::extract::{DecodeMode, ExistingOutputPolicy, ExtractOptions, PathMode};
+use sw_core::idb::Entry;
 use sw_core::image::Image;
 use sw_core::mach::eval::HardwareProfile;
+use sw_core::plan;
 use sw_core::query::Query;
 use sw_core::selection::SelectionConflict;
 
@@ -271,150 +271,6 @@ fn resolve_scope<'a>(dist: &'a Distribution, args: &ExtractArgs) -> Result<Vec<&
     unreachable!("the argument parser requires exactly one scope");
 }
 
-/// The fail-safe gate every extraction goes through.
-///
-/// Extraction writes to the host filesystem, so unlike `find` (which may
-/// show ambiguities) it must refuse to run whenever the entries to write
-/// cannot be determined unambiguously.
-fn gate_extraction<'a>(
-    dist: &'a Distribution,
-    entries: Vec<&'a Entry>,
-    mach: &[String],
-) -> Result<Vec<&'a Entry>> {
-    if mach.is_empty() {
-        gate_without_profile(dist, entries)
-    } else {
-        gate_with_profile(dist, entries, mach)
-    }
-}
-
-/// With a hardware profile, the hierarchical selection decides; any
-/// conflict or unresolved applicability touching the scope refuses the
-/// whole extraction.
-fn gate_with_profile<'a>(
-    dist: &'a Distribution,
-    entries: Vec<&'a Entry>,
-    mach: &[String],
-) -> Result<Vec<&'a Entry>> {
-    let (_pairs, profile) = parse_mach(mach)?;
-    let selection = dist.select(&profile);
-    let scope: HashSet<(String, usize)> = entries.iter().map(|entry| entry_key(entry)).collect();
-    let conflicts: Vec<&SelectionConflict> = selection
-        .conflicts
-        .iter()
-        .filter(|conflict| {
-            conflict
-                .candidates
-                .iter()
-                .any(|entry| scope.contains(&entry_key(entry)))
-        })
-        .collect();
-    if !conflicts.is_empty() {
-        eprintln!("extraction refused; conflict(s) affect the requested entries:\n");
-        eprint!("{}", output::conflict_report(&conflicts));
-        bail!("extraction is ambiguous; no files were written");
-    }
-    let selected: HashSet<(String, usize)> = selection
-        .selected
-        .iter()
-        .map(|entry| entry_key(entry))
-        .collect();
-    Ok(entries
-        .into_iter()
-        .filter(|entry| selected.contains(&entry_key(entry)))
-        .collect())
-}
-
-/// Without a hardware profile no expression can be evaluated, so the
-/// only safe scopes are those with a single variant per path and no
-/// unresolvable applicability anywhere.
-///
-/// Duplicate directory entries are not ambiguity: several subsystems
-/// legitimately create the same directory, matching the collision
-/// preflight's dir/dir exemption.
-fn gate_without_profile<'a>(
-    dist: &'a Distribution,
-    entries: Vec<&'a Entry>,
-) -> Result<Vec<&'a Entry>> {
-    let mut by_path: BTreeMap<&str, Vec<&Entry>> = BTreeMap::new();
-    for entry in &entries {
-        by_path.entry(entry.path.as_str()).or_default().push(entry);
-    }
-    let ambiguous: Vec<&str> = by_path
-        .iter()
-        .filter(|(_, group)| {
-            group.len() > 1
-                && group
-                    .iter()
-                    .any(|entry| entry.file_type != FileType::Directory)
-        })
-        .map(|(path, _)| *path)
-        .collect();
-    let unparsed: Vec<&str> = entries
-        .iter()
-        .filter(|entry| entry.has_unparsed_mach())
-        .map(|entry| entry.path.as_str())
-        .collect();
-    let unresolved = unresolved_subsystems(dist);
-    let unknown: Vec<&str> = entries
-        .iter()
-        .filter(|entry| unresolved.contains(entry.subsystem.to_string().as_str()))
-        .map(|entry| entry.path.as_str())
-        .collect();
-
-    if ambiguous.is_empty() && unparsed.is_empty() && unknown.is_empty() {
-        return Ok(entries);
-    }
-    let mut message = String::from("extraction is ambiguous\n");
-    for path in ambiguous.iter().take(5) {
-        let _ = write!(message, "\n{path} has multiple applicable variants.");
-    }
-    if ambiguous.len() > 5 {
-        let _ = write!(message, "\n... and {} more paths.", ambiguous.len() - 5);
-    }
-    if !unparsed.is_empty() {
-        let _ = write!(
-            message,
-            "\n\nThe applicability of {} entr{} cannot be determined \
-             (unparsable mach expression).",
-            unparsed.len(),
-            if unparsed.len() == 1 { "y" } else { "ies" }
-        );
-    }
-    if !unknown.is_empty() {
-        let _ = write!(
-            message,
-            "\n\nThe applicability of {} entr{} cannot be determined \
-             (undecodable descriptor hardware restriction).",
-            unknown.len(),
-            if unknown.len() == 1 { "y" } else { "ies" }
-        );
-    }
-    message.push_str("\n\nSpecify a hardware profile using --mach.");
-    Err(anyhow!(message))
-}
-
-/// Names of the subsystems whose hardware applicability cannot be fully
-/// decoded, at any level above them (product, image or subsystem).
-fn unresolved_subsystems(dist: &Distribution) -> HashSet<String> {
-    let mut unresolved = HashSet::new();
-    let has_unresolved = |mach: &Option<sw_core::descriptor::model::HardwareRestrictions>| {
-        mach.as_ref().is_some_and(|m| !m.unresolved.is_empty())
-    };
-    for product in dist.products() {
-        let product_unresolved = has_unresolved(&product.mach);
-        for image in &product.images {
-            let image_unresolved = product_unresolved || has_unresolved(&image.mach);
-            for subsystem in &image.subsystems {
-                if image_unresolved || has_unresolved(&subsystem.mach) {
-                    unresolved.insert(subsystem.name.to_string());
-                }
-            }
-        }
-    }
-    unresolved
-}
-
 fn extract_command(dist: &Distribution, args: &ExtractArgs) -> Result<()> {
     let scope = resolve_scope(dist, args)?;
     if scope.is_empty() {
@@ -437,94 +293,31 @@ fn extract_command(dist: &Distribution, args: &ExtractArgs) -> Result<()> {
         },
         keep_stored: args.keep_stored,
         continue_on_error: !args.fail_fast,
+        // The CLI keeps its historical overwrite behavior; the shared
+        // planner still refuses symbolic-link and other unsafe targets.
+        existing_output: ExistingOutputPolicy::Allow,
+    };
+    let profile = if args.mach.mach.is_empty() {
+        None
+    } else {
+        Some(parse_mach(&args.mach.mach)?.1)
     };
 
-    // Only entries that would actually produce output participate in the
-    // fail-safe gate and the collision preflight: an entry that is never
-    // written (e.g. outside a `--relative-to` prefix, or a device node)
-    // cannot corrupt the output and must not block the extraction.
-    //
-    // Statically known failures (no payload, a path the host cannot
-    // represent) are deferred: an entry the hardware selection discards
-    // anyway must not abort the extraction either. The error propagates
-    // only for entries that survive the gate, still before anything is
-    // written.
-    let projected: Vec<(&Entry, sw_core::error::Result<Vec<PathBuf>>)> = scope
-        .iter()
-        .map(|entry| (*entry, extract::output_paths(entry, &options)))
-        .collect();
-    let effective: Vec<&Entry> = projected
-        .iter()
-        .filter(|(_, paths)| !matches!(paths, Ok(paths) if paths.is_empty()))
-        .map(|(entry, _)| *entry)
-        .collect();
-    if effective.is_empty() {
-        bail!("no entries in the requested scope produce output with the given options");
-    }
-    let entries = gate_extraction(dist, effective, &args.mach.mach)?;
-    if entries.is_empty() {
-        bail!("no entries in scope apply to the given hardware profile");
-    }
-
-    let gated: HashSet<(String, usize)> = entries.iter().map(|entry| entry_key(entry)).collect();
-    let mut gated_producers: Vec<(&Entry, Vec<PathBuf>)> = Vec::new();
-    for (entry, paths) in projected {
-        if gated.contains(&entry_key(entry)) {
-            gated_producers.push((entry, paths?));
-        }
-    }
-    preflight_output_collisions(&gated_producers)?;
-
-    let total = entries.len();
-    let mut reader = dist.image_reader();
-    let report = extract::extract(&mut reader, &entries, &args.output, &options);
-    print!("{}", output::extract_report(&report, total));
-    if report.failures.is_empty() {
+    // All extraction safety — hardware selection, ambiguity, output
+    // collisions, output topology and existing outputs — lives in the
+    // shared sw-core planner, which re-evaluates everything immediately
+    // before anything is written.
+    let checked = plan::extract_checked(dist, &scope, &args.output, &options, profile.as_ref())?;
+    print!(
+        "{}",
+        output::extract_report(&checked.report, checked.plan.planned_records)
+    );
+    if checked.report.failures.is_empty() {
         Ok(())
     } else {
-        bail!("{} entries failed to extract", report.failures.len())
+        bail!(
+            "{} entries failed to extract",
+            checked.report.failures.len()
+        )
     }
-}
-
-/// Refuses the extraction when two entries would write the same output
-/// file.
-///
-/// The selection conflict machinery of `sw-core` arbitrates between
-/// variants of one pathname *within* a subsystem; it does not cover
-/// collisions that only appear once entries are mapped to host output
-/// paths: different subsystems shipping the same pathname, `--flat`
-/// merging different directories, or `--raw`/`--keep-stored` `.Z`
-/// sidecars colliding with real files. Directory entries are exempt:
-/// several subsystems legitimately create the same directory.
-fn preflight_output_collisions(producers: &[(&Entry, Vec<PathBuf>)]) -> Result<()> {
-    let mut by_output: BTreeMap<&Path, Vec<&Entry>> = BTreeMap::new();
-    for (entry, paths) in producers {
-        for path in paths {
-            by_output.entry(path.as_path()).or_default().push(entry);
-        }
-    }
-    let collisions: Vec<(&&Path, &Vec<&Entry>)> = by_output
-        .iter()
-        .filter(|(_, entries)| {
-            entries.len() > 1
-                && entries
-                    .iter()
-                    .any(|entry| entry.file_type != FileType::Directory)
-        })
-        .collect();
-    if collisions.is_empty() {
-        return Ok(());
-    }
-    let mut message = String::from("extraction would overwrite output files\n");
-    for (path, entries) in collisions.iter().take(5) {
-        let _ = write!(message, "\n{}", path.display());
-        for entry in entries.iter() {
-            let _ = write!(message, "\n  <- {}: {}", entry.subsystem, entry.path);
-        }
-    }
-    if collisions.len() > 5 {
-        let _ = write!(message, "\n... and {} more outputs.", collisions.len() - 5);
-    }
-    message.push_str("\n\nNo files were written.");
-    Err(anyhow!(message))
 }

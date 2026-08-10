@@ -122,6 +122,15 @@ pub enum Error {
         /// The offending path.
         path: String,
     },
+
+    /// An extraction plan was refused before any bytes were written:
+    /// ambiguous entries, colliding outputs, unsafe output topology, or
+    /// existing output paths the options do not allow to overwrite.
+    #[error("{message}")]
+    ExtractionPlan {
+        /// Why the extraction was refused.
+        message: String,
+    },
 }
 
 impl Error {

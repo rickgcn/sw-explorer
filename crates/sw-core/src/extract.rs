@@ -39,10 +39,28 @@ pub enum DecodeMode {
     Never,
 }
 
+/// How extraction treats output paths that already exist on the host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExistingOutputPolicy {
+    /// Existing regular files may be overwritten by regular-file
+    /// outputs. This is the historical behavior. Symbolic links still
+    /// never replace an existing path: that would change the filesystem
+    /// object type, not overwrite its contents.
+    #[default]
+    Allow,
+    /// Refuse to overwrite or remove anything that already exists.
+    /// Regular-file writes (decoded payloads, stored bytes, `.Z`
+    /// sidecars and symlink breadcrumbs) use atomic no-clobber creation,
+    /// so a target appearing after the caller's preflight still cannot
+    /// be overwritten, and symbolic links are never replaced.
+    Refuse,
+}
+
 /// Options controlling extraction.
 ///
 /// The defaults continue the historical behavior: full paths, decoded
-/// payloads, and continuing past individual failures.
+/// payloads, continuing past individual failures, and overwriting
+/// existing regular files.
 #[derive(Debug, Clone)]
 pub struct ExtractOptions {
     /// How entry paths are mapped below the output directory.
@@ -54,6 +72,8 @@ pub struct ExtractOptions {
     pub keep_stored: bool,
     /// Continue past individual failures instead of aborting.
     pub continue_on_error: bool,
+    /// How output paths that already exist on the host are treated.
+    pub existing_output: ExistingOutputPolicy,
 }
 
 impl Default for ExtractOptions {
@@ -63,6 +83,7 @@ impl Default for ExtractOptions {
             decode: DecodeMode::Auto,
             keep_stored: false,
             continue_on_error: true,
+            existing_output: ExistingOutputPolicy::Allow,
         }
     }
 }
@@ -111,7 +132,15 @@ pub struct ExtractReport {
 /// Directories are created, regular files are written (decoding `.Z`
 /// payloads according to [`ExtractOptions::decode`]), and symbolic links
 /// are recreated on Unix. Permission bits are applied from the entry mode
-/// on Unix.
+/// on Unix. Existing output paths are treated according to
+/// [`ExtractOptions::existing_output`]: with
+/// [`ExistingOutputPolicy::Refuse`], regular-file writes fail atomically
+/// instead of truncating an existing file, and symbolic links never
+/// replace an existing path under either policy.
+///
+/// Callers that need the fail-safe gate (ambiguity, collisions, existing
+/// output classification) should use [`crate::plan::extract_checked`]
+/// instead of calling this directly.
 pub fn extract(
     reader: &mut ImageReader<'_>,
     entries: &[&Entry],
@@ -266,23 +295,43 @@ fn extract_one(
                     });
                 match options.decode {
                     DecodeMode::Auto => {
-                        write_file(&target, &payload.decode()?, entry.mode)?;
+                        write_file(
+                            &target,
+                            &payload.decode()?,
+                            entry.mode,
+                            options.existing_output,
+                        )?;
                         if options.keep_stored && payload.stored_compressed {
-                            write_file(&stored_target(&target), &payload.bytes, entry.mode)?;
+                            write_file(
+                                &stored_target(&target),
+                                &payload.bytes,
+                                entry.mode,
+                                options.existing_output,
+                            )?;
                         }
                     }
                     DecodeMode::Never => {
                         if payload.stored_compressed {
-                            write_file(&stored_target(&target), &payload.bytes, entry.mode)?;
+                            write_file(
+                                &stored_target(&target),
+                                &payload.bytes,
+                                entry.mode,
+                                options.existing_output,
+                            )?;
                         } else {
-                            write_file(&target, &payload.bytes, entry.mode)?;
+                            write_file(
+                                &target,
+                                &payload.bytes,
+                                entry.mode,
+                                options.existing_output,
+                            )?;
                         }
                     }
                 }
                 recovery
             } else if entry.size() == Some(0) && entry.compressed_size().is_none() {
                 // A regular file explicitly recorded as empty.
-                write_file(&target, &[], entry.mode)?;
+                write_file(&target, &[], entry.mode, options.existing_output)?;
                 None
             } else {
                 return Err(Error::PayloadNotFound {
@@ -298,7 +347,7 @@ fn extract_one(
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|source| Error::io(parent, source))?;
             }
-            create_symlink_or_fallback(link_target, &target)?;
+            create_symlink_or_fallback(link_target, &target, options.existing_output)?;
             Ok(ExtractOutcome::Written(None))
         }
         // Devices and FIFOs need privileges and a live system; skip them.
@@ -306,8 +355,29 @@ fn extract_one(
     }
 }
 
-fn write_file(target: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    std::fs::write(target, bytes).map_err(|source| Error::io(target, source))?;
+fn write_file(
+    target: &Path,
+    bytes: &[u8],
+    mode: u32,
+    existing: ExistingOutputPolicy,
+) -> Result<()> {
+    match existing {
+        ExistingOutputPolicy::Allow => {
+            std::fs::write(target, bytes).map_err(|source| Error::io(target, source))?;
+        }
+        ExistingOutputPolicy::Refuse => {
+            // Atomic no-clobber: a target that appeared after the
+            // caller's preflight fails here instead of being truncated.
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(target)
+                .map_err(|source| Error::io(target, source))?;
+            file.write_all(bytes)
+                .map_err(|source| Error::io(target, source))?;
+        }
+    }
     apply_mode(target, mode)
 }
 
@@ -423,33 +493,76 @@ fn apply_mode(_path: &Path, _mode: u32) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn create_symlink_or_fallback(original: &str, link: &Path) -> Result<()> {
-    use std::io::Write;
-    // `symlink_metadata` does not follow the link, so a pre-existing
-    // dangling symlink is still detected and replaced.
+fn create_symlink_or_fallback(
+    original: &str,
+    link: &Path,
+    existing: ExistingOutputPolicy,
+) -> Result<()> {
+    // A symbolic link never replaces an existing path, under either
+    // policy: removing a regular file to make room for a link would
+    // change the filesystem object type (not "overwrite" it), and
+    // removing a pre-existing link — even a dangling one, which
+    // `symlink_metadata` still detects — could retarget paths that
+    // resolve through it. `symlink(2)` itself never overwrites; the
+    // check below only produces a clearer error.
     if std::fs::symlink_metadata(link).is_ok() {
-        std::fs::remove_file(link).map_err(|source| Error::io(link, source))?;
+        return Err(Error::io(link, already_exists()));
     }
     match std::os::unix::fs::symlink(original, link) {
         Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Lost the race against a path that appeared after the
+            // check: report the failure instead of writing a breadcrumb
+            // next to it.
+            Err(Error::io(link, source))
+        }
         Err(_) => {
             // Filesystems without symlink support (e.g. some network or
             // FAT mounts): leave a plain-text breadcrumb instead of
             // pretending success.
             let meta = link_breadcrumb(link);
-            let mut file =
-                std::fs::File::create(&meta).map_err(|source| Error::io(&meta, source))?;
-            writeln!(file, "{original}").map_err(|source| Error::io(&meta, source))
+            write_breadcrumb(&meta, original, existing)
         }
     }
 }
 
 #[cfg(not(unix))]
-fn create_symlink_or_fallback(original: &str, link: &Path) -> Result<()> {
-    use std::io::Write;
+fn create_symlink_or_fallback(
+    original: &str,
+    link: &Path,
+    existing: ExistingOutputPolicy,
+) -> Result<()> {
     let meta = link_breadcrumb(link);
-    let mut file = std::fs::File::create(&meta).map_err(|source| Error::io(&meta, source))?;
-    writeln!(file, "{original}").map_err(|source| Error::io(&meta, source))
+    write_breadcrumb(&meta, original, existing)
+}
+
+/// Writes a symlink breadcrumb file, honoring the existing-output
+/// policy: [`ExistingOutputPolicy::Refuse`] creates it atomically
+/// without clobbering.
+fn write_breadcrumb(meta: &Path, original: &str, existing: ExistingOutputPolicy) -> Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    match existing {
+        ExistingOutputPolicy::Allow => {
+            options.write(true).create(true).truncate(true);
+        }
+        ExistingOutputPolicy::Refuse => {
+            options.write(true).create_new(true);
+        }
+    }
+    let mut file = options
+        .open(meta)
+        .map_err(|source| Error::io(meta, source))?;
+    writeln!(file, "{original}").map_err(|source| Error::io(meta, source))
+}
+
+/// The error a refused overwrite is reported with.
+#[cfg(unix)]
+fn already_exists() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "output path already exists",
+    )
 }
 
 /// The breadcrumb path used when a symbolic link cannot be created:
