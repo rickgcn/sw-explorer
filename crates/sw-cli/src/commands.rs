@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use sw_core::descriptor::model::Subsystem;
-use sw_core::diagnostic::{Diagnostic, Severity};
+use sw_core::diagnostic::Severity;
 use sw_core::distribution::{Distribution, Product};
 use sw_core::error::Error as CoreError;
 use sw_core::extract::{DecodeMode, ExistingOutputPolicy, ExtractOptions, PathMode};
@@ -37,7 +37,7 @@ pub fn run(cli: Cli) -> Result<()> {
 
 /// Prints non-fatal problems found while opening the distribution.
 fn report_diagnostics(dist: &Distribution) {
-    let print = |diagnostic: &Diagnostic| {
+    for diagnostic in dist.all_diagnostics() {
         let severity = match diagnostic.severity {
             Severity::Warning => "warning",
             Severity::Error => "error",
@@ -45,14 +45,6 @@ fn report_diagnostics(dist: &Distribution) {
         match &diagnostic.origin {
             Some(origin) => eprintln!("{severity}: {} ({origin})", diagnostic.message),
             None => eprintln!("{severity}: {}", diagnostic.message),
-        }
-    };
-    for diagnostic in dist.diagnostics() {
-        print(diagnostic);
-    }
-    for product in dist.products() {
-        for diagnostic in &product.diagnostics {
-            print(diagnostic);
         }
     }
 }

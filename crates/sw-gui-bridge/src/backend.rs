@@ -209,7 +209,7 @@ impl Backend {
         let distribution = Distribution::open(path)?;
         let summary = ffi::DistributionSummary {
             product_count: distribution.products().len() as u64,
-            diagnostic_count: distribution.diagnostics().len() as u64,
+            diagnostic_count: distribution.diagnostic_count() as u64,
         };
         let objects = build_object_table(&distribution);
         self.distribution = Some(distribution);

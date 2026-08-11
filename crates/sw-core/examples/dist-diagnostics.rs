@@ -21,18 +21,17 @@ fn main() -> ExitCode {
                 continue;
             }
         };
-        for diagnostic in dist.diagnostics() {
+        for diagnostic in dist.all_diagnostics() {
             total += 1;
-            println!("dist {:?}: {:?}", diagnostic.severity, diagnostic.message);
-        }
-        for product in dist.products() {
-            for diagnostic in &product.diagnostics {
-                total += 1;
-                println!(
-                    "{} {:?}: {:?} {:?}",
-                    product.name, diagnostic.severity, diagnostic.message, diagnostic.origin
-                );
-            }
+            let origin = diagnostic
+                .origin
+                .as_ref()
+                .map(|o| format!(" ({o})"))
+                .unwrap_or_default();
+            println!(
+                "{:?}: {:?}{origin}",
+                diagnostic.severity, diagnostic.message
+            );
         }
     }
     eprintln!("{total} diagnostics");

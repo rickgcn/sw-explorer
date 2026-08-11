@@ -143,6 +143,24 @@ impl Distribution {
         &self.diagnostics
     }
 
+    /// Every diagnostic of the distribution: the distribution-level ones
+    /// first, then each product's in product order (each in stored
+    /// order).
+    ///
+    /// This is the aggregation every frontend should use; whether a
+    /// diagnostic was recorded at the distribution or the product level
+    /// is a storage detail, not semantics.
+    pub fn all_diagnostics(&self) -> impl Iterator<Item = &Diagnostic> {
+        self.diagnostics
+            .iter()
+            .chain(self.products.iter().flat_map(|p| p.diagnostics.iter()))
+    }
+
+    /// The total number of diagnostics, distribution- and product-level.
+    pub fn diagnostic_count(&self) -> usize {
+        self.all_diagnostics().count()
+    }
+
     /// Runs a search query across all products.
     pub fn find(&self, query: &Query) -> QueryResult<'_> {
         let mut result = QueryResult::default();

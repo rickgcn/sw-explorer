@@ -245,7 +245,7 @@ void MainWindowHardwareTest::commitTriggersSelectionForStoredProfile()
     // The commit evaluated the stored profile automatically.
     waitForOverlay(window);
     QCOMPARE(statusTextOf(window),
-             QStringLiteral("Loaded 2 products · 6 selected records · 1 conflict groups"));
+             QStringLiteral("Loaded 2 products · 4 diagnostics · 6 selected records · 1 conflict groups"));
 
     // The overlay applies to whatever scope the user browses.
     treeOf(window)->setCurrentIndex(productIndex(treeOf(window)->model(), QStringLiteral("alpha")));
@@ -291,7 +291,7 @@ void MainWindowHardwareTest::applyOnlyIssuesASelectionRequest()
     QVERIFY(entryTableOf(window)->isColumnHidden(EntryTableModel::StatusColumn));
     QCOMPARE(entryTableOf(window)->model()->rowCount(), 5);
     QCOMPARE(statusTextOf(window),
-             QStringLiteral("Loaded 2 products · Evaluating hardware profile..."));
+             QStringLiteral("Loaded 2 products · 4 diagnostics · Evaluating hardware profile..."));
 
     waitForOverlay(window);
     QCOMPARE(entryTableOf(window)->model()->rowCount(), 5);
@@ -345,7 +345,7 @@ void MainWindowHardwareTest::clearingProfileDisablesOverlay()
     QCOMPARE(selectionSpy.count(), 0);
     QVERIFY(entryTableOf(window)->isColumnHidden(EntryTableModel::StatusColumn));
     QCOMPARE(hardwareButtonOf(window)->text(), QStringLiteral("Hardware: Off"));
-    QCOMPARE(statusTextOf(window), QStringLiteral("Loaded 2 products"));
+    QCOMPARE(statusTextOf(window), QStringLiteral("Loaded 2 products · 4 diagnostics"));
 }
 
 void MainWindowHardwareTest::staleSelectionResponseIsDropped()
@@ -370,7 +370,7 @@ void MainWindowHardwareTest::staleSelectionResponseIsDropped()
 
     QCOMPARE(entryTableOf(window)->model()->rowCount(), 0);
     QCOMPARE(statusTextOf(window),
-             QStringLiteral("Loaded 2 products · 6 selected records · 1 conflict groups"));
+             QStringLiteral("Loaded 2 products · 4 diagnostics · 6 selected records · 1 conflict groups"));
 }
 
 void MainWindowHardwareTest::profileChangeLeavesSearchResultsUntouched()
@@ -484,7 +484,7 @@ void MainWindowHardwareTest::switchingProfileOnlyChangesStatuses()
     QCOMPARE(entriesSpy.count(), 0);
     QCOMPARE(entryTableOf(window)->model()->rowCount(), 5);
     QCOMPARE(statusTextOf(window),
-             QStringLiteral("Loaded 2 products · 5 selected records · 1 conflict groups"));
+             QStringLiteral("Loaded 2 products · 4 diagnostics · 5 selected records · 1 conflict groups"));
 }
 
 void MainWindowHardwareTest::failedOpenKeepsTheWholeHardwareState()
@@ -527,7 +527,7 @@ void MainWindowHardwareTest::failedOpenKeepsTheWholeHardwareState()
     QCOMPARE(button->text(), QStringLiteral("Hardware: IP22"));
     QVERIFY(!entryTableOf(window)->isColumnHidden(EntryTableModel::StatusColumn));
     QCOMPARE(statusTextOf(window),
-             QStringLiteral("Loaded 2 products · 6 selected records · 1 conflict groups"));
+             QStringLiteral("Loaded 2 products · 4 diagnostics · 6 selected records · 1 conflict groups"));
 }
 
 void MainWindowHardwareTest::successfulReopenKeepsProfileAndReselects()
@@ -542,7 +542,7 @@ void MainWindowHardwareTest::successfulReopenKeepsProfileAndReselects()
     window.applyHardwareProfile(ip22Profile());
     waitForOverlay(window);
     QCOMPARE(statusTextOf(window),
-             QStringLiteral("Loaded 2 products · 6 selected records · 1 conflict groups"));
+             QStringLiteral("Loaded 2 products · 4 diagnostics · 6 selected records · 1 conflict groups"));
 
     // The accepted candidate kills the old selection and
     // suggestions; the stored profile is re-evaluated after commit.
@@ -553,7 +553,7 @@ void MainWindowHardwareTest::successfulReopenKeepsProfileAndReselects()
     QTRY_VERIFY(treeOf(window)->isEnabled());
     waitForOverlay(window);
     QCOMPARE(statusTextOf(window),
-             QStringLiteral("Loaded 1 products · 1 selected records · 0 conflict groups"));
+             QStringLiteral("Loaded 1 products · 2 diagnostics · 1 selected records · 0 conflict groups"));
     QCOMPARE(hardwareButtonOf(window)->text(), QStringLiteral("Hardware: IP22"));
 
     // The new distribution's rows carry the fresh selection.
@@ -684,7 +684,7 @@ void MainWindowHardwareTest::selectionErrorKeepsProfileAndFiles()
     // The profile stays applied and the files stay; the overlay is
     // gone and the status bar carries the error.
     QCOMPARE(statusTextOf(window),
-             QStringLiteral("Loaded 2 products · Hardware selection unavailable: hardware "
+             QStringLiteral("Loaded 2 products · 4 diagnostics · Hardware selection unavailable: hardware "
                             "attribute name is empty"));
     QCOMPARE(hardwareButtonOf(window)->toolTip(), QStringLiteral("=IP22"));
     QVERIFY(entryTableOf(window)->isColumnHidden(EntryTableModel::StatusColumn));
@@ -716,7 +716,7 @@ void MainWindowHardwareTest::emptyValueProfileSelectsHeadlessRecord()
     QCOMPARE(hardwareButtonOf(window)->text(), QStringLiteral("Hardware: (empty)"));
     QCOMPARE(hardwareButtonOf(window)->toolTip(), QStringLiteral("GFXBOARD="));
     QCOMPARE(statusTextOf(window),
-             QStringLiteral("Loaded 1 products · 2 selected records · 0 conflict groups"));
+             QStringLiteral("Loaded 1 products · 2 diagnostics · 2 selected records · 0 conflict groups"));
 
     const QAbstractItemModel *model = entryTableOf(window)->model();
     QCOMPARE(model->index(0, EntryTableModel::PathColumn).data().toString(),
@@ -733,7 +733,7 @@ void MainWindowHardwareTest::emptyValueProfileSelectsHeadlessRecord()
     // selection has landed before the statuses are checked.
     window.applyHardwareProfile({{QStringLiteral("GFXBOARD"), QStringLiteral("EXPRESS")}});
     QTRY_COMPARE(statusTextOf(window),
-                 QStringLiteral("Loaded 1 products · 1 selected records · 0 conflict groups"));
+                 QStringLiteral("Loaded 1 products · 2 diagnostics · 1 selected records · 0 conflict groups"));
     QCOMPARE(model->index(0, EntryTableModel::StatusColumn).data().toString(),
              QStringLiteral("Selected"));
     QCOMPARE(model->index(1, EntryTableModel::StatusColumn).data().toString(),

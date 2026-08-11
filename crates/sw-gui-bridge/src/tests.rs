@@ -399,7 +399,11 @@ fn open_synthetic_distribution_reports_counts() {
     let mut backend = new_backend();
     let summary = backend.open_distribution(root.to_str().unwrap()).unwrap();
     assert_eq!(summary.product_count, 1);
-    assert_eq!(summary.diagnostic_count, 1);
+    // The summary counts every diagnostic, at both storage levels:
+    // one distribution-level error (the invalid product name) plus the
+    // two product-level warnings of `test` (no descriptor file, missing
+    // image archive).
+    assert_eq!(summary.diagnostic_count, 3);
     assert!(backend.distribution.is_some());
 
     let _ = std::fs::remove_dir_all(&root);
