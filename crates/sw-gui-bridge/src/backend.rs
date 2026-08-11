@@ -13,8 +13,8 @@ use crate::detail;
 use crate::entry;
 use crate::extraction;
 use crate::hardware;
-use sw_core::distribution::Distribution;
-use sw_core::idb::{Entry, EntryId};
+use sw_core::distribution::{Distribution, EntryKey};
+use sw_core::idb::EntryId;
 use sw_core::mach::eval::HardwareProfile;
 use sw_core::query::Query;
 
@@ -104,12 +104,12 @@ impl std::fmt::Display for ExtractionError {
 
 impl std::error::Error for ExtractionError {}
 
-/// Everything an extraction request resolves to: the concrete entries,
-/// the validated options, the output directory and the hardware
+/// Everything an extraction request resolves to: the canonical entry
+/// keys, the validated options, the output directory and the hardware
 /// profile.
-struct ResolvedExtraction<'a> {
-    /// Entries to extract, resolved against their owning products.
-    entries: Vec<&'a Entry>,
+struct ResolvedExtraction {
+    /// Canonical keys of the entries to extract.
+    entries: Vec<EntryKey>,
     /// Validated core extraction options.
     options: sw_core::extract::ExtractOptions,
     /// Absolute output directory.
@@ -125,21 +125,29 @@ pub(crate) struct Backend {
     /// for every product, image and subsystem. Rebuilt on every
     /// successful open; a failed open leaves it untouched.
     objects: Vec<ObjectEntry>,
+    /// Reverse index from `Distribution` product index to the product's
+    /// object id, built together with the object table on every
+    /// successful open; a failed open leaves it untouched.
+    product_object_ids: Vec<u64>,
 }
 
 pub(crate) fn new_backend() -> Box<Backend> {
     Box::new(Backend {
         distribution: None,
         objects: Vec::new(),
+        product_object_ids: Vec::new(),
     })
 }
 
 /// Builds the object table of a freshly opened distribution, assigning
-/// sequential non-zero ids in natural (depth-first) order.
-fn build_object_table(distribution: &Distribution) -> Vec<ObjectEntry> {
+/// sequential non-zero ids in natural (depth-first) order, plus the
+/// reverse index from product index to product object id.
+fn build_object_table(distribution: &Distribution) -> (Vec<ObjectEntry>, Vec<u64>) {
     let mut objects = Vec::new();
+    let mut product_object_ids = Vec::new();
     for (product_index, product) in distribution.products().iter().enumerate() {
         let product_id = objects.len() as u64 + 1;
+        product_object_ids.push(product_id);
         objects.push(ObjectEntry {
             parent_id: 0,
             reference: ObjectRef::Product(product_index),
@@ -158,7 +166,7 @@ fn build_object_table(distribution: &Distribution) -> Vec<ObjectEntry> {
             }
         }
     }
-    objects
+    (objects, product_object_ids)
 }
 
 /// The tree-level name of an object reference, for error messages.
@@ -205,15 +213,17 @@ impl Backend {
         path: &str,
     ) -> sw_core::error::Result<ffi::DistributionSummary> {
         // Open first, replace second: a failed open must not destroy
-        // the distribution that is already loaded.
+        // the distribution that is already loaded. The summary counts
+        // every diagnostic, distribution- and product-level.
         let distribution = Distribution::open(path)?;
         let summary = ffi::DistributionSummary {
             product_count: distribution.products().len() as u64,
             diagnostic_count: distribution.diagnostic_count() as u64,
         };
-        let objects = build_object_table(&distribution);
+        let (objects, product_object_ids) = build_object_table(&distribution);
         self.distribution = Some(distribution);
         self.objects = objects;
+        self.product_object_ids = product_object_ids;
         Ok(summary)
     }
 
@@ -319,45 +329,16 @@ impl Backend {
         ))
     }
 
-    /// Object id of the product with the given index, found by
-    /// scanning the object table — never derived from id arithmetic.
+    /// Object id of the product with the given index, looked up in the
+    /// reverse index built with the object table — never derived from
+    /// id arithmetic.
     fn product_object_id(&self, product_index: usize) -> Result<u64, ObjectDetailError> {
-        self.objects
-            .iter()
-            .position(|entry| {
-                matches!(entry.reference, ObjectRef::Product(index) if index == product_index)
-            })
-            .map(|position| position as u64 + 1)
+        self.product_object_ids
+            .get(product_index)
+            .copied()
             .ok_or_else(|| {
                 ObjectDetailError(format!("product index {product_index} has no object id"))
             })
-    }
-
-    /// Maps every entry of the distribution to the object id of the
-    /// product that actually owns it. Ownership is pointer identity
-    /// into a product's entry list — never the product segment of the
-    /// record's subsystem name: an IDB record may name a foreign
-    /// subsystem and still belong to the product whose IDB carries
-    /// it, and entry_detail resolves keys against that owner's entry
-    /// list. The map is rebuilt per query and never cached.
-    fn entry_owner_map(
-        &self,
-        distribution: &Distribution,
-    ) -> Result<std::collections::HashMap<*const Entry, u64>, ObjectDetailError> {
-        let mut owners = std::collections::HashMap::with_capacity(
-            distribution
-                .products()
-                .iter()
-                .map(|product| product.entries.len())
-                .sum(),
-        );
-        for (product_index, product) in distribution.products().iter().enumerate() {
-            let product_id = self.product_object_id(product_index)?;
-            for entry in &product.entries {
-                owners.insert(std::ptr::from_ref(entry), product_id);
-            }
-        }
-        Ok(owners)
     }
 
     pub(crate) fn entries(
@@ -410,40 +391,24 @@ impl Backend {
             .distribution
             .as_ref()
             .ok_or_else(|| SearchError("no distribution loaded".to_string()))?;
-        // An empty query means "no search", never "match everything":
-        // a UI glitch must not dump the whole corpus.
-        if query.is_empty() {
-            return Err(SearchError("search query is empty".to_string()));
-        }
-
-        // The CLI query policy: plain text is a substring search; a
-        // query carrying its own wildcard characters reaches the core
-        // matcher unchanged.
-        let pattern = if query.contains(['*', '?']) {
-            query.to_string()
-        } else {
-            format!("*{query}*")
-        };
+        // The core owns the search policy: plain text is a substring
+        // search, an explicit wildcard passes through, and an empty
+        // query is rejected — never a "match everything" search.
+        let query = Query::path_search(query).map_err(|error| SearchError(error.to_string()))?;
         // Distribution::find yields hits in distribution product
         // order, each product in exact IDB order, and never
-        // deduplicates duplicate paths.
-        let found = distribution.find(&Query::path(pattern));
-
-        // Maps each hit to the object id of the product that actually
-        // owns the entry — the shared owner map, never the product
-        // segment of the record's subsystem name.
-        let owners = self
-            .entry_owner_map(distribution)
-            .map_err(|error| SearchError(error.to_string()))?;
+        // deduplicates duplicate paths; every hit carries the key of
+        // the product that actually owns it.
+        let found = distribution.find(&query);
 
         found
             .entries
             .iter()
-            .map(|entry| {
-                let product_id = owners
-                    .get(&std::ptr::from_ref(*entry))
-                    .ok_or_else(|| SearchError("search hit has no owning product".to_string()))?;
-                Ok(entry::entry_summary(*product_id, entry))
+            .map(|located| {
+                let product_id = self
+                    .product_object_id(located.key.product_index)
+                    .map_err(|error| SearchError(error.to_string()))?;
+                Ok(entry::entry_summary(product_id, located.entry))
             })
             .collect()
     }
@@ -475,7 +440,16 @@ impl Backend {
         &self,
     ) -> Result<Vec<ffi::HardwareCandidateSet>, NoDistributionLoaded> {
         let distribution = self.distribution.as_ref().ok_or(NoDistributionLoaded)?;
-        Ok(hardware::hardware_candidates(distribution))
+        // Candidate discovery is a core domain service; the bridge
+        // only converts the DTO shape.
+        Ok(distribution
+            .hardware_candidates()
+            .into_iter()
+            .map(|set| ffi::HardwareCandidateSet {
+                attribute: set.attribute,
+                values: set.values,
+            })
+            .collect())
     }
 
     pub(crate) fn select_entries(
@@ -506,12 +480,10 @@ impl Backend {
 
         // All MACH semantics — hierarchy restrictions, entry-specific
         // expressions, mach-less fallback, duplicate paths, unresolved
-        // expressions and conflicts — come from the core selection.
+        // expressions and conflicts — come from the core selection,
+        // whose entries carry their owning product's key.
         let selection = distribution.select(&profile);
-        let owners = self
-            .entry_owner_map(distribution)
-            .map_err(|error| SelectionError(error.to_string()))?;
-        hardware::selection_snapshot(&selection, &owners).map_err(SelectionError)
+        hardware::selection_snapshot(&selection, &self.product_object_ids).map_err(SelectionError)
     }
 
     /// Resolves the entry keys of an extraction request against the
@@ -519,16 +491,16 @@ impl Backend {
     /// its object id identifies — the owning product, never a product
     /// guessed from the record's subsystem name. Exact duplicates are
     /// rejected; the same path under different keys is legitimate.
-    fn resolve_entries<'a>(
+    fn resolve_entries(
         &self,
-        distribution: &'a Distribution,
+        distribution: &Distribution,
         request: &ffi::ExtractionRequest,
-    ) -> Result<Vec<&'a Entry>, ExtractionError> {
+    ) -> Result<Vec<EntryKey>, ExtractionError> {
         if request.entries.is_empty() {
             return Err(ExtractionError("no entries requested".to_string()));
         }
         let mut seen = std::collections::HashSet::new();
-        let mut entries = Vec::with_capacity(request.entries.len());
+        let mut keys = Vec::with_capacity(request.entries.len());
         for key in &request.entries {
             if !seen.insert((key.product_id, key.entry_id)) {
                 return Err(ExtractionError(format!(
@@ -555,26 +527,30 @@ impl Backend {
                     product.name.as_str()
                 ))
             })?;
-            let entry = product.entry(EntryId(index)).ok_or_else(|| {
-                ExtractionError(format!(
+            let entry_key = EntryKey {
+                product_index,
+                entry_id: EntryId(index),
+            };
+            if distribution.entry(entry_key).is_none() {
+                return Err(ExtractionError(format!(
                     "entry id {} does not exist in product {}",
                     key.entry_id,
                     product.name.as_str()
-                ))
-            })?;
-            entries.push(entry);
+                )));
+            }
+            keys.push(entry_key);
         }
-        Ok(entries)
+        Ok(keys)
     }
 
-    /// Everything an extraction request resolves to: the concrete
-    /// entries, the validated options, the output directory and the
+    /// Everything an extraction request resolves to: the canonical
+    /// entry keys, the validated options, the output directory and the
     /// hardware profile.
-    fn resolve_extraction<'a>(
+    fn resolve_extraction(
         &self,
-        distribution: &'a Distribution,
+        distribution: &Distribution,
         request: &ffi::ExtractionRequest,
-    ) -> Result<ResolvedExtraction<'a>, ExtractionError> {
+    ) -> Result<ResolvedExtraction, ExtractionError> {
         let entries = self.resolve_entries(distribution, request)?;
         let (options, out_dir) = extraction::extract_options(request).map_err(ExtractionError)?;
         let profile = extraction::hardware_profile(request).map_err(ExtractionError)?;

@@ -20,7 +20,10 @@ pub enum PathMode {
     Full,
     /// Write every entry directly into the output directory, using only
     /// its file name; later entries with the same name overwrite earlier
-    /// ones.
+    /// ones. This is the low-level projection/write behavior; the
+    /// checked extraction planner
+    /// ([`crate::plan::plan_extraction`]) refuses such output collisions
+    /// up front.
     Flat,
     /// Strip the given prefix from entry paths. Entries outside the
     /// prefix are skipped.
@@ -129,6 +132,15 @@ pub struct ExtractReport {
 
 /// Extracts entries below `out_dir`.
 ///
+/// This is the low-level payload writer. It does **not** perform any
+/// distribution-wide safety planning — no hardware selection, no
+/// ambiguity or collision detection, no output topology or existing
+/// output checks. ("Unchecked" means unsafe by omission of those
+/// application-level checks, not memory-unsafe.) Normal callers should
+/// use [`crate::plan::extract_checked`], which plans and re-validates
+/// everything immediately before writing; call this directly only to
+/// test the writer itself.
+///
 /// Directories are created, regular files are written (decoding `.Z`
 /// payloads according to [`ExtractOptions::decode`]), and symbolic links
 /// are recreated on Unix. Permission bits are applied from the entry mode
@@ -137,11 +149,7 @@ pub struct ExtractReport {
 /// [`ExistingOutputPolicy::Refuse`], regular-file writes fail atomically
 /// instead of truncating an existing file, and symbolic links never
 /// replace an existing path under either policy.
-///
-/// Callers that need the fail-safe gate (ambiguity, collisions, existing
-/// output classification) should use [`crate::plan::extract_checked`]
-/// instead of calling this directly.
-pub fn extract(
+pub fn extract_unchecked(
     reader: &mut ImageReader<'_>,
     entries: &[&Entry],
     out_dir: &Path,
@@ -193,12 +201,12 @@ fn resolve_relative(entry: &Entry, mode: &PathMode) -> Option<IrixPath> {
     }
 }
 
-/// Projects an entry to the host-relative paths [`extract`] would write
-/// for it under `options`, without writing anything.
+/// Projects an entry to the host-relative paths [`extract_unchecked`]
+/// would write for it under `options`, without writing anything.
 ///
-/// An empty list means [`extract`] would deliberately skip the entry:
-/// excluded by the path mode, a device or FIFO, or a symbolic link
-/// without a recorded target. Failures that are already known
+/// An empty list means [`extract_unchecked`] would deliberately skip the
+/// entry: excluded by the path mode, a device or FIFO, or a symbolic
+/// link without a recorded target. Failures that are already known
 /// statically — a host path that cannot be represented, a regular file
 /// without a payload — are returned as errors, so a caller preflighting
 /// with this projection fails before any bytes hit the disk instead of
@@ -207,7 +215,7 @@ fn resolve_relative(entry: &Entry, mode: &PathMode) -> Option<IrixPath> {
 /// # Errors
 ///
 /// Returns [`Error::UnsafePath`] or [`Error::PayloadNotFound`] for
-/// entries [`extract`] is statically known to fail on.
+/// entries [`extract_unchecked`] is statically known to fail on.
 pub fn output_paths(entry: &Entry, options: &ExtractOptions) -> Result<Vec<PathBuf>> {
     let Some(relative) = resolve_relative(entry, &options.path_mode) else {
         return Ok(Vec::new());

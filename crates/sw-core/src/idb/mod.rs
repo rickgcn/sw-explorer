@@ -19,10 +19,14 @@ use crate::names::SubsystemName;
 use crate::path::IrixPath;
 use std::path::PathBuf;
 
-/// Stable identifier of an [`Entry`] within its product.
+/// Stable identifier of an [`Entry`] within its owning product.
 ///
 /// Subsystems reference entries through `EntryId` instead of copying them;
 /// all entries live in `Product::entries`.
+///
+/// The id is the entry's position in the owning product's IDB order; it
+/// is *not* unique across products. A distribution-wide identity is
+/// [`crate::distribution::EntryKey`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EntryId(pub usize);
 

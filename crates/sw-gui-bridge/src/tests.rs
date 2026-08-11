@@ -2346,76 +2346,24 @@ fn candidates_require_loaded_distribution() {
 }
 
 #[test]
-fn candidates_cover_every_mach_source_in_first_appearance_order() {
-    let root = temp_root("candidates-all-sources");
+fn candidates_match_core_discovery() {
+    let root = temp_root("candidates-core-conversion");
     write_candidates_dist(&root);
 
     let mut backend = new_backend();
     backend.open_distribution(root.to_str().unwrap()).unwrap();
 
-    // Product restrictions first, then the image with its subsystems,
-    // then the entries in IDB order. Nested && / || / ! trees are
-    // walked; every comparison's right-hand side becomes a candidate,
-    // whatever the operator; a bare `IP26` is a CPUBOARD comparison;
-    // the unknown FROBNICATE attribute is preserved verbatim. IP22 and
-    // EXPRESS repeat on later entries and stay deduplicated.
-    assert_eq!(
-        candidate_pairs(&backend.hardware_candidates().unwrap()),
-        vec![
-            (
-                "CPUBOARD".to_string(),
-                vec!["IP22".to_string(), "IP30".to_string(), "IP26".to_string()],
-            ),
-            (
-                "GFXBOARD".to_string(),
-                vec![
-                    "EXPRESS".to_string(),
-                    "NEWPRESS".to_string(),
-                    "SERVER".to_string(),
-                ],
-            ),
-            ("VIDEO".to_string(), vec!["EVO".to_string()]),
-            ("MODE".to_string(), vec!["64bit".to_string()]),
-            ("FROBNICATE".to_string(), vec!["YES".to_string()]),
-        ]
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn candidates_ignore_unparseable_payloads() {
-    let root = temp_root("candidates-unresolved");
-    write_candidates_dist(&root);
-
-    let mut backend = new_backend();
-    backend.open_distribution(root.to_str().unwrap()).unwrap();
-
-    // The unparseable entry payload `=GARBAGE` contributes nothing;
-    // nothing is guessed from raw text.
-    for set in backend.hardware_candidates().unwrap() {
-        assert!(!set.attribute.is_empty());
-        for value in &set.values {
-            assert!(!value.is_empty());
-            assert!(!value.contains("GARBAGE"));
-        }
-    }
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn candidates_ignore_conditional_flag_conditions() {
-    let root = temp_root("candidates-flags");
-    write_candidates_dist(&root);
-
-    let mut backend = new_backend();
-    backend.open_distribution(root.to_str().unwrap()).unwrap();
-
-    // IP99 only appears in a `default` flag condition, which is not a
-    // MACH expression.
-    for set in backend.hardware_candidates().unwrap() {
-        assert!(!set.values.iter().any(|value| value == "IP99"));
+    // The bridge is a pure conversion: its DTOs equal the core
+    // candidate sets field by field, in the same order. The candidate
+    // semantics themselves are golden-tested in sw-core.
+    let distribution = sw_core::distribution::Distribution::open(&root).unwrap();
+    let core = distribution.hardware_candidates();
+    let bridge = backend.hardware_candidates().unwrap();
+    assert_eq!(bridge.len(), core.len());
+    assert!(!bridge.is_empty());
+    for (ffi_set, core_set) in bridge.iter().zip(core.iter()) {
+        assert_eq!(ffi_set.attribute, core_set.attribute);
+        assert_eq!(ffi_set.values, core_set.values);
     }
 
     let _ = std::fs::remove_dir_all(&root);
@@ -2560,7 +2508,7 @@ fn selection_empty_value_matches_core_select() {
     let core_paths: Vec<String> = core
         .selected
         .iter()
-        .map(|entry| entry.path.to_string())
+        .map(|located| located.entry.path.to_string())
         .collect();
     assert_eq!(bridge_paths, core_paths);
 
@@ -2948,7 +2896,7 @@ fn selection_matches_core_distribution_select() {
     let core_paths: Vec<String> = core
         .selected
         .iter()
-        .map(|entry| entry.path.to_string())
+        .map(|located| located.entry.path.to_string())
         .collect();
     assert_eq!(bridge_paths, core_paths);
 
@@ -2968,7 +2916,7 @@ fn selection_matches_core_distribution_select() {
         let core_candidates: Vec<String> = core_conflict
             .candidates
             .iter()
-            .map(|entry| entry.path.to_string())
+            .map(|located| located.entry.path.to_string())
             .collect();
         assert_eq!(bridge_candidates, core_candidates);
     }
@@ -3035,10 +2983,10 @@ fn real_dist_hardware_smoke() {
 
     // Every selected key resolves back to the very entry the core
     // selected at that position.
-    for (key, entry) in snapshot.selected.iter().zip(core.selected.iter()) {
+    for (key, located) in snapshot.selected.iter().zip(core.selected.iter()) {
         let detail = backend.entry_detail(key.product_id, key.entry_id).unwrap();
-        assert_eq!(detail.path, entry.path.to_string());
-        assert_eq!(detail.subsystem, entry.subsystem.to_string());
+        assert_eq!(detail.path, located.entry.path.to_string());
+        assert_eq!(detail.subsystem, located.entry.subsystem.to_string());
     }
     // Conflict candidates resolve as well.
     for conflict in &snapshot.conflicts {
@@ -3567,8 +3515,17 @@ fn extraction_matches_the_core_planner_exactly() {
     let bridge_summary = backend.plan_extraction(&request).unwrap();
 
     let distribution = sw_core::distribution::Distribution::open(&root).unwrap();
-    let product = distribution.product("xa").unwrap();
-    let requested: Vec<&sw_core::idb::Entry> = product.entries.iter().skip(1).take(4).collect();
+    let product_index = distribution
+        .products()
+        .iter()
+        .position(|p| p.name.as_str() == "xa")
+        .unwrap();
+    let requested: Vec<sw_core::distribution::EntryKey> = (1..=4)
+        .map(|id| sw_core::distribution::EntryKey {
+            product_index,
+            entry_id: sw_core::idb::EntryId(id),
+        })
+        .collect();
     let profile = HardwareProfile::builder().add("CPUBOARD", "IP22").build();
     let options = sw_core::extract::ExtractOptions {
         existing_output: sw_core::extract::ExistingOutputPolicy::Refuse,

@@ -190,15 +190,11 @@ fn no_error_diagnostics_on_real_media() {
     let dist = Distribution::open(&path).expect("open distribution");
 
     let mut errors = Vec::new();
-    for diagnostic in dist.diagnostics() {
+    for diagnostic in dist.all_diagnostics() {
         if diagnostic.severity == Severity::Error {
-            errors.push(format!("dist: {}", diagnostic.message));
-        }
-    }
-    for product in dist.products() {
-        for diagnostic in &product.diagnostics {
-            if diagnostic.severity == Severity::Error {
-                errors.push(format!("{}: {}", product.name, diagnostic.message));
+            match &diagnostic.origin {
+                Some(origin) => errors.push(format!("{origin}: {}", diagnostic.message)),
+                None => errors.push(diagnostic.message.clone()),
             }
         }
     }

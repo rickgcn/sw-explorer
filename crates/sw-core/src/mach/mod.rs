@@ -26,6 +26,7 @@
 //! `CPUBOARD=IP22`, and `IP22 || IP26` means
 //! `CPUBOARD=IP22 || CPUBOARD=IP26`.
 
+pub mod candidates;
 pub mod eval;
 pub(crate) mod lexer;
 pub mod parser;

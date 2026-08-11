@@ -10,10 +10,9 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 use sw_core::descriptor::model::Subsystem;
 use sw_core::diagnostic::Severity;
-use sw_core::distribution::{Distribution, Product};
+use sw_core::distribution::{Distribution, EntryKey, LocatedEntry, Product};
 use sw_core::error::Error as CoreError;
 use sw_core::extract::{DecodeMode, ExistingOutputPolicy, ExtractOptions, PathMode};
-use sw_core::idb::Entry;
 use sw_core::image::Image;
 use sw_core::mach::eval::HardwareProfile;
 use sw_core::plan;
@@ -68,44 +67,43 @@ fn parse_mach(mach: &[String]) -> Result<(Vec<(String, String)>, HardwareProfile
     Ok((pairs, builder.build()))
 }
 
-/// Builds a path query: plain text matches as a substring, an explicit
-/// `*`/`?` pattern is handed to the core wildcard matcher unchanged.
-fn path_query(pattern: &str) -> Query {
-    if pattern.contains(['*', '?']) {
-        Query::path(pattern)
-    } else {
-        Query::path(format!("*{pattern}*"))
-    }
+/// Identifies an entry's owning product by name, with its index.
+fn find_product<'a>(dist: &'a Distribution, name: &str) -> Option<(usize, &'a Product)> {
+    dist.products()
+        .iter()
+        .enumerate()
+        .find(|(_, product)| product.name.as_str() == name)
 }
 
-/// Identifies an entry within a distribution, for set operations.
-fn entry_key(entry: &Entry) -> (String, usize) {
-    (entry.subsystem.product().to_string(), entry.id.0)
-}
-
-fn find_image<'a>(dist: &'a Distribution, name: &str) -> Option<(&'a Product, &'a Image)> {
-    dist.products().iter().find_map(|product| {
-        product
-            .images
-            .iter()
-            .find(|image| image.name.to_string() == name)
-            .map(|image| (product, image))
-    })
+fn find_image<'a>(dist: &'a Distribution, name: &str) -> Option<(usize, &'a Product, &'a Image)> {
+    dist.products()
+        .iter()
+        .enumerate()
+        .find_map(|(index, product)| {
+            product
+                .images
+                .iter()
+                .find(|image| image.name.to_string() == name)
+                .map(|image| (index, product, image))
+        })
 }
 
 fn find_subsystem<'a>(
     dist: &'a Distribution,
     name: &str,
-) -> Option<(&'a Product, &'a Image, &'a Subsystem)> {
-    dist.products().iter().find_map(|product| {
-        product.images.iter().find_map(|image| {
-            image
-                .subsystems
-                .iter()
-                .find(|subsystem| subsystem.name.to_string() == name)
-                .map(|subsystem| (product, image, subsystem))
+) -> Option<(usize, &'a Product, &'a Image, &'a Subsystem)> {
+    dist.products()
+        .iter()
+        .enumerate()
+        .find_map(|(index, product)| {
+            product.images.iter().find_map(|image| {
+                image
+                    .subsystems
+                    .iter()
+                    .find(|subsystem| subsystem.name.to_string() == name)
+                    .map(|subsystem| (index, product, image, subsystem))
+            })
         })
-    })
 }
 
 fn products(dist: &Distribution) -> Result<()> {
@@ -134,12 +132,12 @@ fn show(dist: &Distribution, args: &ShowArgs) -> Result<()> {
             print!("{}", output::product_details(product));
         }
         2 => {
-            let (_product, image) = find_image(dist, &args.name)
+            let (_index, _product, image) = find_image(dist, &args.name)
                 .ok_or_else(|| anyhow!("image not found: {}", args.name))?;
             print!("{}", output::image_details(image));
         }
         3 => {
-            let (_product, image, subsystem) = find_subsystem(dist, &args.name)
+            let (_index, _product, image, subsystem) = find_subsystem(dist, &args.name)
                 .ok_or_else(|| anyhow!("subsystem not found: {}", args.name))?;
             print!("{}", output::subsystem_details(image, subsystem));
         }
@@ -150,13 +148,13 @@ fn show(dist: &Distribution, args: &ShowArgs) -> Result<()> {
 }
 
 fn find(dist: &Distribution, args: &FindArgs) -> Result<()> {
-    let query = path_query(&args.pattern);
+    let query = Query::path_search(&args.pattern)?;
     let found = dist.find(&query);
     if args.mach.mach.is_empty() {
         if found.entries.is_empty() {
             eprintln!("no entries match {:?}", args.pattern);
         } else {
-            print!("{}", output::entry_table(&found.entries));
+            print!("{}", output::entry_table(dist, &found.entries));
         }
         return Ok(());
     }
@@ -164,13 +162,12 @@ fn find(dist: &Distribution, args: &FindArgs) -> Result<()> {
     // With a hardware profile, the full hierarchical selection decides:
     // product, image, subsystem and entry restrictions all apply.
     let (_pairs, profile) = parse_mach(&args.mach.mach)?;
-    let keys: HashSet<(String, usize)> =
-        found.entries.iter().map(|entry| entry_key(entry)).collect();
+    let keys: HashSet<EntryKey> = found.entries.iter().map(|located| located.key).collect();
     let selection = dist.select(&profile);
-    let entries: Vec<&Entry> = selection
+    let entries: Vec<LocatedEntry> = selection
         .selected
         .iter()
-        .filter(|entry| keys.contains(&entry_key(entry)))
+        .filter(|located| keys.contains(&located.key))
         .copied()
         .collect();
     if entries.is_empty() {
@@ -179,7 +176,7 @@ fn find(dist: &Distribution, args: &FindArgs) -> Result<()> {
             args.pattern
         );
     } else {
-        print!("{}", output::entry_table(&entries));
+        print!("{}", output::entry_table(dist, &entries));
     }
     let conflicts: Vec<&SelectionConflict> = selection
         .conflicts
@@ -188,7 +185,7 @@ fn find(dist: &Distribution, args: &FindArgs) -> Result<()> {
             conflict
                 .candidates
                 .iter()
-                .any(|entry| keys.contains(&entry_key(entry)))
+                .any(|located| keys.contains(&located.key))
         })
         .collect();
     if !conflicts.is_empty() {
@@ -214,8 +211,8 @@ fn select(dist: &Distribution, args: &SelectArgs) -> Result<()> {
     let _ = writeln!(out, "Conflicts:        {}", selection.conflicts.len());
     if args.list {
         out.push('\n');
-        for entry in &selection.selected {
-            let _ = writeln!(out, "{}", entry.path);
+        for located in &selection.selected {
+            let _ = writeln!(out, "{}", located.entry.path);
         }
     }
     if !selection.conflicts.is_empty() {
@@ -227,37 +224,57 @@ fn select(dist: &Distribution, args: &SelectArgs) -> Result<()> {
     Ok(())
 }
 
-/// Resolves the extraction scope to a concrete entry list.
-fn resolve_scope<'a>(dist: &'a Distribution, args: &ExtractArgs) -> Result<Vec<&'a Entry>> {
+/// Resolves the extraction scope to canonical entry keys; the shared
+/// planner resolves them against the distribution itself.
+fn resolve_scope(dist: &Distribution, args: &ExtractArgs) -> Result<Vec<EntryKey>> {
     if let Some(pattern) = &args.path {
-        let entries = dist.find(&path_query(pattern)).entries;
-        if entries.is_empty() {
+        let keys: Vec<EntryKey> = dist
+            .find(&Query::path_search(pattern)?)
+            .entries
+            .into_iter()
+            .map(|located| located.key)
+            .collect();
+        if keys.is_empty() {
             bail!("no entries match {pattern:?}");
         }
-        return Ok(entries);
+        return Ok(keys);
     }
     if let Some(name) = &args.product {
-        let product = dist
-            .product(name)
+        let (product_index, product) = find_product(dist, name)
             .ok_or_else(|| CoreError::ProductNotFound { name: name.clone() })?;
-        return Ok(product.entries.iter().collect());
+        return Ok(product
+            .entries
+            .iter()
+            .map(|entry| EntryKey {
+                product_index,
+                entry_id: entry.id,
+            })
+            .collect());
     }
     if let Some(name) = &args.image {
-        let (product, image) =
+        let (product_index, product, image) =
             find_image(dist, name).ok_or_else(|| anyhow!("image not found: {name}"))?;
         return Ok(product
             .entries
             .iter()
             .filter(|entry| entry.subsystem.image_name() == image.name)
+            .map(|entry| EntryKey {
+                product_index,
+                entry_id: entry.id,
+            })
             .collect());
     }
     if let Some(name) = &args.subsystem {
-        let (product, _image, subsystem) =
+        let (product_index, product, _image, subsystem) =
             find_subsystem(dist, name).ok_or_else(|| anyhow!("subsystem not found: {name}"))?;
         return Ok(subsystem
             .entry_ids
             .iter()
-            .filter_map(|id| product.entry(*id))
+            .filter(|id| product.entry(**id).is_some())
+            .map(|id| EntryKey {
+                product_index,
+                entry_id: *id,
+            })
             .collect());
     }
     unreachable!("the argument parser requires exactly one scope");

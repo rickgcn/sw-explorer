@@ -30,8 +30,8 @@
 //! let selection = dist.select(&profile);
 //!
 //! let mut reader = dist.image_reader();
-//! for entry in selection.selected {
-//!     if let Ok(payload) = reader.read(entry) {
+//! for located in selection.selected {
+//!     if let Ok(payload) = reader.read(located.entry) {
 //!         let bytes = payload.decode()?;
 //!         // ...
 //!     }

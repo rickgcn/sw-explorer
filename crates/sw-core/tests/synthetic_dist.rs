@@ -316,10 +316,10 @@ fn selection_prefers_matching_specific() {
     let tools: Vec<_> = selection
         .selected
         .iter()
-        .filter(|e| e.path.as_str() == "bin/tool")
+        .filter(|e| e.entry.path.as_str() == "bin/tool")
         .collect();
     assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].source_path, "src/tool1");
+    assert_eq!(tools[0].entry.source_path, "src/tool1");
 
     // Both etc/conf candidates match: conflict reported, both kept.
     let conf = selection
@@ -331,7 +331,7 @@ fn selection_prefers_matching_specific() {
     let conf_selected = selection
         .selected
         .iter()
-        .filter(|e| e.path.as_str() == "etc/conf")
+        .filter(|e| e.entry.path.as_str() == "etc/conf")
         .count();
     assert_eq!(conf_selected, 2);
 
@@ -346,7 +346,7 @@ fn selection_prefers_matching_specific() {
         !selection
             .selected
             .iter()
-            .any(|e| e.path.as_str() == "broken")
+            .any(|e| e.entry.path.as_str() == "broken")
     );
 }
 
@@ -358,10 +358,10 @@ fn selection_falls_back_without_match() {
     let tools: Vec<_> = selection
         .selected
         .iter()
-        .filter(|e| e.path.as_str() == "bin/tool")
+        .filter(|e| e.entry.path.as_str() == "bin/tool")
         .collect();
     assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].source_path, "src/tool3");
+    assert_eq!(tools[0].entry.source_path, "src/tool3");
 }
 
 #[test]
@@ -406,7 +406,7 @@ fn selection_reports_unresolved_subsystem_mach() {
         !selection
             .selected
             .iter()
-            .any(|e| e.subsystem.to_string() == "side.sw.unix")
+            .any(|e| e.entry.subsystem.to_string() == "side.sw.unix")
     );
     let conflict = selection
         .conflicts
@@ -423,13 +423,14 @@ fn extracts_to_host_filesystem() {
     let profile = HardwareProfile::builder().set("CPUBOARD", "IP20").build();
     let selection = dist.select(&profile);
     let mut reader = dist.image_reader();
+    let selected: Vec<&sw_core::idb::Entry> = selection
+        .selected
+        .iter()
+        .map(|located| located.entry)
+        .collect();
 
-    let report = extract::extract(
-        &mut reader,
-        &selection.selected,
-        &out,
-        &ExtractOptions::default(),
-    );
+    let report =
+        extract::extract_unchecked(&mut reader, &selected, &out, &ExtractOptions::default());
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     assert_eq!(std::fs::read(out.join("hello.txt")).unwrap(), b"hello");
@@ -465,7 +466,7 @@ fn regular_entry_without_payload_is_a_failure() {
     let product = dist.product("t").unwrap();
     let entry = &product.entries[0];
     let mut reader = dist.image_reader();
-    let report = extract::extract(
+    let report = extract::extract_unchecked(
         &mut reader,
         &[entry],
         &root.join("out"),
@@ -516,7 +517,8 @@ fn extraction_decode_modes() {
     let entry = &dist.product("t").unwrap().entries[0];
     let mut reader = dist.image_reader();
     let out = root.join("out-auto");
-    let report = extract::extract(&mut reader, &[entry], &out, &ExtractOptions::default());
+    let report =
+        extract::extract_unchecked(&mut reader, &[entry], &out, &ExtractOptions::default());
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert_eq!(std::fs::read(out.join("cshrc")).unwrap(), plain);
     assert!(!out.join("cshrc.Z").exists());
@@ -527,7 +529,7 @@ fn extraction_decode_modes() {
         keep_stored: true,
         ..ExtractOptions::default()
     };
-    let report = extract::extract(&mut reader, &[entry], &out, &options);
+    let report = extract::extract_unchecked(&mut reader, &[entry], &out, &options);
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert_eq!(std::fs::read(out.join("cshrc")).unwrap(), plain);
     assert_eq!(std::fs::read(out.join("cshrc.Z")).unwrap(), compressed);
@@ -538,7 +540,7 @@ fn extraction_decode_modes() {
         decode: DecodeMode::Never,
         ..ExtractOptions::default()
     };
-    let report = extract::extract(&mut reader, &[entry], &out, &options);
+    let report = extract::extract_unchecked(&mut reader, &[entry], &out, &options);
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert!(!out.join("cshrc").exists());
     assert_eq!(std::fs::read(out.join("cshrc.Z")).unwrap(), compressed);
@@ -568,7 +570,7 @@ fn extraction_path_modes() {
         path_mode: PathMode::Flat,
         ..ExtractOptions::default()
     };
-    let report = extract::extract(&mut reader, &hello, &out, &options);
+    let report = extract::extract_unchecked(&mut reader, &hello, &out, &options);
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert_eq!(std::fs::read(out.join("hello.txt")).unwrap(), b"hello");
 
@@ -578,7 +580,7 @@ fn extraction_path_modes() {
         path_mode: PathMode::RelativeTo(IrixPath::new("bin").unwrap()),
         ..ExtractOptions::default()
     };
-    let report = extract::extract(&mut reader, &tools, &out, &options);
+    let report = extract::extract_unchecked(&mut reader, &tools, &out, &options);
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert_eq!(report.skipped, 0);
     assert!(out.join("tool").is_file());
@@ -594,7 +596,7 @@ fn extraction_path_modes() {
         .collect();
     assert_eq!(bin_dir.len(), 1);
     let out = root.join("out-root");
-    let report = extract::extract(&mut reader, &bin_dir, &out, &options);
+    let report = extract::extract_unchecked(&mut reader, &bin_dir, &out, &options);
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert_eq!(report.extracted, 1);
     assert!(out.is_dir());

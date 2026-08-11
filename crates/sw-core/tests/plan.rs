@@ -2,7 +2,7 @@
 //! invariants, the hardware gates, collision/topology/existing-output
 //! preflights, the atomic no-clobber write layer, and checked execution.
 use std::path::{Path, PathBuf};
-use sw_core::distribution::Distribution;
+use sw_core::distribution::{Distribution, EntryKey};
 use sw_core::error::Error;
 use sw_core::extract::{self, DecodeMode, ExistingOutputPolicy, ExtractOptions, PathMode};
 use sw_core::idb::Entry;
@@ -330,16 +330,27 @@ fn open() -> (PathBuf, Distribution) {
     (root, dist)
 }
 
-fn entries<'a>(dist: &'a Distribution, product: &str) -> Vec<&'a Entry> {
-    dist.product(product).unwrap().entries.iter().collect()
-}
-
-fn entries_named<'a>(dist: &'a Distribution, product: &str, path: &str) -> Vec<&'a Entry> {
+fn keys(dist: &Distribution, product: &str) -> Vec<EntryKey> {
+    let product_index = dist
+        .products()
+        .iter()
+        .position(|p| p.name.as_str() == product)
+        .unwrap();
     dist.product(product)
         .unwrap()
         .entries
         .iter()
-        .filter(|entry| entry.path.as_str() == path)
+        .map(|entry| EntryKey {
+            product_index,
+            entry_id: entry.id,
+        })
+        .collect()
+}
+
+fn keys_named(dist: &Distribution, product: &str, path: &str) -> Vec<EntryKey> {
+    keys(dist, product)
+        .into_iter()
+        .filter(|key| dist.entry(*key).unwrap().entry.path.as_str() == path)
         .collect()
 }
 
@@ -358,9 +369,17 @@ fn refuse_options() -> ExtractOptions {
     }
 }
 
+/// The plain entry references of a key list, for the tests that
+/// exercise the low-level writer directly.
+fn plain<'a>(dist: &'a Distribution, keys: &[EntryKey]) -> Vec<&'a Entry> {
+    keys.iter()
+        .map(|key| dist.entry(*key).expect("key resolves").entry)
+        .collect()
+}
+
 fn plan_err(
     dist: &Distribution,
-    requested: &[&Entry],
+    requested: &[EntryKey],
     out: &Path,
     options: &ExtractOptions,
     profile: Option<&HardwareProfile>,
@@ -377,7 +396,7 @@ fn plan_err(
 #[test]
 fn projection_error_of_unselected_entry_does_not_block() {
     let (root, dist) = open();
-    let requested = entries(&dist, "mv");
+    let requested = keys(&dist, "mv");
     let ip22 = profile(&[("CPUBOARD", "IP22")]);
     let plan = plan::plan_extraction(
         &dist,
@@ -388,7 +407,7 @@ fn projection_error_of_unselected_entry_does_not_block() {
     )
     .expect("bad variant is excluded, so its projection error must not block");
     assert_eq!(plan.entries.len(), 1);
-    assert_eq!(plan.entries[0].path.as_str(), "good.txt");
+    assert_eq!(plan.entries[0].entry.path.as_str(), "good.txt");
     assert_eq!(plan.summary.hardware_excluded_records, 1);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -396,7 +415,7 @@ fn projection_error_of_unselected_entry_does_not_block() {
 #[test]
 fn projection_error_of_selected_entry_blocks() {
     let (root, dist) = open();
-    let requested = entries(&dist, "mv");
+    let requested = keys(&dist, "mv");
     let ip30 = profile(&[("CPUBOARD", "IP30")]);
     let error = plan::plan_extraction(
         &dist,
@@ -418,8 +437,8 @@ fn gate_runs_before_projection_errors_propagate() {
     // An ambiguous scope (three bin/tool variants) that also contains a
     // statically broken entry: without a profile the ambiguity must be
     // reported, not the payload problem.
-    let mut requested = entries_named(&dist, "test", "bin/tool");
-    requested.extend(entries_named(&dist, "mv", "bad.txt"));
+    let mut requested = keys_named(&dist, "test", "bin/tool");
+    requested.extend(keys_named(&dist, "mv", "bad.txt"));
     let message = plan_err(
         &dist,
         &requested,
@@ -441,11 +460,11 @@ fn omissions_outside_relative_to_prefix_do_not_participate() {
     let (root, dist) = open();
     // The etc/conf pair would be ambiguous without a profile, but it is
     // outside the `bin` prefix and therefore omitted entirely.
-    let mut requested = entries_named(&dist, "test", "etc/conf");
+    let mut requested = keys_named(&dist, "test", "etc/conf");
     requested.extend(
-        entries_named(&dist, "test", "bin/tool")
+        keys_named(&dist, "test", "bin/tool")
             .into_iter()
-            .filter(|entry| entry.source_path == "src/tool3"),
+            .filter(|key| dist.entry(*key).unwrap().entry.source_path == "src/tool3"),
     );
     let options = ExtractOptions {
         path_mode: PathMode::RelativeTo(IrixPath::new("bin").unwrap()),
@@ -462,9 +481,9 @@ fn omissions_outside_relative_to_prefix_do_not_participate() {
 #[test]
 fn devices_and_unresolved_symlinks_are_omitted() {
     let (root, dist) = open();
-    let mut requested = entries_named(&dist, "test", "var/pipe");
-    requested.extend(entries_named(&dist, "test", "dangling"));
-    requested.extend(entries_named(&dist, "test", "hello.txt"));
+    let mut requested = keys_named(&dist, "test", "var/pipe");
+    requested.extend(keys_named(&dist, "test", "dangling"));
+    requested.extend(keys_named(&dist, "test", "hello.txt"));
     let plan = plan::plan_extraction(
         &dist,
         &requested,
@@ -475,7 +494,7 @@ fn devices_and_unresolved_symlinks_are_omitted() {
     .expect("a FIFO and a targetless symlink are deliberate omissions");
     assert_eq!(plan.summary.omitted_records, 2);
     assert_eq!(plan.entries.len(), 1);
-    assert_eq!(plan.entries[0].path.as_str(), "hello.txt");
+    assert_eq!(plan.entries[0].entry.path.as_str(), "hello.txt");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -486,7 +505,7 @@ fn devices_and_unresolved_symlinks_are_omitted() {
 #[test]
 fn duplicate_non_directory_paths_refuse_without_profile() {
     let (root, dist) = open();
-    let requested = entries_named(&dist, "test", "bin/tool");
+    let requested = keys_named(&dist, "test", "bin/tool");
     let message = plan_err(
         &dist,
         &requested,
@@ -506,10 +525,10 @@ fn duplicate_non_directory_paths_refuse_without_profile() {
 #[test]
 fn duplicate_directories_are_legal_without_profile() {
     let (root, dist) = open();
-    let mut requested = entries_named(&dist, "dupa", "opt/shared");
-    requested.extend(entries_named(&dist, "dupb", "opt/shared"));
-    requested.extend(entries_named(&dist, "dupa", "only/a.txt"));
-    requested.extend(entries_named(&dist, "dupb", "only/b.txt"));
+    let mut requested = keys_named(&dist, "dupa", "opt/shared");
+    requested.extend(keys_named(&dist, "dupb", "opt/shared"));
+    requested.extend(keys_named(&dist, "dupa", "only/a.txt"));
+    requested.extend(keys_named(&dist, "dupb", "only/b.txt"));
     let plan = plan::plan_extraction(
         &dist,
         &requested,
@@ -525,7 +544,7 @@ fn duplicate_directories_are_legal_without_profile() {
 #[test]
 fn unparsable_entry_mach_refuses_without_profile() {
     let (root, dist) = open();
-    let requested = entries_named(&dist, "test", "broken");
+    let requested = keys_named(&dist, "test", "broken");
     let message = plan_err(
         &dist,
         &requested,
@@ -544,7 +563,7 @@ fn unresolved_hierarchy_refuses_without_profile() {
     // Subsystem-, product- and image-level undecodable restrictions all
     // make the affected entries' applicability unknown.
     for product in ["side", "pun", "iun"] {
-        let requested = entries(&dist, product);
+        let requested = keys(&dist, product);
         let message = plan_err(
             &dist,
             &requested,
@@ -567,7 +586,7 @@ fn unresolved_hierarchy_refuses_without_profile() {
 #[test]
 fn profile_selects_matching_variant() {
     let (root, dist) = open();
-    let requested = entries_named(&dist, "test", "bin/tool");
+    let requested = keys_named(&dist, "test", "bin/tool");
     let ip22 = profile(&[("CPUBOARD", "IP22")]);
     let plan = plan::plan_extraction(
         &dist,
@@ -578,7 +597,7 @@ fn profile_selects_matching_variant() {
     )
     .expect("one specific variant applies");
     assert_eq!(plan.entries.len(), 1);
-    assert_eq!(plan.entries[0].source_path, "src/tool1");
+    assert_eq!(plan.entries[0].entry.source_path, "src/tool1");
     assert_eq!(plan.summary.hardware_excluded_records, 2);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -586,7 +605,7 @@ fn profile_selects_matching_variant() {
 #[test]
 fn profile_falls_back_without_match() {
     let (root, dist) = open();
-    let requested = entries_named(&dist, "test", "bin/tool");
+    let requested = keys_named(&dist, "test", "bin/tool");
     let ip20 = profile(&[("CPUBOARD", "IP20")]);
     let plan = plan::plan_extraction(
         &dist,
@@ -597,14 +616,14 @@ fn profile_falls_back_without_match() {
     )
     .expect("the mach-less fallback applies");
     assert_eq!(plan.entries.len(), 1);
-    assert_eq!(plan.entries[0].source_path, "src/tool3");
+    assert_eq!(plan.entries[0].entry.source_path, "src/tool3");
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn conflict_touching_scope_refuses() {
     let (root, dist) = open();
-    let requested = entries_named(&dist, "test", "etc/conf");
+    let requested = keys_named(&dist, "test", "etc/conf");
     let both = profile(&[("CPUBOARD", "IP22"), ("CPUARCH", "R4400")]);
     let message = plan_err(
         &dist,
@@ -623,7 +642,7 @@ fn conflict_outside_scope_does_not_block() {
     let (root, dist) = open();
     // etc/conf (both-specific) and broken (unparsable) are conflicts in
     // this profile, but they are outside the requested scope.
-    let requested = entries_named(&dist, "test", "hello.txt");
+    let requested = keys_named(&dist, "test", "hello.txt");
     let both = profile(&[("CPUBOARD", "IP22"), ("CPUARCH", "R4400")]);
     let plan = plan::plan_extraction(
         &dist,
@@ -640,7 +659,7 @@ fn conflict_outside_scope_does_not_block() {
 #[test]
 fn profile_selecting_nothing_refuses() {
     let (root, dist) = open();
-    let requested = entries(&dist, "nb");
+    let requested = keys(&dist, "nb");
     let ip99 = profile(&[("CPUBOARD", "IP99")]);
     let message = plan_err(
         &dist,
@@ -665,8 +684,8 @@ fn cross_subsystem_collision_refuses() {
     let (root, dist) = open();
     // With a profile both mach-less variants stay selected, and the
     // shared output path is caught by the collision preflight.
-    let mut requested = entries(&dist, "dupa");
-    requested.extend(entries(&dist, "dupb"));
+    let mut requested = keys(&dist, "dupa");
+    requested.extend(keys(&dist, "dupb"));
     let ip22 = profile(&[("CPUBOARD", "IP22")]);
     let message = plan_err(
         &dist,
@@ -688,8 +707,8 @@ fn cross_subsystem_collision_refuses() {
 #[test]
 fn flat_basename_collision_refuses() {
     let (root, dist) = open();
-    let mut requested = entries_named(&dist, "dupa", "a/same.txt");
-    requested.extend(entries_named(&dist, "dupb", "b/same.txt"));
+    let mut requested = keys_named(&dist, "dupa", "a/same.txt");
+    requested.extend(keys_named(&dist, "dupb", "b/same.txt"));
     let options = ExtractOptions {
         path_mode: PathMode::Flat,
         ..ExtractOptions::default()
@@ -706,7 +725,7 @@ fn flat_basename_collision_refuses() {
 #[test]
 fn raw_mode_z_sidecar_collision_refuses() {
     let (root, dist) = open();
-    let requested = entries(&dist, "zcol");
+    let requested = keys(&dist, "zcol");
     let options = ExtractOptions {
         decode: DecodeMode::Never,
         ..ExtractOptions::default()
@@ -723,7 +742,7 @@ fn raw_mode_z_sidecar_collision_refuses() {
 #[test]
 fn keep_stored_z_sidecar_collision_refuses() {
     let (root, dist) = open();
-    let requested = entries(&dist, "zcol");
+    let requested = keys(&dist, "zcol");
     let options = ExtractOptions {
         keep_stored: true,
         ..ExtractOptions::default()
@@ -740,7 +759,7 @@ fn keep_stored_z_sidecar_collision_refuses() {
 #[test]
 fn auto_decode_without_keep_stored_has_no_sidecar_collision() {
     let (root, dist) = open();
-    let requested = entries(&dist, "zcol");
+    let requested = keys(&dist, "zcol");
     let plan = plan::plan_extraction(
         &dist,
         &requested,
@@ -760,9 +779,9 @@ fn auto_decode_without_keep_stored_has_no_sidecar_collision() {
 #[test]
 fn non_directory_planned_ancestor_refuses() {
     let (root, dist) = open();
-    let requested = entries_named(&dist, "topo", "blk")
+    let requested = keys_named(&dist, "topo", "blk")
         .into_iter()
-        .chain(entries_named(&dist, "topo", "blk/inner"))
+        .chain(keys_named(&dist, "topo", "blk/inner"))
         .collect::<Vec<_>>();
     let message = plan_err(
         &dist,
@@ -785,9 +804,9 @@ fn non_directory_planned_ancestor_refuses() {
 #[test]
 fn directory_planned_ancestor_is_legal() {
     let (root, dist) = open();
-    let requested = entries_named(&dist, "topo", "okdir")
+    let requested = keys_named(&dist, "topo", "okdir")
         .into_iter()
-        .chain(entries_named(&dist, "topo", "okdir/inner"))
+        .chain(keys_named(&dist, "topo", "okdir/inner"))
         .collect::<Vec<_>>();
     plan::plan_extraction(
         &dist,
@@ -804,9 +823,9 @@ fn directory_planned_ancestor_is_legal() {
 #[test]
 fn planned_symlink_ancestor_refuses() {
     let (root, dist) = open();
-    let requested = entries_named(&dist, "topo", "linkdir")
+    let requested = keys_named(&dist, "topo", "linkdir")
         .into_iter()
-        .chain(entries_named(&dist, "topo", "linkdir/inner"))
+        .chain(keys_named(&dist, "topo", "linkdir/inner"))
         .collect::<Vec<_>>();
     let message = plan_err(
         &dist,
@@ -825,7 +844,7 @@ fn planned_symlink_ancestor_refuses() {
 #[test]
 fn non_directory_mapping_to_output_root_refuses() {
     let (root, dist) = open();
-    let requested = entries_named(&dist, "test", "hello.txt");
+    let requested = keys_named(&dist, "test", "hello.txt");
     let options = ExtractOptions {
         path_mode: PathMode::RelativeTo(IrixPath::new("hello.txt").unwrap()),
         ..ExtractOptions::default()
@@ -844,8 +863,8 @@ fn non_directory_mapping_to_output_root_refuses() {
 #[test]
 fn case_only_output_difference_collides_on_windows() {
     let (root, dist) = open();
-    let mut requested = entries_named(&dist, "case", "usr/Upper.txt");
-    requested.extend(entries_named(&dist, "case", "usr/upper.txt"));
+    let mut requested = keys_named(&dist, "case", "usr/Upper.txt");
+    requested.extend(keys_named(&dist, "case", "usr/upper.txt"));
     let message = plan_err(
         &dist,
         &requested,
@@ -866,9 +885,9 @@ fn case_only_output_difference_collides_on_windows() {
 #[test]
 fn case_only_non_directory_ancestor_blocks_topology_on_windows() {
     let (root, dist) = open();
-    let requested = entries_named(&dist, "case", "CASEBLK")
+    let requested = keys_named(&dist, "case", "CASEBLK")
         .into_iter()
-        .chain(entries_named(&dist, "case", "caseblk/inner"))
+        .chain(keys_named(&dist, "case", "caseblk/inner"))
         .collect::<Vec<_>>();
     let message = plan_err(
         &dist,
@@ -890,9 +909,9 @@ fn case_only_non_directory_ancestor_blocks_topology_on_windows() {
 #[test]
 fn case_only_directory_ancestor_is_legal_on_windows() {
     let (root, dist) = open();
-    let requested = entries_named(&dist, "case", "CASEDIR")
+    let requested = keys_named(&dist, "case", "CASEDIR")
         .into_iter()
-        .chain(entries_named(&dist, "case", "casedir/inner"))
+        .chain(keys_named(&dist, "case", "casedir/inner"))
         .collect::<Vec<_>>();
     let plan = plan::plan_extraction(
         &dist,
@@ -916,7 +935,7 @@ fn existing_regular_target_refuses() {
     let out = root.join("out");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(out.join("hello.txt"), b"KEEP").unwrap();
-    let requested = entries_named(&dist, "test", "hello.txt");
+    let requested = keys_named(&dist, "test", "hello.txt");
     let message = plan_err(&dist, &requested, &out, &refuse_options(), None);
     assert!(
         message.contains("extraction would overwrite existing files"),
@@ -932,7 +951,7 @@ fn existing_regular_target_allowed_and_counted() {
     let out = root.join("out");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(out.join("hello.txt"), b"OLD").unwrap();
-    let requested = entries_named(&dist, "test", "hello.txt");
+    let requested = keys_named(&dist, "test", "hello.txt");
     let plan = plan::plan_extraction(&dist, &requested, &out, &ExtractOptions::default(), None)
         .expect("Allow permits overwriting an existing regular file");
     assert_eq!(plan.summary.existing_outputs, 1);
@@ -944,7 +963,7 @@ fn existing_directory_for_directory_entry_is_allowed() {
     let (root, dist) = open();
     let out = root.join("out");
     std::fs::create_dir_all(out.join("bin")).unwrap();
-    let requested = entries_named(&dist, "test", "bin");
+    let requested = keys_named(&dist, "test", "bin");
     plan::plan_extraction(&dist, &requested, &out, &refuse_options(), None)
         .expect("a directory output may merge into an existing real directory");
     let _ = std::fs::remove_dir_all(&root);
@@ -955,7 +974,7 @@ fn existing_directory_for_regular_entry_refuses() {
     let (root, dist) = open();
     let out = root.join("out");
     std::fs::create_dir_all(out.join("hello.txt")).unwrap();
-    let requested = entries_named(&dist, "test", "hello.txt");
+    let requested = keys_named(&dist, "test", "hello.txt");
     // Even the Allow policy never replaces a directory with a file.
     let message = plan_err(&dist, &requested, &out, &ExtractOptions::default(), None);
     assert!(
@@ -973,7 +992,7 @@ fn existing_symlink_target_refuses_even_with_allow() {
     let out = root.join("out");
     std::fs::create_dir_all(&out).unwrap();
     std::os::unix::fs::symlink("/tmp/elsewhere", out.join("hello.txt")).unwrap();
-    let requested = entries_named(&dist, "test", "hello.txt");
+    let requested = keys_named(&dist, "test", "hello.txt");
     let message = plan_err(&dist, &requested, &out, &ExtractOptions::default(), None);
     assert!(message.contains("existing symbolic link"), "{message}");
     let _ = std::fs::remove_dir_all(&root);
@@ -986,7 +1005,7 @@ fn existing_regular_target_refuses_planned_symlink_even_with_allow() {
     let out = root.join("out");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(out.join("hello.link"), b"KEEP").unwrap();
-    let requested = entries_named(&dist, "test", "hello.link");
+    let requested = keys_named(&dist, "test", "hello.link");
     // Allow only ever replaces an existing regular file with a
     // regular-file output; a planned symbolic link taking its place
     // would change the filesystem object type, not overwrite contents.
@@ -1007,9 +1026,9 @@ fn existing_symlink_ancestor_refuses() {
     let out = root.join("out");
     std::fs::create_dir_all(&out).unwrap();
     std::os::unix::fs::symlink("/tmp/elsewhere", out.join("bin")).unwrap();
-    let requested: Vec<&Entry> = entries_named(&dist, "test", "bin/tool")
+    let requested: Vec<EntryKey> = keys_named(&dist, "test", "bin/tool")
         .into_iter()
-        .filter(|entry| entry.source_path == "src/tool3")
+        .filter(|key| dist.entry(*key).unwrap().entry.source_path == "src/tool3")
         .collect();
     let message = plan_err(&dist, &requested, &out, &refuse_options(), None);
     assert!(
@@ -1025,9 +1044,9 @@ fn existing_regular_file_ancestor_refuses() {
     let out = root.join("out");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(out.join("bin"), b"not a dir").unwrap();
-    let requested: Vec<&Entry> = entries_named(&dist, "test", "bin/tool")
+    let requested: Vec<EntryKey> = keys_named(&dist, "test", "bin/tool")
         .into_iter()
-        .filter(|entry| entry.source_path == "src/tool3")
+        .filter(|key| dist.entry(*key).unwrap().entry.source_path == "src/tool3")
         .collect();
     let message = plan_err(&dist, &requested, &out, &refuse_options(), None);
     assert!(
@@ -1042,7 +1061,7 @@ fn output_root_existing_as_file_refuses() {
     let (root, dist) = open();
     let out = root.join("out");
     std::fs::write(&out, b"not a dir").unwrap();
-    let requested = entries_named(&dist, "test", "hello.txt");
+    let requested = keys_named(&dist, "test", "hello.txt");
     let message = plan_err(&dist, &requested, &out, &refuse_options(), None);
     assert!(message.contains("is not a directory"), "{message}");
     let _ = std::fs::remove_dir_all(&root);
@@ -1056,7 +1075,7 @@ fn output_root_may_itself_be_a_symlink() {
     std::fs::create_dir_all(&real).unwrap();
     let out = root.join("out-link");
     std::os::unix::fs::symlink(&real, &out).unwrap();
-    let requested = entries_named(&dist, "test", "hello.txt");
+    let requested = keys_named(&dist, "test", "hello.txt");
     // The output root is the user's explicit trust boundary.
     plan::plan_extraction(&dist, &requested, &out, &refuse_options(), None)
         .expect("the output root itself may be a symbolic link");
@@ -1109,8 +1128,8 @@ fn planning_never_mutates_the_filesystem() {
 
     // A refused plan (cross-subsystem collision) against a nonexistent
     // output directory.
-    let mut requested = entries(&dist, "dupa");
-    requested.extend(entries(&dist, "dupb"));
+    let mut requested = keys(&dist, "dupa");
+    requested.extend(keys(&dist, "dupb"));
     let ip22 = profile(&[("CPUBOARD", "IP22")]);
     assert!(
         plan::plan_extraction(
@@ -1123,7 +1142,7 @@ fn planning_never_mutates_the_filesystem() {
         .is_err()
     );
     // A successful plan against another nonexistent output directory.
-    let hello = entries_named(&dist, "test", "hello.txt");
+    let hello = keys_named(&dist, "test", "hello.txt");
     plan::plan_extraction(
         &dist,
         &hello,
@@ -1151,9 +1170,10 @@ fn refuse_write_never_clobbers_an_existing_regular_file() {
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(out.join("hello.txt"), b"KEEP").unwrap();
 
-    let hello = entries_named(&dist, "test", "hello.txt");
+    let hello = keys_named(&dist, "test", "hello.txt");
     let mut reader = dist.image_reader();
-    let report = extract::extract(&mut reader, &hello, &out, &refuse_options());
+    let report =
+        extract::extract_unchecked(&mut reader, &plain(&dist, &hello), &out, &refuse_options());
     assert_eq!(report.extracted, 0);
     assert_eq!(report.failures.len(), 1);
     // The target was neither truncated nor modified.
@@ -1168,9 +1188,14 @@ fn allow_write_still_overwrites() {
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(out.join("hello.txt"), b"OLD").unwrap();
 
-    let hello = entries_named(&dist, "test", "hello.txt");
+    let hello = keys_named(&dist, "test", "hello.txt");
     let mut reader = dist.image_reader();
-    let report = extract::extract(&mut reader, &hello, &out, &ExtractOptions::default());
+    let report = extract::extract_unchecked(
+        &mut reader,
+        &plain(&dist, &hello),
+        &out,
+        &ExtractOptions::default(),
+    );
     assert_eq!(report.extracted, 1);
     assert_eq!(std::fs::read(out.join("hello.txt")).unwrap(), b"hello");
     let _ = std::fs::remove_dir_all(&root);
@@ -1184,9 +1209,10 @@ fn refuse_symlink_never_replaces_an_existing_path() {
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(out.join("hello.link"), b"KEEP").unwrap();
 
-    let link = entries_named(&dist, "test", "hello.link");
+    let link = keys_named(&dist, "test", "hello.link");
     let mut reader = dist.image_reader();
-    let report = extract::extract(&mut reader, &link, &out, &refuse_options());
+    let report =
+        extract::extract_unchecked(&mut reader, &plain(&dist, &link), &out, &refuse_options());
     assert_eq!(report.extracted, 0);
     assert_eq!(report.failures.len(), 1);
     assert_eq!(std::fs::read(out.join("hello.link")).unwrap(), b"KEEP");
@@ -1201,11 +1227,16 @@ fn allow_symlink_never_replaces_an_existing_regular_file() {
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(out.join("hello.link"), b"KEEP").unwrap();
 
-    let link = entries_named(&dist, "test", "hello.link");
+    let link = keys_named(&dist, "test", "hello.link");
     let mut reader = dist.image_reader();
     // The Allow policy overwrites regular-file contents only; it never
     // removes an existing file to make room for a symbolic link.
-    let report = extract::extract(&mut reader, &link, &out, &ExtractOptions::default());
+    let report = extract::extract_unchecked(
+        &mut reader,
+        &plain(&dist, &link),
+        &out,
+        &ExtractOptions::default(),
+    );
     assert_eq!(report.extracted, 0);
     assert_eq!(report.failures.len(), 1);
     assert_eq!(std::fs::read(out.join("hello.link")).unwrap(), b"KEEP");
@@ -1220,10 +1251,15 @@ fn allow_symlink_never_replaces_an_existing_symlink() {
     std::fs::create_dir_all(&out).unwrap();
     std::os::unix::fs::symlink("/tmp/elsewhere", out.join("hello.link")).unwrap();
 
-    let link = entries_named(&dist, "test", "hello.link");
+    let link = keys_named(&dist, "test", "hello.link");
     let mut reader = dist.image_reader();
     // A pre-existing link (even a dangling one) is never retargeted.
-    let report = extract::extract(&mut reader, &link, &out, &ExtractOptions::default());
+    let report = extract::extract_unchecked(
+        &mut reader,
+        &plain(&dist, &link),
+        &out,
+        &ExtractOptions::default(),
+    );
     assert_eq!(report.extracted, 0);
     assert_eq!(report.failures.len(), 1);
     assert_eq!(
@@ -1240,9 +1276,9 @@ fn allow_symlink_never_replaces_an_existing_symlink() {
 #[test]
 fn extract_checked_plans_and_extracts() {
     let (root, dist) = open();
-    let mut requested = entries_named(&dist, "test", "hello.txt");
-    requested.extend(entries_named(&dist, "test", "bin"));
-    requested.extend(entries_named(&dist, "test", "empty.txt"));
+    let mut requested = keys_named(&dist, "test", "hello.txt");
+    requested.extend(keys_named(&dist, "test", "bin"));
+    requested.extend(keys_named(&dist, "test", "empty.txt"));
     let out = root.join("out");
     let checked = plan::extract_checked(&dist, &requested, &out, &refuse_options(), None)
         .expect("the fresh plan succeeds");
@@ -1259,7 +1295,7 @@ fn extract_checked_plans_and_extracts() {
 #[test]
 fn extract_checked_replans_immediately_before_writing() {
     let (root, dist) = open();
-    let requested = entries_named(&dist, "test", "hello.txt");
+    let requested = keys_named(&dist, "test", "hello.txt");
     let out = root.join("out");
     // Preflight succeeds while the output directory does not exist yet.
     plan::plan_extraction(&dist, &requested, &out, &refuse_options(), None)
@@ -1290,10 +1326,10 @@ fn summary_counts_every_category() {
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(out.join("cshrc"), b"OLD").unwrap();
 
-    let mut requested = entries_named(&dist, "test", "hello.txt");
-    requested.extend(entries_named(&dist, "test", "cshrc"));
-    requested.extend(entries_named(&dist, "test", "var/pipe"));
-    requested.extend(entries_named(&dist, "test", "bin/tool"));
+    let mut requested = keys_named(&dist, "test", "hello.txt");
+    requested.extend(keys_named(&dist, "test", "cshrc"));
+    requested.extend(keys_named(&dist, "test", "var/pipe"));
+    requested.extend(keys_named(&dist, "test", "bin/tool"));
     let options = ExtractOptions {
         keep_stored: true,
         ..ExtractOptions::default()
@@ -1329,13 +1365,17 @@ fn real_dist_planner_smoke() {
     let ip22 = profile(&[("CPUBOARD", "IP22")]);
     let out = std::env::temp_dir().join(format!("sw-core-plan-real-{}", std::process::id()));
     let mut planned: Option<ExtractionPlan> = None;
-    'outer: for product in dist.products() {
+    'outer: for (product_index, product) in dist.products().iter().enumerate() {
         for entry in &product.entries {
             if entry.payload.is_none() {
                 continue;
             }
+            let key = EntryKey {
+                product_index,
+                entry_id: entry.id,
+            };
             if let Ok(plan) =
-                plan::plan_extraction(&dist, &[entry], &out, &refuse_options(), Some(&ip22))
+                plan::plan_extraction(&dist, &[key], &out, &refuse_options(), Some(&ip22))
             {
                 planned = Some(plan);
                 break 'outer;
@@ -1346,14 +1386,12 @@ fn real_dist_planner_smoke() {
     assert_eq!(plan.summary.requested_records, 1);
     assert_eq!(plan.summary.planned_records, 1);
     assert!(plan.summary.output_paths >= 1);
-    // Entry identity survives the planner round-trip.
-    let entry = plan.entries[0];
-    let owner = dist
-        .products()
-        .iter()
-        .flat_map(|product| product.entries.iter())
-        .find(|candidate| std::ptr::eq(*candidate, entry));
-    assert!(owner.is_some());
+    // Entry identity survives the planner round-trip: the planned key
+    // resolves back to the very same entry.
+    let key = plan.entries[0].key;
+    let resolved = dist.entry(key).expect("the planned key resolves");
+    assert_eq!(resolved.key, key);
+    assert!(std::ptr::eq(resolved.entry, plan.entries[0].entry));
     let _ = std::fs::remove_dir_all(&out);
 }
 
@@ -1366,7 +1404,7 @@ fn real_dist_checked_extraction_smoke() {
     let dist = Distribution::open(&path).expect("open real distribution");
     let out = std::env::temp_dir().join(format!("sw-core-extract-real-{}", std::process::id()));
     let mut extracted = 0;
-    'outer: for product in dist.products() {
+    'outer: for (product_index, product) in dist.products().iter().enumerate() {
         for entry in &product.entries {
             if extracted >= 3 {
                 break;
@@ -1378,7 +1416,11 @@ fn real_dist_checked_extraction_smoke() {
             {
                 continue;
             }
-            let Ok(checked) = plan::extract_checked(&dist, &[entry], &out, &refuse_options(), None)
+            let key = EntryKey {
+                product_index,
+                entry_id: entry.id,
+            };
+            let Ok(checked) = plan::extract_checked(&dist, &[key], &out, &refuse_options(), None)
             else {
                 continue;
             };

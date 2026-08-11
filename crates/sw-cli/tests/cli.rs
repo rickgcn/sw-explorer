@@ -518,6 +518,76 @@ fn find_no_match_is_not_an_error() {
     assert!(stderr.contains("no entries match"));
 }
 
+#[test]
+fn find_rejects_an_empty_query() {
+    let dist = build_dist();
+    let (code, _, stderr) = run(sw(&dist).args(["find", ""]));
+    assert_eq!(code, 1);
+    assert!(stderr.contains("search query is empty"), "{stderr}");
+}
+
+/// Builds the ownership regression distribution: `alpha`'s IDB carries
+/// a record naming the *foreign* subsystem `beta.sw.unix`, while `beta`
+/// has its own record with the same entry id. The record belongs to
+/// alpha; the subsystem name is not an ownership boundary.
+fn build_foreign_dist() -> PathBuf {
+    let root = temp_dir("foreign");
+    // Both records are explicitly empty regular files: no image
+    // archive is needed for the extraction assertion below.
+    std::fs::write(
+        root.join("alpha.idb"),
+        "f 0755 root sys usr/bin/foreign src/f beta.sw.unix sum(1) size(0) mach(CPUBOARD=IP22)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("beta.idb"),
+        "f 0755 root sys usr/bin/beta src/b beta.sw.unix sum(1) size(0) mach(CPUBOARD=IP22)\n",
+    )
+    .unwrap();
+    root
+}
+
+#[test]
+fn find_with_mach_keeps_foreign_records_with_their_actual_owner() {
+    let dist = build_foreign_dist();
+    let (code, stdout, _) = run(sw(&dist).args(["find", "foreign", "--mach", "CPUBOARD=IP22"]));
+    assert_eq!(code, 0);
+    let row = stdout
+        .lines()
+        .find(|line| line.contains("usr/bin/foreign"))
+        .expect("the foreign record is found");
+    // The displayed product is the actual owner (alpha), never the
+    // product segment of the record's subsystem name (beta).
+    assert!(row.starts_with("alpha"), "{row}");
+    assert!(row.contains("beta.sw.unix"), "{row}");
+    // beta's own record shares the entry id but is a different entry:
+    // it must not leak into this result.
+    assert!(!stdout.contains("usr/bin/beta"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dist);
+}
+
+#[test]
+fn extract_by_path_keeps_foreign_records_with_their_actual_owner() {
+    let dist = build_foreign_dist();
+    let out = temp_dir("out");
+    let (code, _, stderr) = run(sw(&dist)
+        .args([
+            "extract",
+            "--path",
+            "foreign",
+            "--mach",
+            "CPUBOARD=IP22",
+            "-o",
+        ])
+        .arg(&out));
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(std::fs::read(out.join("usr/bin/foreign")).unwrap(), b"");
+    // beta's same-id record was never in the requested scope.
+    assert!(!out.join("usr/bin/beta").exists());
+    let _ = std::fs::remove_dir_all(&dist);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
 // --- select -----------------------------------------------------------
 
 #[test]

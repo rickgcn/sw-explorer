@@ -24,6 +24,7 @@ use crate::image::layout::{
 };
 use crate::image::reader::ImageReader;
 use crate::image::{Image, ImageArchive, ImageLayout};
+use crate::mach::candidates::HardwareCandidateSet;
 use crate::mach::eval::HardwareProfile;
 use crate::names::{ImageName, ProductName};
 use crate::query::{Query, QueryResult};
@@ -37,6 +38,49 @@ pub struct DistributionSupportFiles {
     pub sa: Option<PathBuf>,
     /// The miniroot (`mr`) file, if present.
     pub mr: Option<PathBuf>,
+}
+
+/// The canonical identity of an [`Entry`] within one [`Distribution`]
+/// instance.
+///
+/// An [`EntryId`] alone identifies an entry only within its owning
+/// product; several products may hold an entry with the same id, and a
+/// record's subsystem name says nothing about ownership (an IDB record
+/// may name a foreign subsystem). `EntryKey` pairs the entry id with
+/// the position of the owning product in [`Distribution::products`],
+/// making it unique across the whole distribution.
+///
+/// Stability contract: an `EntryKey` is valid for the lifetime of the
+/// [`Distribution`] instance it was obtained from. It is a session-local
+/// identity, not a permanent database id: it is *not* stable across
+/// reopening the same directory, and never comparable across different
+/// `Distribution` instances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EntryKey {
+    /// Position of the owning product in [`Distribution::products`].
+    pub product_index: usize,
+    /// The entry's id within its owning product (IDB order, 0-based).
+    pub entry_id: EntryId,
+}
+
+/// An entry together with its canonical distribution-wide identity.
+///
+/// This is the shape every distribution-wide listing (search results,
+/// hardware selection, extraction plans) carries: the borrowed entry
+/// plus the [`EntryKey`] of the product that actually owns it, so no
+/// caller ever has to re-derive ownership from a subsystem name or a
+/// pointer.
+///
+/// Only `sw-core` can pair a key with an entry — the
+/// struct cannot be constructed outside this crate — so `key` always
+/// names the product that actually owns `entry`.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct LocatedEntry<'a> {
+    /// The entry's canonical identity within its distribution.
+    pub key: EntryKey,
+    /// The entry itself, borrowed from its owning product.
+    pub entry: &'a Entry,
 }
 
 /// A whole distribution directory.
@@ -133,6 +177,18 @@ impl Distribution {
         self.products.iter().find(|p| p.name.as_str() == name)
     }
 
+    /// Resolves a canonical entry key to the entry it identifies.
+    ///
+    /// Both halves of the key are bounds-checked. Keys originating from
+    /// another `Distribution` instance are outside the API contract (see
+    /// the stability contract on [`EntryKey`]): when their numeric
+    /// halves happen to be valid in this distribution, they identify a
+    /// different entry of *this* distribution, not an error.
+    pub fn entry(&self, key: EntryKey) -> Option<LocatedEntry<'_>> {
+        let entry = self.products.get(key.product_index)?.entry(key.entry_id)?;
+        Some(LocatedEntry { key, entry })
+    }
+
     /// Miniroot support files.
     pub fn support_files(&self) -> &DistributionSupportFiles {
         &self.support_files
@@ -161,23 +217,52 @@ impl Distribution {
         self.all_diagnostics().count()
     }
 
+    /// The hardware attribute values the distribution's MACH expressions
+    /// compare against, grouped by attribute, in first-appearance order.
+    ///
+    /// Candidates come exclusively from successfully parsed expressions
+    /// (product, image, subsystem and entry level); payloads that could
+    /// not be parsed contribute nothing.
+    pub fn hardware_candidates(&self) -> Vec<HardwareCandidateSet> {
+        crate::mach::candidates::hardware_candidates(self)
+    }
+
     /// Runs a search query across all products.
+    ///
+    /// Hits keep their owning-product identity: the result is in
+    /// distribution product order, each product in IDB order, and
+    /// duplicate paths are never deduplicated.
     pub fn find(&self, query: &Query) -> QueryResult<'_> {
         let mut result = QueryResult::default();
-        for product in &self.products {
+        for (product_index, product) in self.products.iter().enumerate() {
             result
                 .entries
-                .extend(product.entries.iter().filter(|e| query.matches(e)));
+                .extend(
+                    product
+                        .entries
+                        .iter()
+                        .filter(|e| query.matches(e))
+                        .map(|entry| LocatedEntry {
+                            key: EntryKey {
+                                product_index,
+                                entry_id: entry.id,
+                            },
+                            entry,
+                        }),
+                );
         }
         result
     }
 
     /// Selects the entries applicable to a hardware target, across all
     /// products.
+    ///
+    /// Selected entries and conflict candidates keep their
+    /// owning-product identity.
     pub fn select(&self, profile: &HardwareProfile) -> EntrySelection<'_> {
         let mut selection = EntrySelection::default();
-        for product in &self.products {
-            let mut product_selection = selection::select_product(product, profile);
+        for (product_index, product) in self.products.iter().enumerate() {
+            let mut product_selection = selection::select_product(product_index, product, profile);
             selection.selected.append(&mut product_selection.selected);
             selection.conflicts.append(&mut product_selection.conflicts);
         }

@@ -1,7 +1,7 @@
 //! Extraction planning: the shared fail-safe gate every extraction goes
 //! through before any bytes are written.
 //!
-//! Both frontends (the CLI and the Qt GUI) hand concrete entry lists to
+//! Both frontends (the CLI and the Qt GUI) hand canonical entry keys to
 //! [`plan_extraction`] and execute through [`extract_checked`]; neither
 //! re-implements hardware selection, collision detection or
 //! existing-output handling. The planner performs its checks in this
@@ -29,7 +29,7 @@
 //! file, two entries writing one output); they do not attempt to defend
 //! against a hostile process concurrently mutating the output tree.
 use crate::descriptor::model::HardwareRestrictions;
-use crate::distribution::Distribution;
+use crate::distribution::{Distribution, EntryKey, LocatedEntry};
 use crate::error::{Error, Result};
 use crate::extract::{self, ExistingOutputPolicy, ExtractOptions, ExtractReport};
 use crate::idb::attribute::IdbAttribute;
@@ -64,12 +64,13 @@ pub struct ExtractionPlanSummary {
 
 /// A confirmed extraction plan.
 ///
-/// `entries` is the authoritative execution list, in requested order;
-/// frontends must not re-derive it from the summary.
+/// `entries` is the authoritative execution list, in requested order,
+/// with every entry's owning-product identity; frontends must not
+/// re-derive it from the summary.
 #[derive(Debug)]
 pub struct ExtractionPlan<'a> {
     /// Entries to extract, after omissions and the hardware gate.
-    pub entries: Vec<&'a Entry>,
+    pub entries: Vec<LocatedEntry<'a>>,
     /// Counts describing the plan.
     pub summary: ExtractionPlanSummary,
 }
@@ -86,33 +87,53 @@ pub struct CheckedExtractReport {
 
 /// Plans an extraction without touching the filesystem.
 ///
-/// `requested` is the frontend's scope already resolved to concrete
-/// entries; the planner knows nothing about object ids, search modes or
-/// command-line flags. `out_dir` need not exist; planning never creates
+/// `requested` is the frontend's scope as canonical entry keys; the
+/// planner knows nothing about object ids, search modes or command-line
+/// flags. Every key is resolved against `distribution` itself, so the
+/// key/entry pairing the planner trusts can only ever come from this
+/// one distribution. `out_dir` need not exist; planning never creates
 /// it. All refusals are reported as [`Error::ExtractionPlan`] except
 /// static projection errors ([`Error::UnsafePath`],
 /// [`Error::PayloadNotFound`]), which keep their original type.
 ///
 /// # Errors
 ///
-/// Returns an error whenever the extraction cannot be run safely:
-/// ambiguity without a profile, hardware conflicts or an empty
-/// selection with a profile, static projection failures of selected
-/// entries, output collisions, unsafe output topology, unsafe existing
-/// ancestors, existing outputs the policy disallows, or an output root
-/// that exists as a non-directory.
+/// Returns an error whenever the extraction cannot be run safely: an
+/// entry key that does not resolve in this distribution, ambiguity
+/// without a profile, hardware conflicts or an empty selection with a
+/// profile, static projection failures of selected entries, output
+/// collisions, unsafe output topology, unsafe existing ancestors,
+/// existing outputs the policy disallows, or an output root that exists
+/// as a non-directory.
 pub fn plan_extraction<'a>(
     distribution: &'a Distribution,
-    requested: &[&'a Entry],
+    requested: &[EntryKey],
     out_dir: &Path,
     options: &ExtractOptions,
     profile: Option<&HardwareProfile>,
 ) -> Result<ExtractionPlan<'a>> {
+    // Resolve every requested key against *this* distribution first.
+    // The planner never trusts a caller-supplied key/entry pairing.
+    // Unresolvable keys are refused; keys from another Distribution
+    // instance are outside EntryKey's contract and, if numerically valid,
+    // identify entries of this Distribution.
+    let requested: Vec<LocatedEntry<'a>> = requested
+        .iter()
+        .map(|key| {
+            distribution.entry(*key).ok_or_else(|| {
+                plan_error(format!(
+                    "entry key {}:{} does not resolve in this distribution",
+                    key.product_index, key.entry_id.0
+                ))
+            })
+        })
+        .collect::<Result<_>>()?;
+
     // Project every requested entry first, holding errors back: an
     // entry the hardware gate discards anyway must not abort the plan.
-    let projected: Vec<(&Entry, Result<Vec<PathBuf>>)> = requested
+    let projected: Vec<(LocatedEntry, Result<Vec<PathBuf>>)> = requested
         .iter()
-        .map(|entry| (*entry, extract::output_paths(entry, options)))
+        .map(|located| (*located, extract::output_paths(located.entry, options)))
         .collect();
 
     // Entries that deliberately produce nothing (`Ok([])`) never reach
@@ -122,10 +143,10 @@ pub fn plan_extraction<'a>(
         .iter()
         .filter(|(_, paths)| matches!(paths, Ok(paths) if paths.is_empty()))
         .count();
-    let effective: Vec<&Entry> = projected
+    let effective: Vec<LocatedEntry> = projected
         .iter()
         .filter(|(_, paths)| !matches!(paths, Ok(paths) if paths.is_empty()))
-        .map(|(entry, _)| *entry)
+        .map(|(located, _)| *located)
         .collect();
     if effective.is_empty() {
         return Err(plan_error(
@@ -142,14 +163,11 @@ pub fn plan_extraction<'a>(
 
     // Propagate held projection errors, but only for entries that
     // survived the gate, still before anything is written.
-    let gated_set: HashSet<*const Entry> = gated
-        .iter()
-        .map(|entry| std::ptr::from_ref(*entry))
-        .collect();
-    let mut producers: Vec<(&Entry, Vec<PathBuf>)> = Vec::new();
-    for (entry, paths) in projected {
-        if gated_set.contains(&std::ptr::from_ref(entry)) {
-            producers.push((entry, paths?));
+    let gated_set: HashSet<EntryKey> = gated.iter().map(|located| located.key).collect();
+    let mut producers: Vec<(LocatedEntry, Vec<PathBuf>)> = Vec::new();
+    for (located, paths) in projected {
+        if gated_set.contains(&located.key) {
+            producers.push((located, paths?));
         }
     }
 
@@ -161,7 +179,7 @@ pub fn plan_extraction<'a>(
         preflight_existing_outputs(out_dir, &producers, options.existing_output)?;
 
     let output_paths = producers.iter().map(|(_, paths)| paths.len()).sum();
-    let entries: Vec<&Entry> = producers.iter().map(|(entry, _)| *entry).collect();
+    let entries: Vec<LocatedEntry> = producers.iter().map(|(located, _)| *located).collect();
     let planned_records = entries.len();
     Ok(ExtractionPlan {
         entries,
@@ -189,16 +207,19 @@ pub fn plan_extraction<'a>(
 /// Returns the [`plan_extraction`] errors before anything is written.
 /// Runtime failures of individual entries are reported through
 /// [`CheckedExtractReport::report`] instead.
-pub fn extract_checked<'a>(
-    distribution: &'a Distribution,
-    requested: &[&'a Entry],
+pub fn extract_checked(
+    distribution: &Distribution,
+    requested: &[EntryKey],
     out_dir: &Path,
     options: &ExtractOptions,
     profile: Option<&HardwareProfile>,
 ) -> Result<CheckedExtractReport> {
     let plan = plan_extraction(distribution, requested, out_dir, options, profile)?;
+    // The low-level writer works on plain entries; ownership identity
+    // has served its purpose in the planner.
+    let entries: Vec<&Entry> = plan.entries.iter().map(|located| located.entry).collect();
     let mut reader = distribution.image_reader();
-    let report = extract::extract(&mut reader, &plan.entries, out_dir, options);
+    let report = extract::extract_unchecked(&mut reader, &entries, out_dir, options);
     Ok(CheckedExtractReport {
         plan: plan.summary,
         report,
@@ -214,11 +235,14 @@ pub fn extract_checked<'a>(
 /// preflight's dir/dir exemption.
 fn gate_without_profile<'a>(
     distribution: &'a Distribution,
-    effective: &[&'a Entry],
-) -> Result<Vec<&'a Entry>> {
-    let mut by_path: BTreeMap<&str, Vec<&Entry>> = BTreeMap::new();
-    for entry in effective {
-        by_path.entry(entry.path.as_str()).or_default().push(entry);
+    effective: &[LocatedEntry<'a>],
+) -> Result<Vec<LocatedEntry<'a>>> {
+    let mut by_path: BTreeMap<&str, Vec<LocatedEntry>> = BTreeMap::new();
+    for located in effective {
+        by_path
+            .entry(located.entry.path.as_str())
+            .or_default()
+            .push(*located);
     }
     let ambiguous: Vec<&str> = by_path
         .iter()
@@ -226,20 +250,20 @@ fn gate_without_profile<'a>(
             group.len() > 1
                 && group
                     .iter()
-                    .any(|entry| entry.file_type != FileType::Directory)
+                    .any(|located| located.entry.file_type != FileType::Directory)
         })
         .map(|(path, _)| *path)
         .collect();
     let unparsed: Vec<&str> = effective
         .iter()
-        .filter(|entry| entry.has_unparsed_mach())
-        .map(|entry| entry.path.as_str())
+        .filter(|located| located.entry.has_unparsed_mach())
+        .map(|located| located.entry.path.as_str())
         .collect();
-    let unresolved = unresolved_entries(distribution);
+    let unresolved = unresolved_keys(distribution);
     let unknown: Vec<&str> = effective
         .iter()
-        .filter(|entry| unresolved.contains(&std::ptr::from_ref(*entry)))
-        .map(|entry| entry.path.as_str())
+        .filter(|located| unresolved.contains(&located.key))
+        .map(|located| located.entry.path.as_str())
         .collect();
 
     if ambiguous.is_empty() && unparsed.is_empty() && unknown.is_empty() {
@@ -279,26 +303,29 @@ fn entry_plural(count: usize) -> &'static str {
     if count == 1 { "y" } else { "ies" }
 }
 
-/// Entries whose hardware applicability cannot be fully decoded because
-/// a descriptor level above them (product, image or subsystem) contains
-/// an undecodable hardware restriction.
+/// Keys of entries whose hardware applicability cannot be fully
+/// decoded because a descriptor level above them (product, image or
+/// subsystem) contains an undecodable hardware restriction.
 ///
-/// Membership is by entry identity, never by subsystem name: a name is
-/// not an ownership boundary.
-fn unresolved_entries(distribution: &Distribution) -> HashSet<*const Entry> {
+/// Membership is by canonical entry identity, never by subsystem name:
+/// a name is not an ownership boundary.
+fn unresolved_keys(distribution: &Distribution) -> HashSet<EntryKey> {
     let mut affected = HashSet::new();
     let has_unresolved = |mach: &Option<HardwareRestrictions>| {
         mach.as_ref().is_some_and(|m| !m.unresolved.is_empty())
     };
-    for product in distribution.products() {
+    for (product_index, product) in distribution.products().iter().enumerate() {
         let product_unresolved = has_unresolved(&product.mach);
         for image in &product.images {
             let image_unresolved = product_unresolved || has_unresolved(&image.mach);
             for subsystem in &image.subsystems {
                 if image_unresolved || has_unresolved(&subsystem.mach) {
                     for id in &subsystem.entry_ids {
-                        if let Some(entry) = product.entry(*id) {
-                            affected.insert(std::ptr::from_ref(entry));
+                        if product.entry(*id).is_some() {
+                            affected.insert(EntryKey {
+                                product_index,
+                                entry_id: *id,
+                            });
                         }
                     }
                 }
@@ -315,14 +342,11 @@ fn unresolved_entries(distribution: &Distribution) -> HashSet<*const Entry> {
 /// entries the selection excluded.
 fn gate_with_profile<'a>(
     distribution: &'a Distribution,
-    effective: &[&'a Entry],
+    effective: &[LocatedEntry<'a>],
     profile: &HardwareProfile,
-) -> Result<(Vec<&'a Entry>, usize)> {
+) -> Result<(Vec<LocatedEntry<'a>>, usize)> {
     let selection = distribution.select(profile);
-    let scope: HashSet<*const Entry> = effective
-        .iter()
-        .map(|entry| std::ptr::from_ref(*entry))
-        .collect();
+    let scope: HashSet<EntryKey> = effective.iter().map(|located| located.key).collect();
     let conflicts: Vec<&SelectionConflict> = selection
         .conflicts
         .iter()
@@ -330,20 +354,20 @@ fn gate_with_profile<'a>(
             conflict
                 .candidates
                 .iter()
-                .any(|entry| scope.contains(&std::ptr::from_ref(*entry)))
+                .any(|located| scope.contains(&located.key))
         })
         .collect();
     if !conflicts.is_empty() {
         return Err(plan_error(conflict_message(&conflicts)));
     }
-    let selected: HashSet<*const Entry> = selection
+    let selected: HashSet<EntryKey> = selection
         .selected
         .iter()
-        .map(|entry| std::ptr::from_ref(*entry))
+        .map(|located| located.key)
         .collect();
-    let gated: Vec<&Entry> = effective
+    let gated: Vec<LocatedEntry> = effective
         .iter()
-        .filter(|entry| selected.contains(&std::ptr::from_ref(**entry)))
+        .filter(|located| selected.contains(&located.key))
         .copied()
         .collect();
     if gated.is_empty() {
@@ -367,8 +391,8 @@ fn conflict_message(conflicts: &[&SelectionConflict]) -> String {
     for conflict in conflicts {
         let _ = write!(message, "\nCONFLICT {}", conflict.path);
         for candidate in &conflict.candidates {
-            let _ = write!(message, "\n  {}", candidate.subsystem);
-            let _ = write!(message, "\n  mach: {}", entry_mach(candidate));
+            let _ = write!(message, "\n  {}", candidate.entry.subsystem);
+            let _ = write!(message, "\n  mach: {}", entry_mach(candidate.entry));
         }
     }
     message
@@ -426,25 +450,25 @@ fn output_path_key(path: &Path) -> String {
 /// or raw/keep-stored `.Z` sidecars colliding with real files.
 /// Directory entries are exempt: several subsystems legitimately create
 /// the same directory.
-fn preflight_output_collisions(producers: &[(&Entry, Vec<PathBuf>)]) -> Result<()> {
-    let mut by_output: BTreeMap<String, (&Path, Vec<&Entry>)> = BTreeMap::new();
-    for (entry, paths) in producers {
+fn preflight_output_collisions(producers: &[(LocatedEntry, Vec<PathBuf>)]) -> Result<()> {
+    let mut by_output: BTreeMap<String, (&Path, Vec<LocatedEntry>)> = BTreeMap::new();
+    for (located, paths) in producers {
         for path in paths {
             let (_, entries) = by_output
                 .entry(output_path_key(path))
                 .or_insert_with(|| (path.as_path(), Vec::new()));
-            if !entries.iter().any(|other| std::ptr::eq(*other, *entry)) {
-                entries.push(entry);
+            if !entries.iter().any(|other| other.key == located.key) {
+                entries.push(*located);
             }
         }
     }
-    let collisions: Vec<(&Path, &Vec<&Entry>)> = by_output
+    let collisions: Vec<(&Path, &Vec<LocatedEntry>)> = by_output
         .values()
         .filter(|(_, entries)| {
             entries.len() > 1
                 && entries
                     .iter()
-                    .any(|entry| entry.file_type != FileType::Directory)
+                    .any(|located| located.entry.file_type != FileType::Directory)
         })
         .map(|(path, entries)| (*path, entries))
         .collect();
@@ -454,8 +478,12 @@ fn preflight_output_collisions(producers: &[(&Entry, Vec<PathBuf>)]) -> Result<(
     let mut message = String::from("extraction would overwrite output files\n");
     for (path, entries) in collisions.iter().take(5) {
         let _ = write!(message, "\n{}", path.display());
-        for entry in entries.iter() {
-            let _ = write!(message, "\n  <- {}: {}", entry.subsystem, entry.path);
+        for located in entries.iter() {
+            let _ = write!(
+                message,
+                "\n  <- {}: {}",
+                located.entry.subsystem, located.entry.path
+            );
         }
     }
     if collisions.len() > 5 {
@@ -473,15 +501,15 @@ fn preflight_output_collisions(producers: &[(&Entry, Vec<PathBuf>)]) -> Result<(
 /// output directory: `usr -> /etc` followed by `usr/passwd` must never
 /// be written. Planned directory ancestors are the normal case and stay
 /// legal.
-fn preflight_output_topology(producers: &[(&Entry, Vec<PathBuf>)]) -> Result<()> {
+fn preflight_output_topology(producers: &[(LocatedEntry, Vec<PathBuf>)]) -> Result<()> {
     // Every planned output path and whether it is a directory output,
     // keyed for the host filesystem (see `output_path_key`); the
     // original paths are kept for messages. Collisions were already
     // refused, so a key has a single kind here (duplicated directory
     // outputs agree on it).
     let mut kinds: HashMap<String, (&Path, bool)> = HashMap::new();
-    for (entry, paths) in producers {
-        let is_directory = entry.file_type == FileType::Directory;
+    for (located, paths) in producers {
+        let is_directory = located.entry.file_type == FileType::Directory;
         for path in paths {
             if path.as_os_str().is_empty() && !is_directory {
                 // A non-directory entry mapping to the output root
@@ -489,7 +517,7 @@ fn preflight_output_topology(producers: &[(&Entry, Vec<PathBuf>)]) -> Result<()>
                 // file.
                 return Err(plan_error(format!(
                     "invalid output topology\n\n{}: {} maps to the output directory itself\n\nNo files were written.",
-                    entry.subsystem, entry.path
+                    located.entry.subsystem, located.entry.path
                 )));
             }
             kinds.insert(output_path_key(path), (path.as_path(), is_directory));
@@ -554,7 +582,7 @@ fn preflight_output_root(out_dir: &Path) -> Result<()> {
 /// defended.
 fn preflight_existing_ancestors(
     out_dir: &Path,
-    producers: &[(&Entry, Vec<PathBuf>)],
+    producers: &[(LocatedEntry, Vec<PathBuf>)],
 ) -> Result<()> {
     let mut checked: HashSet<PathBuf> = HashSet::new();
     for (_, paths) in producers {
@@ -600,13 +628,14 @@ fn preflight_existing_ancestors(
 /// Returns the number of existing regular files that will be replaced.
 fn preflight_existing_outputs(
     out_dir: &Path,
-    producers: &[(&Entry, Vec<PathBuf>)],
+    producers: &[(LocatedEntry, Vec<PathBuf>)],
     policy: ExistingOutputPolicy,
 ) -> Result<usize> {
     let mut overwrites: Vec<PathBuf> = Vec::new();
     let mut conflicts: Vec<String> = Vec::new();
     let mut existing_regular = 0;
-    for (entry, paths) in producers {
+    for (located, paths) in producers {
+        let entry = located.entry;
         for path in paths {
             let host = out_dir.join(path);
             let metadata = match std::fs::symlink_metadata(&host) {

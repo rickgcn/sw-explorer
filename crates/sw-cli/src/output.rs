@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use sw_core::descriptor::model::{
     ConditionalFlag, HardwareRestrictions, Subsystem, SubsystemRange, VersionLimit,
 };
-use sw_core::distribution::Product;
+use sw_core::distribution::{Distribution, LocatedEntry, Product};
 use sw_core::extract::ExtractReport;
 use sw_core::idb::attribute::IdbAttribute;
 use sw_core::idb::{Entry, FileType};
@@ -375,13 +375,16 @@ fn range_display(range: &SubsystemRange) -> String {
     format!("{} {}..{}", range.target(), range.versions.min.0, max)
 }
 
-/// Renders the entry search result table.
-pub fn entry_table(entries: &[&Entry]) -> String {
+/// Renders the entry search result table. The PRODUCT column names the
+/// product that actually owns the record — which may differ from the
+/// product segment of the record's subsystem name.
+pub fn entry_table(dist: &Distribution, entries: &[LocatedEntry]) -> String {
     let rows: Vec<Vec<String>> = entries
         .iter()
-        .map(|entry| {
+        .map(|located| {
+            let entry = located.entry;
             vec![
-                entry.subsystem.product().to_string(),
+                dist.products()[located.key.product_index].name.to_string(),
                 entry.subsystem.to_string(),
                 file_type_name(entry.file_type).to_string(),
                 entry
@@ -450,8 +453,8 @@ pub fn conflict_report(conflicts: &[&SelectionConflict]) -> String {
         let _ = writeln!(out, "CONFLICT {}", conflict.path);
         for candidate in &conflict.candidates {
             out.push('\n');
-            let _ = writeln!(out, "  {}", candidate.subsystem);
-            let _ = writeln!(out, "  mach: {}", entry_mach(candidate));
+            let _ = writeln!(out, "  {}", candidate.entry.subsystem);
+            let _ = writeln!(out, "  mach: {}", entry_mach(candidate.entry));
         }
         out.push('\n');
     }
