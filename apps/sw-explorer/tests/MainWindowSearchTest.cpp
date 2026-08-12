@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include <QAbstractItemModel>
+#include <QAction>
 #include <QFile>
 #include <QKeySequence>
 #include <QLabel>
@@ -14,6 +15,7 @@
 #include <QTest>
 #include <QTimer>
 #include <QToolBar>
+#include <QToolButton>
 #include <QTreeView>
 
 #include "EntryBrowserWidget.h"
@@ -49,6 +51,8 @@ private slots:
     void queryChangeInvalidatesInspector();
     void failedOpenKeepsSearchState();
     void successfulReopenClearsSearchState();
+    void programmaticOpenOwnsTheLifecycle();
+    void openStaysLockedThroughCommit();
 };
 
 namespace {
@@ -571,6 +575,66 @@ void MainWindowSearchTest::successfulReopenClearsSearchState()
                       .toString(),
              QStringLiteral("usr/bin/gamma"));
     QCOMPARE(entryTableOf(window)->model()->rowCount(), 1);
+}
+
+void MainWindowSearchTest::programmaticOpenOwnsTheLifecycle()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeTwoProductDist(dir));
+
+    MainWindow window;
+    QAction *openAction = window.findChild<QAction *>(QStringLiteral("openAction"));
+    auto *hardwareButton = window.findChild<QToolButton *>(QStringLiteral("hardwareButton"));
+    QVERIFY(openAction != nullptr);
+    QVERIFY(hardwareButton != nullptr);
+
+    QSignalSpy openSpy(&window, &MainWindow::backendOpenRequested);
+
+    // The command itself owns the transaction start: the backend
+    // request has left and the lockdown is already in place when the
+    // call returns, ahead of any queued worker response.
+    window.openDistribution(dir.path());
+    QCOMPARE(openSpy.count(), 1);
+    QCOMPARE(openSpy.first().at(0).toString(), dir.path());
+    QVERIFY(!openAction->isEnabled());
+    QVERIFY(!hardwareButton->isEnabled());
+    QVERIFY(!searchEditOf(window)->isEnabled());
+
+    // The commit releases every lock.
+    QTRY_VERIFY(treeOf(window)->model()->rowCount() > 0);
+    QTRY_VERIFY(openAction->isEnabled());
+    QVERIFY(hardwareButton->isEnabled());
+    QVERIFY(searchEditOf(window)->isEnabled());
+}
+
+void MainWindowSearchTest::openStaysLockedThroughCommit()
+{
+    QTemporaryDir dirA;
+    QVERIFY(writeTwoProductDist(dirA));
+    QTemporaryDir dirB;
+    QVERIFY(writeGammaDist(dirB));
+
+    MainWindow window;
+    loadDistribution(window, dirA.path());
+
+    QAction *openAction = window.findChild<QAction *>(QStringLiteral("openAction"));
+    QVERIFY(openAction != nullptr);
+    QVERIFY(openAction->isEnabled());
+
+    // candidateAccepted fires synchronously inside the candidate
+    // handler; the backend commit has not landed yet at that point,
+    // and Open must still be locked — no nested open may slip into
+    // the commit window.
+    bool openLockedAtAccept = false;
+    connect(&window, &MainWindow::candidateAccepted, [&] {
+        openLockedAtAccept = !openAction->isEnabled();
+    });
+
+    window.openDistribution(dirB.path());
+    QTRY_VERIFY(openLockedAtAccept);
+
+    // The commit landing releases the lock.
+    QTRY_VERIFY(openAction->isEnabled());
 }
 
 QTEST_MAIN(MainWindowSearchTest)

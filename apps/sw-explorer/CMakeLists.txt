@@ -440,6 +440,24 @@ set_tests_properties(EntryBrowserWidgetTest PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
 )
 
+# The session state machine tests are GUI-free (QTEST_GUILESS_MAIN):
+# pure value state, no widgets and no Rust bridge.
+add_executable(SessionStateTest
+    tests/SessionStateTest.cpp
+    src/EntrySnapshot.h
+    src/HardwareSnapshot.h
+    src/SessionState.h
+)
+
+target_include_directories(SessionStateTest PRIVATE src)
+
+target_link_libraries(SessionStateTest PRIVATE
+    Qt6::Core
+    Qt6::Test
+)
+
+add_test(NAME SessionStateTest COMMAND SessionStateTest)
+
 # The main-window search tests are QWidget tests (QTEST_MAIN) driving
 # the real backend through the worker thread, so they link the
 # staticlib exactly like the application; the offscreen platform
