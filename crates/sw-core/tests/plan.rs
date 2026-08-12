@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use sw_core::distribution::{Distribution, EntryKey};
 use sw_core::error::Error;
 use sw_core::extract::{self, DecodeMode, ExistingOutputPolicy, ExtractOptions, PathMode};
-use sw_core::idb::Entry;
 use sw_core::mach::eval::HardwareProfile;
 use sw_core::path::IrixPath;
 use sw_core::plan::{self, ExtractionPlan};
@@ -367,14 +366,6 @@ fn refuse_options() -> ExtractOptions {
         existing_output: ExistingOutputPolicy::Refuse,
         ..ExtractOptions::default()
     }
-}
-
-/// The plain entry references of a key list, for the tests that
-/// exercise the low-level writer directly.
-fn plain<'a>(dist: &'a Distribution, keys: &[EntryKey]) -> Vec<&'a Entry> {
-    keys.iter()
-        .map(|key| dist.entry(*key).expect("key resolves").entry)
-        .collect()
 }
 
 fn plan_err(
@@ -1172,8 +1163,7 @@ fn refuse_write_never_clobbers_an_existing_regular_file() {
 
     let hello = keys_named(&dist, "test", "hello.txt");
     let mut reader = dist.image_reader();
-    let report =
-        extract::extract_unchecked(&mut reader, &plain(&dist, &hello), &out, &refuse_options());
+    let report = extract::extract_unchecked(&mut reader, &hello, &out, &refuse_options());
     assert_eq!(report.extracted, 0);
     assert_eq!(report.failures.len(), 1);
     // The target was neither truncated nor modified.
@@ -1190,12 +1180,7 @@ fn allow_write_still_overwrites() {
 
     let hello = keys_named(&dist, "test", "hello.txt");
     let mut reader = dist.image_reader();
-    let report = extract::extract_unchecked(
-        &mut reader,
-        &plain(&dist, &hello),
-        &out,
-        &ExtractOptions::default(),
-    );
+    let report = extract::extract_unchecked(&mut reader, &hello, &out, &ExtractOptions::default());
     assert_eq!(report.extracted, 1);
     assert_eq!(std::fs::read(out.join("hello.txt")).unwrap(), b"hello");
     let _ = std::fs::remove_dir_all(&root);
@@ -1211,8 +1196,7 @@ fn refuse_symlink_never_replaces_an_existing_path() {
 
     let link = keys_named(&dist, "test", "hello.link");
     let mut reader = dist.image_reader();
-    let report =
-        extract::extract_unchecked(&mut reader, &plain(&dist, &link), &out, &refuse_options());
+    let report = extract::extract_unchecked(&mut reader, &link, &out, &refuse_options());
     assert_eq!(report.extracted, 0);
     assert_eq!(report.failures.len(), 1);
     assert_eq!(std::fs::read(out.join("hello.link")).unwrap(), b"KEEP");
@@ -1231,12 +1215,7 @@ fn allow_symlink_never_replaces_an_existing_regular_file() {
     let mut reader = dist.image_reader();
     // The Allow policy overwrites regular-file contents only; it never
     // removes an existing file to make room for a symbolic link.
-    let report = extract::extract_unchecked(
-        &mut reader,
-        &plain(&dist, &link),
-        &out,
-        &ExtractOptions::default(),
-    );
+    let report = extract::extract_unchecked(&mut reader, &link, &out, &ExtractOptions::default());
     assert_eq!(report.extracted, 0);
     assert_eq!(report.failures.len(), 1);
     assert_eq!(std::fs::read(out.join("hello.link")).unwrap(), b"KEEP");
@@ -1254,12 +1233,7 @@ fn allow_symlink_never_replaces_an_existing_symlink() {
     let link = keys_named(&dist, "test", "hello.link");
     let mut reader = dist.image_reader();
     // A pre-existing link (even a dangling one) is never retargeted.
-    let report = extract::extract_unchecked(
-        &mut reader,
-        &plain(&dist, &link),
-        &out,
-        &ExtractOptions::default(),
-    );
+    let report = extract::extract_unchecked(&mut reader, &link, &out, &ExtractOptions::default());
     assert_eq!(report.extracted, 0);
     assert_eq!(report.failures.len(), 1);
     assert_eq!(

@@ -26,7 +26,7 @@ use crate::image::reader::ImageReader;
 use crate::image::{Image, ImageArchive, ImageLayout};
 use crate::mach::candidates::HardwareCandidateSet;
 use crate::mach::eval::HardwareProfile;
-use crate::names::{ImageName, ProductName};
+use crate::names::{ImageName, ProductName, SubsystemName};
 use crate::query::{Query, QueryResult};
 use crate::selection::{self, EntrySelection};
 use std::path::{Path, PathBuf};
@@ -83,13 +83,115 @@ pub struct LocatedEntry<'a> {
     pub entry: &'a Entry,
 }
 
+// Hierarchy identity: qualified names describe what the media called
+// an object; keys describe where that logical object lives in this
+// distribution. Foreign IDB references mean the two notions can
+// disagree — a record of product `alpha` may name the subsystem
+// `beta.sw.unix`, growing a synthetic image `beta.sw` inside `alpha`'s
+// tree next to the `beta.sw` image `beta` itself may carry. A name
+// lookup therefore legitimately yields zero, one or *several* logical
+// objects; only a key identifies exactly one.
+
+/// The canonical identity of an [`Image`] within one [`Distribution`]
+/// instance.
+///
+/// An [`ImageName`] alone does not identify a logical image: the same
+/// qualified name may appear several times in one distribution (foreign
+/// IDB references), and its product segment need not name the
+/// containing product. `ImageKey` pairs the image's position in its
+/// owning product with the product's position in
+/// [`Distribution::products`].
+///
+/// Stability contract: an `ImageKey` is valid for the lifetime of the
+/// [`Distribution`] instance it was obtained from. It is a session-local
+/// identity, not a permanent database id: it is *not* stable across
+/// reopening the same directory, and never comparable across different
+/// `Distribution` instances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ImageKey {
+    /// Position of the containing product in [`Distribution::products`].
+    pub product_index: usize,
+    /// Position of the image in the containing product's images.
+    pub image_index: usize,
+}
+
+/// The canonical identity of a [`Subsystem`] within one
+/// [`Distribution`] instance.
+///
+/// A [`SubsystemName`] alone does not identify a logical subsystem, for
+/// the same reason an [`ImageName`] does not identify a logical image
+/// (see [`ImageKey`]).
+///
+/// Stability contract: as for [`ImageKey`] — session-local, not stable
+/// across reopening, never comparable across `Distribution` instances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SubsystemKey {
+    /// Position of the containing product in [`Distribution::products`].
+    pub product_index: usize,
+    /// Position of the containing image in the product's images.
+    pub image_index: usize,
+    /// Position of the subsystem in the image's subsystems.
+    pub subsystem_index: usize,
+}
+
+/// An image together with its canonical hierarchy identity.
+///
+/// Only `sw-core` can pair a key with an image — the struct cannot be
+/// constructed outside this crate — so `key` always names the logical
+/// position that actually contains `image`.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct LocatedImage<'a> {
+    /// The image's canonical identity within its distribution.
+    pub key: ImageKey,
+    /// The image itself, borrowed from its containing product.
+    pub image: &'a Image,
+}
+
+/// A subsystem together with its canonical hierarchy identity.
+///
+/// Only `sw-core` can pair a key with a subsystem — the struct cannot
+/// be constructed outside this crate — so `key` always names the
+/// logical position that actually contains `subsystem`.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct LocatedSubsystem<'a> {
+    /// The subsystem's canonical identity within its distribution.
+    pub key: SubsystemKey,
+    /// The subsystem itself, borrowed from its containing image.
+    pub subsystem: &'a Subsystem,
+}
+
 /// A whole distribution directory.
 #[derive(Debug)]
 pub struct Distribution {
     root: PathBuf,
     products: Vec<Product>,
+    // Reverse attachment index, built once at open: for every entry of
+    // every product, the exact logical position it is attached to.
+    // Containment lookups read this index instead of re-scanning the
+    // hierarchy on every payload read to "rediscover" an attachment
+    // that is already authoritative.
+    entry_locations: Vec<Vec<EntryLocation>>,
     support_files: DistributionSupportFiles,
     diagnostics: Vec<Diagnostic>,
+}
+
+/// The reverse attachment of one entry: where in its owning product's
+/// logical hierarchy the entry lives.
+///
+/// Attachment guarantees exactly one membership per entry; both
+/// violation shapes are recorded honestly so a containment lookup can
+/// refuse instead of picking an arbitrary first match.
+#[derive(Debug, Clone, Copy)]
+enum EntryLocation {
+    /// Not attached to any subsystem.
+    Unattached,
+    /// Attached to exactly one subsystem: `(image index, subsystem
+    /// index)` within the owning product.
+    Attached(usize, usize),
+    /// Claimed by several subsystems.
+    Ambiguous,
 }
 
 impl Distribution {
@@ -154,9 +256,12 @@ impl Distribution {
             mr: existing_file(root.join("mr")),
         };
 
+        let entry_locations = products.iter().map(record_entry_locations).collect();
+
         Ok(Distribution {
             root,
             products,
+            entry_locations,
             support_files,
             diagnostics,
         })
@@ -187,6 +292,224 @@ impl Distribution {
     pub fn entry(&self, key: EntryKey) -> Option<LocatedEntry<'_>> {
         let entry = self.products.get(key.product_index)?.entry(key.entry_id)?;
         Some(LocatedEntry { key, entry })
+    }
+
+    /// Resolves a canonical image key to the image it identifies.
+    ///
+    /// Both halves of the key are bounds-checked. Keys originating from
+    /// another `Distribution` instance are outside the API contract (see
+    /// the stability contract on [`ImageKey`]): when their numeric
+    /// halves happen to be valid in this distribution, they identify the
+    /// image at those indices in *this* distribution, not an error.
+    pub fn image(&self, key: ImageKey) -> Option<LocatedImage<'_>> {
+        let image = self
+            .products
+            .get(key.product_index)?
+            .images
+            .get(key.image_index)?;
+        Some(LocatedImage { key, image })
+    }
+
+    /// Resolves a canonical subsystem key to the subsystem it
+    /// identifies.
+    ///
+    /// Every level of the key is bounds-checked. Keys originating from
+    /// another `Distribution` instance are outside the API contract (see
+    /// the stability contract on [`SubsystemKey`]): when their numeric
+    /// parts happen to be valid in this distribution, they identify the
+    /// subsystem at those indices in *this* distribution, not an error.
+    pub fn subsystem(&self, key: SubsystemKey) -> Option<LocatedSubsystem<'_>> {
+        let subsystem = self
+            .products
+            .get(key.product_index)?
+            .images
+            .get(key.image_index)?
+            .subsystems
+            .get(key.subsystem_index)?;
+        Some(LocatedSubsystem { key, subsystem })
+    }
+
+    /// Every logical image carrying exactly this qualified name, in
+    /// distribution product order, each product in image order.
+    ///
+    /// A name is not an identity: the result may be empty, hold exactly
+    /// one image, or hold several logical images that merely share the
+    /// media name (foreign IDB references, duplicated descriptor
+    /// records). No winner is chosen and nothing is deduplicated;
+    /// callers needing a unique object must handle the cardinality
+    /// themselves.
+    pub fn images_named(&self, name: &ImageName) -> Vec<LocatedImage<'_>> {
+        let mut found = Vec::new();
+        for (product_index, product) in self.products.iter().enumerate() {
+            for (image_index, image) in product.images.iter().enumerate() {
+                if &image.name == name {
+                    found.push(LocatedImage {
+                        key: ImageKey {
+                            product_index,
+                            image_index,
+                        },
+                        image,
+                    });
+                }
+            }
+        }
+        found
+    }
+
+    /// Every logical subsystem carrying exactly this qualified name, in
+    /// distribution product order, each product in image order, each
+    /// image in subsystem order.
+    ///
+    /// As with [`Distribution::images_named`], the result may be empty
+    /// or hold several logical subsystems sharing the media name; no
+    /// winner is chosen.
+    pub fn subsystems_named(&self, name: &SubsystemName) -> Vec<LocatedSubsystem<'_>> {
+        let mut found = Vec::new();
+        for (product_index, product) in self.products.iter().enumerate() {
+            for (image_index, image) in product.images.iter().enumerate() {
+                for (subsystem_index, subsystem) in image.subsystems.iter().enumerate() {
+                    if &subsystem.name == name {
+                        found.push(LocatedSubsystem {
+                            key: SubsystemKey {
+                                product_index,
+                                image_index,
+                                subsystem_index,
+                            },
+                            subsystem,
+                        });
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// The entries of one exact logical image, in the containing
+    /// product's IDB order.
+    ///
+    /// The scope is the image object the key identifies: membership is
+    /// the attachment recorded in its subsystems' `entry_ids`, never the
+    /// entries' qualified image names, so two same-name images never
+    /// share an entry set. Scanning the product's flat entry list keeps
+    /// the exact IDB order (interleaved subsystem records are not
+    /// regrouped) and never deduplicates duplicate paths.
+    ///
+    /// A valid image without any attached entries yields an empty
+    /// list; `None` means only that the key does not resolve.
+    pub fn entries_in_image(&self, key: ImageKey) -> Option<Vec<LocatedEntry<'_>>> {
+        let located = self.image(key)?;
+        let product = &self.products[key.product_index];
+        let membership: std::collections::HashSet<EntryId> = located
+            .image
+            .subsystems
+            .iter()
+            .flat_map(|subsystem| subsystem.entry_ids.iter().copied())
+            .collect();
+        Some(
+            product
+                .entries
+                .iter()
+                .filter(|entry| membership.contains(&entry.id))
+                .map(|entry| LocatedEntry {
+                    key: EntryKey {
+                        product_index: key.product_index,
+                        entry_id: entry.id,
+                    },
+                    entry,
+                })
+                .collect(),
+        )
+    }
+
+    /// The entries of one exact logical subsystem, in the containing
+    /// product's IDB order.
+    ///
+    /// The scope is the subsystem object the key identifies: membership
+    /// is exactly its own `entry_ids`, never a re-derivation from the
+    /// entries' qualified subsystem names.
+    ///
+    /// A valid subsystem without any attached entries yields an empty
+    /// list; `None` means only that the key does not resolve.
+    pub fn entries_in_subsystem(&self, key: SubsystemKey) -> Option<Vec<LocatedEntry<'_>>> {
+        let located = self.subsystem(key)?;
+        let product = &self.products[key.product_index];
+        // `entry_ids` is recorded in IDB order by attachment; every id
+        // resolves by construction.
+        Some(
+            located
+                .subsystem
+                .entry_ids
+                .iter()
+                .filter_map(|id| product.entry(*id))
+                .map(|entry| LocatedEntry {
+                    key: EntryKey {
+                        product_index: key.product_index,
+                        entry_id: entry.id,
+                    },
+                    entry,
+                })
+                .collect(),
+        )
+    }
+
+    /// The exact logical image the given entry is attached to.
+    ///
+    /// Containment is decided by the owning product's attachment
+    /// records (`Subsystem::entry_ids`), never by the entry's qualified
+    /// name. Attachment guarantees exactly one membership per entry; a
+    /// distribution violating that invariant resolves to `None` rather
+    /// than an arbitrary first match.
+    pub(crate) fn image_containing_entry(&self, key: EntryKey) -> Option<LocatedImage<'_>> {
+        let (image_index, _) = self.membership_of(key)?;
+        let image = &self.products[key.product_index].images[image_index];
+        Some(LocatedImage {
+            key: ImageKey {
+                product_index: key.product_index,
+                image_index,
+            },
+            image,
+        })
+    }
+
+    /// The exact logical subsystem the given entry is attached to; see
+    /// [`Distribution::image_containing_entry`].
+    #[allow(dead_code)]
+    pub(crate) fn subsystem_containing_entry(&self, key: EntryKey) -> Option<LocatedSubsystem<'_>> {
+        let (image_index, subsystem_index) = self.membership_of(key)?;
+        let subsystem =
+            &self.products[key.product_index].images[image_index].subsystems[subsystem_index];
+        Some(LocatedSubsystem {
+            key: SubsystemKey {
+                product_index: key.product_index,
+                image_index,
+                subsystem_index,
+            },
+            subsystem,
+        })
+    }
+
+    /// The `(image index, subsystem index)` membership of an entry
+    /// within its owning product.
+    ///
+    /// Read from the reverse attachment index recorded at open time
+    /// (see [`record_entry_locations`]). `None` when the key does not
+    /// resolve, or when the attachment invariant "every entry is
+    /// attached to exactly one logical subsystem" is violated (zero or
+    /// several memberships): ambiguity is never resolved by picking a
+    /// first match.
+    fn membership_of(&self, key: EntryKey) -> Option<(usize, usize)> {
+        let product = self.products.get(key.product_index)?;
+        product.entry(key.entry_id)?;
+        match self
+            .entry_locations
+            .get(key.product_index)?
+            .get(key.entry_id.0)?
+        {
+            EntryLocation::Attached(image_index, subsystem_index) => {
+                Some((*image_index, *subsystem_index))
+            }
+            EntryLocation::Unattached | EntryLocation::Ambiguous => None,
+        }
     }
 
     /// Miniroot support files.
@@ -508,6 +831,40 @@ fn tree_from_descriptor(
     images
 }
 
+/// Records the reverse attachment index of one product: for every
+/// entry, the exact `(image index, subsystem index)` position it is
+/// attached to.
+///
+/// [`attach_entries`] attaches every entry to exactly one subsystem, so
+/// this index is the authoritative containment answer and containment
+/// lookups never re-scan the hierarchy. Both violation shapes are
+/// recorded (several memberships also trip a debug assertion) so a
+/// later lookup refuses instead of picking an arbitrary first match.
+fn record_entry_locations(product: &Product) -> Vec<EntryLocation> {
+    let mut locations = vec![EntryLocation::Unattached; product.entries.len()];
+    for (image_index, image) in product.images.iter().enumerate() {
+        for (subsystem_index, subsystem) in image.subsystems.iter().enumerate() {
+            for &entry_id in &subsystem.entry_ids {
+                let Some(slot) = locations.get_mut(entry_id.0) else {
+                    continue;
+                };
+                debug_assert!(
+                    matches!(slot, EntryLocation::Unattached),
+                    "entry {} is attached to several subsystems",
+                    entry_id.0
+                );
+                *slot = match slot {
+                    EntryLocation::Unattached => {
+                        EntryLocation::Attached(image_index, subsystem_index)
+                    }
+                    _ => EntryLocation::Ambiguous,
+                };
+            }
+        }
+    }
+    locations
+}
+
 /// Attaches every IDB entry to the subsystem it names.
 ///
 /// An entry naming a subsystem the descriptor does not declare creates a
@@ -638,11 +995,24 @@ fn open_image_archive(
 
 /// Computes the layout of every image and attaches payload locators to
 /// the payload-bearing entries.
+///
+/// Membership is the exact attachment recorded in each image's
+/// subsystems (`Subsystem::entry_ids`), never the entries' qualified
+/// image names: two logical images sharing one media name (foreign IDB
+/// references or duplicated descriptor records) have disjoint entry
+/// sets, and only the image an entry was actually attached to learns
+/// its payload layout. Scanning the flat entry list keeps the IDB
+/// order the archive records follow.
 fn compute_layouts(images: &mut [Image], entries: &mut [Entry]) {
     for image in images {
+        let membership: std::collections::HashSet<EntryId> = image
+            .subsystems
+            .iter()
+            .flat_map(|subsystem| subsystem.entry_ids.iter().copied())
+            .collect();
         let bearing: Vec<EntryId> = entries
             .iter()
-            .filter(|e| e.subsystem.image_name() == image.name && e.compressed_size().is_some())
+            .filter(|e| membership.contains(&e.id) && e.compressed_size().is_some())
             .map(|e| e.id)
             .collect();
 

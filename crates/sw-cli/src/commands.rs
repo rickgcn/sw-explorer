@@ -5,16 +5,17 @@
 
 use crate::cli::{Cli, Command, ExtractArgs, FindArgs, SelectArgs, ShowArgs, TreeArgs};
 use crate::output;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use sw_core::descriptor::model::Subsystem;
 use sw_core::diagnostic::Severity;
-use sw_core::distribution::{Distribution, EntryKey, LocatedEntry, Product};
+use sw_core::distribution::{
+    Distribution, EntryKey, ImageKey, LocatedEntry, LocatedImage, LocatedSubsystem, Product,
+};
 use sw_core::error::Error as CoreError;
 use sw_core::extract::{DecodeMode, ExistingOutputPolicy, ExtractOptions, PathMode};
-use sw_core::image::Image;
 use sw_core::mach::eval::HardwareProfile;
+use sw_core::names::{ImageName, SubsystemName};
 use sw_core::plan;
 use sw_core::query::Query;
 use sw_core::selection::SelectionConflict;
@@ -75,35 +76,55 @@ fn find_product<'a>(dist: &'a Distribution, name: &str) -> Option<(usize, &'a Pr
         .find(|(_, product)| product.name.as_str() == name)
 }
 
-fn find_image<'a>(dist: &'a Distribution, name: &str) -> Option<(usize, &'a Product, &'a Image)> {
-    dist.products()
-        .iter()
-        .enumerate()
-        .find_map(|(index, product)| {
-            product
-                .images
-                .iter()
-                .find(|image| image.name.to_string() == name)
-                .map(|image| (index, product, image))
-        })
+/// Resolves a qualified image name to exactly one logical image.
+///
+/// A name is not an identity: it may match zero, one or several
+/// logical images (foreign IDB references, duplicated descriptor
+/// records). Zero matches mean "not found"; several matches are
+/// refused with the candidate list instead of a guessed first match.
+fn unique_image<'a>(dist: &'a Distribution, name: &ImageName) -> Result<LocatedImage<'a>> {
+    let matches = dist.images_named(name);
+    match matches.len() {
+        0 => bail!("image not found: {name}"),
+        1 => Ok(matches[0]),
+        _ => {
+            let mut message = format!("image name is ambiguous: {name}\n\nmatches:");
+            for located in &matches {
+                let product = &dist.products()[located.key.product_index];
+                let _ = write!(
+                    message,
+                    "\n  containing product {} (image index {})",
+                    product.name, located.key.image_index
+                );
+            }
+            bail!(message)
+        }
+    }
 }
 
-fn find_subsystem<'a>(
+/// Resolves a qualified subsystem name to exactly one logical
+/// subsystem; see [`unique_image`].
+fn unique_subsystem<'a>(
     dist: &'a Distribution,
-    name: &str,
-) -> Option<(usize, &'a Product, &'a Image, &'a Subsystem)> {
-    dist.products()
-        .iter()
-        .enumerate()
-        .find_map(|(index, product)| {
-            product.images.iter().find_map(|image| {
-                image
-                    .subsystems
-                    .iter()
-                    .find(|subsystem| subsystem.name.to_string() == name)
-                    .map(|subsystem| (index, product, image, subsystem))
-            })
-        })
+    name: &SubsystemName,
+) -> Result<LocatedSubsystem<'a>> {
+    let matches = dist.subsystems_named(name);
+    match matches.len() {
+        0 => bail!("subsystem not found: {name}"),
+        1 => Ok(matches[0]),
+        _ => {
+            let mut message = format!("subsystem name is ambiguous: {name}\n\nmatches:");
+            for located in &matches {
+                let product = &dist.products()[located.key.product_index];
+                let _ = write!(
+                    message,
+                    "\n  containing product {} (image {}, subsystem {})",
+                    product.name, located.key.image_index, located.key.subsystem_index
+                );
+            }
+            bail!(message)
+        }
+    }
 }
 
 fn products(dist: &Distribution) -> Result<()> {
@@ -132,14 +153,27 @@ fn show(dist: &Distribution, args: &ShowArgs) -> Result<()> {
             print!("{}", output::product_details(product));
         }
         2 => {
-            let (_index, _product, image) = find_image(dist, &args.name)
-                .ok_or_else(|| anyhow!("image not found: {}", args.name))?;
-            print!("{}", output::image_details(image));
+            // Validated by the argument parser; the grammar authority
+            // is the core name type.
+            let name = ImageName::parse(&args.name)?;
+            let located = unique_image(dist, &name)?;
+            print!("{}", output::image_details(located.image));
         }
         3 => {
-            let (_index, _product, image, subsystem) = find_subsystem(dist, &args.name)
-                .ok_or_else(|| anyhow!("subsystem not found: {}", args.name))?;
-            print!("{}", output::subsystem_details(image, subsystem));
+            let name = SubsystemName::parse(&args.name)?;
+            let located = unique_subsystem(dist, &name)?;
+            // The containing image is resolved by key, never re-derived
+            // from the subsystem's qualified name.
+            let image = dist
+                .image(ImageKey {
+                    product_index: located.key.product_index,
+                    image_index: located.key.image_index,
+                })
+                .expect("the containing image of a resolved subsystem key resolves");
+            print!(
+                "{}",
+                output::subsystem_details(image.image, located.subsystem)
+            );
         }
         // The argument parser already restricts the name to 1-3 segments.
         _ => unreachable!("target name arity is validated by the argument parser"),
@@ -252,30 +286,23 @@ fn resolve_scope(dist: &Distribution, args: &ExtractArgs) -> Result<Vec<EntryKey
             .collect());
     }
     if let Some(name) = &args.image {
-        let (product_index, product, image) =
-            find_image(dist, name).ok_or_else(|| anyhow!("image not found: {name}"))?;
-        return Ok(product
-            .entries
-            .iter()
-            .filter(|entry| entry.subsystem.image_name() == image.name)
-            .map(|entry| EntryKey {
-                product_index,
-                entry_id: entry.id,
-            })
-            .collect());
+        let name = ImageName::parse(name)?;
+        let located = unique_image(dist, &name)?;
+        // The exact logical image is the scope: its attached entries,
+        // never a re-filter by qualified name. An ambiguous name is
+        // refused here, before the planner and before any write.
+        let entries = dist
+            .entries_in_image(located.key)
+            .expect("a resolved image key resolves its entries");
+        return Ok(entries.iter().map(|located| located.key).collect());
     }
     if let Some(name) = &args.subsystem {
-        let (product_index, product, _image, subsystem) =
-            find_subsystem(dist, name).ok_or_else(|| anyhow!("subsystem not found: {name}"))?;
-        return Ok(subsystem
-            .entry_ids
-            .iter()
-            .filter(|id| product.entry(**id).is_some())
-            .map(|id| EntryKey {
-                product_index,
-                entry_id: *id,
-            })
-            .collect());
+        let name = SubsystemName::parse(name)?;
+        let located = unique_subsystem(dist, &name)?;
+        let entries = dist
+            .entries_in_subsystem(located.key)
+            .expect("a resolved subsystem key resolves its entries");
+        return Ok(entries.iter().map(|located| located.key).collect());
     }
     unreachable!("the argument parser requires exactly one scope");
 }

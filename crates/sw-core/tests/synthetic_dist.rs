@@ -2,7 +2,7 @@
 //! built in a temporary directory: descriptor + IDB + one image archive.
 use std::path::PathBuf;
 use sw_core::descriptor::model::{ConditionalFlag, SubsystemPresence, Version};
-use sw_core::distribution::Distribution;
+use sw_core::distribution::{Distribution, EntryKey};
 use sw_core::extract::{self, DecodeMode, ExtractOptions, PathMode};
 use sw_core::image::PayloadResolution;
 use sw_core::mach::eval::HardwareProfile;
@@ -276,6 +276,11 @@ fn descriptor_is_the_hierarchy_authority() {
 #[test]
 fn reads_payloads_exactly() {
     let (_root, dist) = open();
+    let product_index = dist
+        .products()
+        .iter()
+        .position(|p| p.name.as_str() == "test")
+        .unwrap();
     let product = dist.product("test").unwrap();
     let mut reader = dist.image_reader();
 
@@ -284,7 +289,13 @@ fn reads_payloads_exactly() {
         if entry.payload.is_none() {
             continue;
         }
-        let payload = reader.read(entry).expect("read payload");
+        let located = dist
+            .entry(EntryKey {
+                product_index,
+                entry_id: entry.id,
+            })
+            .unwrap();
+        let payload = reader.read(located.key).expect("read payload");
         assert_eq!(payload.location.resolution, PayloadResolution::Exact);
         assert_eq!(
             payload.decode().unwrap().len() as u64,
@@ -300,7 +311,13 @@ fn reads_payloads_exactly() {
         .iter()
         .find(|e| e.path.as_str() == "caf\u{e9}.txt")
         .unwrap();
-    let payload = reader.read(cafe).unwrap();
+    let cafe = dist
+        .entry(EntryKey {
+            product_index,
+            entry_id: cafe.id,
+        })
+        .unwrap();
+    let payload = reader.read(cafe.key).unwrap();
     assert_eq!(payload.bytes, b"latin1");
 }
 
@@ -423,14 +440,17 @@ fn extracts_to_host_filesystem() {
     let profile = HardwareProfile::builder().set("CPUBOARD", "IP20").build();
     let selection = dist.select(&profile);
     let mut reader = dist.image_reader();
-    let selected: Vec<&sw_core::idb::Entry> = selection
-        .selected
-        .iter()
-        .map(|located| located.entry)
-        .collect();
 
-    let report =
-        extract::extract_unchecked(&mut reader, &selected, &out, &ExtractOptions::default());
+    let report = extract::extract_unchecked(
+        &mut reader,
+        &selection
+            .selected
+            .iter()
+            .map(|located| located.key)
+            .collect::<Vec<_>>(),
+        &out,
+        &ExtractOptions::default(),
+    );
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     assert_eq!(std::fs::read(out.join("hello.txt")).unwrap(), b"hello");
@@ -465,10 +485,16 @@ fn regular_entry_without_payload_is_a_failure() {
     let dist = Distribution::open(&root).unwrap();
     let product = dist.product("t").unwrap();
     let entry = &product.entries[0];
+    let located = dist
+        .entry(EntryKey {
+            product_index: 0,
+            entry_id: entry.id,
+        })
+        .unwrap();
     let mut reader = dist.image_reader();
     let report = extract::extract_unchecked(
         &mut reader,
-        &[entry],
+        &[located.key],
         &root.join("out"),
         &ExtractOptions::default(),
     );
@@ -515,10 +541,20 @@ fn extraction_decode_modes() {
     let root = build_compressed_dist();
     let dist = Distribution::open(&root).unwrap();
     let entry = &dist.product("t").unwrap().entries[0];
+    let located = dist
+        .entry(EntryKey {
+            product_index: 0,
+            entry_id: entry.id,
+        })
+        .unwrap();
     let mut reader = dist.image_reader();
     let out = root.join("out-auto");
-    let report =
-        extract::extract_unchecked(&mut reader, &[entry], &out, &ExtractOptions::default());
+    let report = extract::extract_unchecked(
+        &mut reader,
+        &[located.key],
+        &out,
+        &ExtractOptions::default(),
+    );
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert_eq!(std::fs::read(out.join("cshrc")).unwrap(), plain);
     assert!(!out.join("cshrc.Z").exists());
@@ -529,7 +565,7 @@ fn extraction_decode_modes() {
         keep_stored: true,
         ..ExtractOptions::default()
     };
-    let report = extract::extract_unchecked(&mut reader, &[entry], &out, &options);
+    let report = extract::extract_unchecked(&mut reader, &[located.key], &out, &options);
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert_eq!(std::fs::read(out.join("cshrc")).unwrap(), plain);
     assert_eq!(std::fs::read(out.join("cshrc.Z")).unwrap(), compressed);
@@ -540,7 +576,7 @@ fn extraction_decode_modes() {
         decode: DecodeMode::Never,
         ..ExtractOptions::default()
     };
-    let report = extract::extract_unchecked(&mut reader, &[entry], &out, &options);
+    let report = extract::extract_unchecked(&mut reader, &[located.key], &out, &options);
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert!(!out.join("cshrc").exists());
     assert_eq!(std::fs::read(out.join("cshrc.Z")).unwrap(), compressed);
@@ -551,16 +587,27 @@ fn extraction_decode_modes() {
 #[test]
 fn extraction_path_modes() {
     let (root, dist) = open();
+    let product_index = dist
+        .products()
+        .iter()
+        .position(|p| p.name.as_str() == "test")
+        .unwrap();
     let product = dist.product("test").unwrap();
+    let key_of = |entry: &sw_core::idb::Entry| EntryKey {
+        product_index,
+        entry_id: entry.id,
+    };
     let hello: Vec<_> = product
         .entries
         .iter()
         .filter(|e| e.path.as_str() == "hello.txt")
+        .map(key_of)
         .collect();
     let tools: Vec<_> = product
         .entries
         .iter()
         .filter(|e| e.path.as_str() == "bin/tool")
+        .map(key_of)
         .collect();
     let mut reader = dist.image_reader();
 
@@ -593,6 +640,7 @@ fn extraction_path_modes() {
         .entries
         .iter()
         .filter(|e| e.path.as_str() == "bin" && e.file_type == sw_core::idb::FileType::Directory)
+        .map(key_of)
         .collect();
     assert_eq!(bin_dir.len(), 1);
     let out = root.join("out-root");

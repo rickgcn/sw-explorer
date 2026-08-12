@@ -73,7 +73,13 @@ pub struct ImageLayout {
 /// record is read (see [`reader`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PayloadLocator {
-    /// The image archive holding the payload.
+    /// The qualified file name of the physical archive holding the
+    /// payload. This is media metadata — which file the bytes live in —
+    /// not a logical hierarchy identity: several logical images may
+    /// reference the same physical archive file name, and the name's
+    /// product segment need not name the entry's owning product. The
+    /// exact logical image an entry belongs to is decided by its
+    /// [`crate::distribution::EntryKey`] attachment instead.
     pub image: ImageName,
     /// Size of the payload as stored (compressed size, or plain size when
     /// stored uncompressed), or `None` when it could not be determined —
@@ -119,7 +125,8 @@ impl Payload {
 /// Where a payload record was actually found in an image archive.
 #[derive(Debug, Clone)]
 pub struct PayloadLocation {
-    /// The image archive read from.
+    /// The qualified file name of the physical archive read from (media
+    /// metadata, like [`PayloadLocator::image`]).
     pub image: ImageName,
     /// The offset predicted by the layout algorithm, if any.
     pub expected_record_offset: Option<u64>,

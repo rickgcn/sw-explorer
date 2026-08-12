@@ -154,17 +154,24 @@ fn parse_mach_value(value: &str) -> Result<String, String> {
     }
 }
 
-/// Validates a `show` target: one to three non-empty dotted segments.
+/// Validates a `show` target: a product, image or subsystem name. The
+/// grammar authority is the core name types; the CLI only dispatches
+/// on the segment count.
 fn parse_target_name(value: &str) -> Result<String, String> {
-    let segments: Vec<&str> = value.split('.').collect();
-    if (1..=3).contains(&segments.len()) && segments.iter().all(|s| !s.is_empty()) {
-        Ok(value.to_string())
-    } else {
-        Err(format!(
-            "expected a product, image or subsystem name \
-             (1 to 3 dot-separated segments), got {value:?}"
-        ))
-    }
+    let parsed = match value.split('.').count() {
+        1 => ProductName::new(value).map(|_| ()),
+        2 => ImageName::parse(value).map(|_| ()),
+        3 => SubsystemName::parse(value).map(|_| ()),
+        _ => {
+            return Err(format!(
+                "expected a product, image or subsystem name \
+                 (1 to 3 dot-separated segments), got {value:?}"
+            ));
+        }
+    };
+    parsed
+        .map(|_| value.to_string())
+        .map_err(|error| error.to_string())
 }
 
 fn parse_product_name(value: &str) -> Result<String, String> {
@@ -174,14 +181,7 @@ fn parse_product_name(value: &str) -> Result<String, String> {
 }
 
 fn parse_image_name(value: &str) -> Result<String, String> {
-    let segments: Vec<&str> = value.split('.').collect();
-    if segments.len() != 2 {
-        return Err(format!(
-            "expected an image name like `eoe.sw`, got {value:?}"
-        ));
-    }
-    let product = ProductName::new(segments[0]).map_err(|error| error.to_string())?;
-    ImageName::from_parts(product, segments[1].to_string())
+    ImageName::parse(value)
         .map(|_| value.to_string())
         .map_err(|error| error.to_string())
 }

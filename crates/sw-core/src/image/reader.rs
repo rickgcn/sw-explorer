@@ -10,12 +10,21 @@
 //! Reading is always verification: the record name must match the entry's
 //! raw path, and the outcome is reported honestly through
 //! [`crate::image::PayloadResolution`].
-use crate::distribution::Distribution;
+//!
+//! Entries arrive as canonical [`EntryKey`] values, which the reader
+//! resolves against the distribution it is bound to: the owning product
+//! and the exact logical image an entry is attached to come from that
+//! resolution, never from the qualified product segment of a name — an
+//! IDB record may legitimately name a *foreign* subsystem whose product
+//! has no presence in the distribution at all. Because the reader mints
+//! every [`LocatedEntry`] itself, one distribution's identity can never
+//! be paired with another distribution's entry metadata.
+use crate::distribution::{Distribution, EntryKey, LocatedEntry, Product};
 use crate::error::{Error, Result};
-use crate::idb::Entry;
+use crate::idb::{Entry, EntryId};
 use crate::image::latin1_bytes;
 use crate::image::resync::{self, RecordSearch};
-use crate::image::{ImageArchive, Payload, PayloadLocation, PayloadResolution};
+use crate::image::{Image, ImageArchive, Payload, PayloadLocation, PayloadResolution};
 use crate::names::ImageName;
 use std::collections::HashMap;
 use std::fs::File;
@@ -24,6 +33,10 @@ use std::io::{Read, Seek, SeekFrom};
 /// Reads payloads of the entries of one distribution.
 pub struct ImageReader<'a> {
     distribution: &'a Distribution,
+    // Session state per *physical* archive file (its qualified file
+    // name), not per logical image: several logical images may
+    // reference the same physical archive, and they legitimately share
+    // the open file and the learned delta.
     states: HashMap<ImageName, ImageState>,
 }
 
@@ -43,46 +56,78 @@ impl<'a> ImageReader<'a> {
         }
     }
 
+    /// Resolves a canonical key through the distribution this reader is
+    /// bound to.
+    ///
+    /// The reader mints every [`LocatedEntry`] it acts on itself, so a
+    /// caller can never hand it one distribution's identity paired with
+    /// another distribution's entry metadata. Keys originating from
+    /// another distribution are outside the API contract (see
+    /// [`crate::distribution::EntryKey`]): when their numeric halves
+    /// happen to be valid here, they identify an entry of *this*
+    /// distribution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EntryNotFound`] when the key does not resolve in
+    /// the distribution this reader is bound to.
+    pub(crate) fn locate(&self, key: EntryKey) -> Result<LocatedEntry<'a>> {
+        self.distribution
+            .entry(key)
+            .ok_or(Error::EntryNotFound { key })
+    }
+
     /// Reads the payload of one entry.
+    ///
+    /// The key is resolved against the distribution this reader is
+    /// bound to: the entry's canonical identity decides the exact
+    /// logical image it is attached to, and that image's archive is the
+    /// physical file read; the qualified product segment of the payload
+    /// locator's image name is never used to guess an owning product.
+    /// Keys originating from another distribution are outside the API
+    /// contract (see the stability contract on
+    /// [`crate::distribution::EntryKey`]): when their numeric halves
+    /// happen to be valid here, they identify an entry of *this*
+    /// distribution.
     ///
     /// The returned bytes are still compressed if the entry is stored
     /// compressed; call [`Payload::decode`] to transparently decompress.
     ///
     /// # Errors
     ///
-    /// * [`Error::PayloadNotFound`] — the entry carries no payload locator.
-    /// * [`Error::ProductNotFound`] — the locator's product is unknown.
+    /// * [`Error::EntryNotFound`] — the key does not resolve in the
+    ///   distribution this reader is bound to.
+    /// * [`Error::PayloadNotFound`] — the entry carries no payload
+    ///   locator, or its attachment does not resolve.
     /// * [`Error::PayloadSizeUnknown`] — the stored size is unknown, so the
     ///   payload cannot be delimited.
     /// * [`Error::ResyncFailed`] — the record could not be located.
     /// * [`Error::AmbiguousPayloadRecord`] — several records tied.
     /// * [`Error::Io`] — the archive could not be read.
-    pub fn read(&mut self, entry: &Entry) -> Result<Payload> {
+    pub fn read(&mut self, key: EntryKey) -> Result<Payload> {
+        let entry = self.locate(key)?;
         let locator = entry
+            .entry
             .payload
             .as_ref()
             .ok_or_else(|| Error::PayloadNotFound {
-                entry: entry.path.to_string(),
+                entry: entry.entry.path.to_string(),
             })?
             .clone();
 
-        let product_name = locator.image.product().as_str();
-        let product =
-            self.distribution
-                .product(product_name)
-                .ok_or_else(|| Error::ProductNotFound {
-                    name: product_name.to_string(),
-                })?;
-        let archive: &ImageArchive = &product
-            .images
-            .iter()
-            .find(|image| image.name == locator.image)
+        // The exact logical image the entry is attached to, confirmed
+        // by attachment membership — never a name lookup. A record
+        // naming a foreign subsystem is served by the synthetic image
+        // of its *owning* product.
+        let located_image = self
+            .distribution
+            .image_containing_entry(entry.key)
             .ok_or_else(|| Error::PayloadNotFound {
-                entry: entry.path.to_string(),
-            })?
-            .archive;
+                entry: entry.entry.path.to_string(),
+            })?;
+        let archive: &ImageArchive = &located_image.image.archive;
 
-        let image = locator.image.clone();
+        let image = located_image.image.name.clone();
         if !self.states.contains_key(&image) {
             let file =
                 File::open(&archive.path).map_err(|source| Error::io(&archive.path, source))?;
@@ -96,7 +141,7 @@ impl<'a> ImageReader<'a> {
             );
         }
 
-        let expected_name = latin1_bytes(&entry.raw_path);
+        let expected_name = latin1_bytes(&entry.entry.raw_path);
 
         // 1. With a learned delta, probe `expected + delta` first.
         let probe = {
@@ -116,10 +161,10 @@ impl<'a> ImageReader<'a> {
         };
         if let Some((offset, delta)) = probe {
             return self.finish_read(
-                entry,
+                entry.entry,
                 &locator,
                 offset,
-                entry.raw_path.clone(),
+                entry.entry.raw_path.clone(),
                 PayloadResolution::Delta { delta },
             );
         }
@@ -140,17 +185,24 @@ impl<'a> ImageReader<'a> {
         };
         if let Some(offset) = exact {
             return self.finish_read(
-                entry,
+                entry.entry,
                 &locator,
                 offset,
-                entry.raw_path.clone(),
+                entry.entry.raw_path.clone(),
                 PayloadResolution::Exact,
             );
         }
 
         // 3. Resynchronize, using the next payload-bearing entry of the
         //    same image as a cross-check hint, and learn the delta.
-        let next_name = next_payload_name(&product.entries, entry);
+        let product = self
+            .distribution
+            .products()
+            .get(entry.key.product_index)
+            .ok_or_else(|| Error::PayloadNotFound {
+                entry: entry.entry.path.to_string(),
+            })?;
+        let next_name = next_payload_name(product, located_image.image, entry.entry);
         let found = {
             let state = self.states.get_mut(&image).expect("inserted above");
             resync::find_record(
@@ -158,14 +210,14 @@ impl<'a> ImageReader<'a> {
                 state.file_size,
                 locator.expected_record_offset,
                 &RecordSearch {
-                    raw_name: &entry.raw_path,
+                    raw_name: &entry.entry.raw_path,
                     encoded_size: locator.encoded_size,
                     next_name: next_name.as_deref(),
                 },
             )?
         }
         .ok_or_else(|| Error::ResyncFailed {
-            entry: entry.path.to_string(),
+            entry: entry.entry.path.to_string(),
         })?;
 
         let resolution = match locator.expected_record_offset {
@@ -177,7 +229,7 @@ impl<'a> ImageReader<'a> {
             None => PayloadResolution::Scanned,
         };
         self.finish_read(
-            entry,
+            entry.entry,
             &locator,
             found.record_offset,
             found.matched_name,
@@ -244,18 +296,24 @@ fn read_record_name(file: &mut File, file_size: u64, offset: u64) -> Result<Opti
     Ok(Some(name))
 }
 
-/// Finds the raw path of the next payload-bearing entry in the same image.
-fn next_payload_name(entries: &[Entry], entry: &Entry) -> Option<String> {
-    let image = entry.payload.as_ref()?.image.clone();
-    entries
+/// Finds the raw path of the next payload-bearing entry attached to the
+/// same exact image, scanning the owning product's entries in IDB
+/// order.
+///
+/// Membership is the image's recorded attachment (`entry_ids`), never a
+/// qualified-name comparison: a record naming a foreign subsystem finds
+/// its hint in its *owning* product's tree.
+fn next_payload_name(product: &Product, image: &Image, entry: &Entry) -> Option<String> {
+    let membership: std::collections::HashSet<EntryId> = image
+        .subsystems
+        .iter()
+        .flat_map(|subsystem| subsystem.entry_ids.iter().copied())
+        .collect();
+    product
+        .entries
         .iter()
         .skip_while(|candidate| candidate.id != entry.id)
         .skip(1)
-        .find(|candidate| {
-            candidate
-                .payload
-                .as_ref()
-                .is_some_and(|locator| locator.image == image)
-        })
+        .find(|candidate| candidate.payload.is_some() && membership.contains(&candidate.id))
         .map(|candidate| candidate.raw_path.clone())
 }

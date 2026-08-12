@@ -215,11 +215,13 @@ pub fn extract_checked(
     profile: Option<&HardwareProfile>,
 ) -> Result<CheckedExtractReport> {
     let plan = plan_extraction(distribution, requested, out_dir, options, profile)?;
-    // The low-level writer works on plain entries; ownership identity
-    // has served its purpose in the planner.
-    let entries: Vec<&Entry> = plan.entries.iter().map(|located| located.entry).collect();
+    // The planned entries keep their canonical identity all the way to
+    // the payload read: the low-level writer re-resolves each key
+    // through the reader's own distribution, so entry identity and
+    // entry metadata are always minted by the same authority.
+    let keys: Vec<EntryKey> = plan.entries.iter().map(|located| located.key).collect();
     let mut reader = distribution.image_reader();
-    let report = extract::extract_unchecked(&mut reader, &entries, out_dir, options);
+    let report = extract::extract_unchecked(&mut reader, &keys, out_dir, options);
     Ok(CheckedExtractReport {
         plan: plan.summary,
         report,

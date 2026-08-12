@@ -184,13 +184,19 @@ pub(crate) fn product_detail(product: &Product, id: u64) -> ffi::ProductDetail {
     }
 }
 
-/// Builds the detail DTO of the image with object id `id`.
-pub(crate) fn image_detail(image: &Image, id: u64) -> ffi::ImageDetail {
+/// Builds the detail DTO of the image with object id `id`; `product`
+/// is the image's containing product.
+///
+/// The containing product is reported from the hierarchy position, not
+/// from the image's qualified name: a synthetic image grown from a
+/// foreign IDB reference displays its *container*, which legitimately
+/// differs from the name's product segment.
+pub(crate) fn image_detail(product: &Product, image: &Image, id: u64) -> ffi::ImageDetail {
     ffi::ImageDetail {
         id,
         name: image.name.file_name(),
         title: image.title.clone().unwrap_or_default(),
-        product_name: image.name.product().as_str().to_string(),
+        product_name: product.name.as_str().to_string(),
         // Images synthesized from IDB entries carry no descriptor
         // record fields; this mirrors the hierarchy.
         descriptor_present: image.version.is_some(),
@@ -213,8 +219,13 @@ pub(crate) fn image_detail(image: &Image, id: u64) -> ffi::ImageDetail {
 }
 
 /// Builds the detail DTO of the subsystem with object id `id`;
-/// `image` is the subsystem's containing image.
+/// `product` and `image` are the subsystem's containing objects.
+///
+/// The containing product and image are reported from the hierarchy
+/// position, not from the subsystem's qualified name (see
+/// [`image_detail`]).
 pub(crate) fn subsystem_detail(
+    product: &Product,
     image: &Image,
     subsystem: &Subsystem,
     id: u64,
@@ -224,8 +235,8 @@ pub(crate) fn subsystem_detail(
         identity: subsystem.name.to_string(),
         short_name: subsystem.name.subsystem().to_string(),
         title: subsystem.title.clone().unwrap_or_default(),
-        product_name: subsystem.name.product().as_str().to_string(),
-        image_name: subsystem.name.image_name().file_name(),
+        product_name: product.name.as_str().to_string(),
+        image_name: image.name.file_name(),
         image_version_known: image.version.is_some(),
         image_version: image.version.map(|version| version.0).unwrap_or(0),
         descriptor_present: subsystem.presence.descriptor,

@@ -13,19 +13,21 @@ use crate::detail;
 use crate::entry;
 use crate::extraction;
 use crate::hardware;
-use sw_core::distribution::{Distribution, EntryKey};
+use sw_core::distribution::{Distribution, EntryKey, ImageKey, LocatedEntry, SubsystemKey};
 use sw_core::idb::EntryId;
 use sw_core::mach::eval::HardwareProfile;
 use sw_core::query::Query;
 
 /// Identifies one domain object of the loaded distribution by its
-/// position: product index, image index and subsystem index into
-/// `Distribution::products()` and below.
+/// canonical sw-core hierarchy key: the position of the product, image
+/// or subsystem within `Distribution::products()` and below. Products
+/// keep their bare index; images and subsystems use the core key types,
+/// so a name is never part of an object's identity.
 #[derive(Clone, Copy)]
 enum ObjectRef {
     Product(usize),
-    Image(usize, usize),
-    Subsystem(usize, usize, usize),
+    Image(ImageKey),
+    Subsystem(SubsystemKey),
 }
 
 /// One entry of the backend's object table: the public object id is
@@ -156,12 +158,19 @@ fn build_object_table(distribution: &Distribution) -> (Vec<ObjectEntry>, Vec<u64
             let image_id = objects.len() as u64 + 1;
             objects.push(ObjectEntry {
                 parent_id: product_id,
-                reference: ObjectRef::Image(product_index, image_index),
+                reference: ObjectRef::Image(ImageKey {
+                    product_index,
+                    image_index,
+                }),
             });
             for subsystem_index in 0..image.subsystems.len() {
                 objects.push(ObjectEntry {
                     parent_id: image_id,
-                    reference: ObjectRef::Subsystem(product_index, image_index, subsystem_index),
+                    reference: ObjectRef::Subsystem(SubsystemKey {
+                        product_index,
+                        image_index,
+                        subsystem_index,
+                    }),
                 });
             }
         }
@@ -249,8 +258,11 @@ impl Backend {
                         idb_present: product.idb_file.is_some(),
                     }
                 }
-                ObjectRef::Image(product_index, image_index) => {
-                    let image = &distribution.products()[product_index].images[image_index];
+                ObjectRef::Image(key) => {
+                    let image = distribution
+                        .image(key)
+                        .expect("object table keys resolve in the loaded distribution")
+                        .image;
                     ffi::HierarchyNode {
                         id,
                         parent_id,
@@ -271,9 +283,11 @@ impl Backend {
                             .any(|subsystem| subsystem.presence.idb),
                     }
                 }
-                ObjectRef::Subsystem(product_index, image_index, subsystem_index) => {
-                    let subsystem = &distribution.products()[product_index].images[image_index]
-                        .subsystems[subsystem_index];
+                ObjectRef::Subsystem(key) => {
+                    let subsystem = distribution
+                        .subsystem(key)
+                        .expect("object table keys resolve in the loaded distribution")
+                        .subsystem;
                     ffi::HierarchyNode {
                         id,
                         parent_id,
@@ -304,13 +318,16 @@ impl Backend {
 
     pub(crate) fn image_detail(&self, id: u64) -> Result<ffi::ImageDetail, ObjectDetailError> {
         let (reference, distribution) = self.resolve_object(id)?;
-        let ObjectRef::Image(product_index, image_index) = *reference else {
+        let ObjectRef::Image(key) = *reference else {
             return Err(wrong_kind(id, "an image", reference));
         };
-        Ok(detail::image_detail(
-            &distribution.products()[product_index].images[image_index],
-            id,
-        ))
+        let located = distribution
+            .image(key)
+            .expect("object table keys resolve in the loaded distribution");
+        // The containing product comes from the key, not from the
+        // image's qualified name.
+        let product = &distribution.products()[key.product_index];
+        Ok(detail::image_detail(product, located.image, id))
     }
 
     pub(crate) fn subsystem_detail(
@@ -318,13 +335,24 @@ impl Backend {
         id: u64,
     ) -> Result<ffi::SubsystemDetail, ObjectDetailError> {
         let (reference, distribution) = self.resolve_object(id)?;
-        let ObjectRef::Subsystem(product_index, image_index, subsystem_index) = *reference else {
+        let ObjectRef::Subsystem(key) = *reference else {
             return Err(wrong_kind(id, "a subsystem", reference));
         };
-        let image = &distribution.products()[product_index].images[image_index];
+        let located = distribution
+            .subsystem(key)
+            .expect("object table keys resolve in the loaded distribution");
+        let image = distribution
+            .image(ImageKey {
+                product_index: key.product_index,
+                image_index: key.image_index,
+            })
+            .expect("the containing image of a resolved subsystem key resolves")
+            .image;
+        let product = &distribution.products()[key.product_index];
         Ok(detail::subsystem_detail(
+            product,
             image,
-            &image.subsystems[subsystem_index],
+            located.subsystem,
             id,
         ))
     }
@@ -346,41 +374,43 @@ impl Backend {
         scope_id: u64,
     ) -> Result<Vec<ffi::EntrySummary>, ObjectDetailError> {
         let (reference, distribution) = self.resolve_object(scope_id)?;
-        let product_index = match *reference {
-            ObjectRef::Product(product_index) => product_index,
-            ObjectRef::Image(product_index, _) => product_index,
-            ObjectRef::Subsystem(product_index, ..) => product_index,
-        };
-        let product = &distribution.products()[product_index];
-        let product_id = self.product_object_id(product_index)?;
 
-        // Every scope filters the product's flat entry list, so the
-        // result keeps the exact IDB order: interleaved subsystem
-        // records are never regrouped, and duplicate paths are never
-        // deduplicated.
-        let scoped: Vec<&sw_core::idb::Entry> = match *reference {
-            ObjectRef::Product(_) => product.entries.iter().collect(),
-            ObjectRef::Image(_, image_index) => {
-                let image_name = &product.images[image_index].name;
-                product
-                    .entries
-                    .iter()
-                    .filter(|entry| &entry.subsystem.image_name() == image_name)
-                    .collect()
-            }
-            ObjectRef::Subsystem(_, image_index, subsystem_index) => {
-                let name = &product.images[image_index].subsystems[subsystem_index].name;
-                product
-                    .entries
-                    .iter()
-                    .filter(|entry| &entry.subsystem == name)
-                    .collect()
-            }
+        // Every scope resolves to entries carrying their canonical
+        // keys, so the result keeps the exact IDB order: interleaved
+        // subsystem records are never regrouped, and duplicate paths
+        // are never deduplicated. Image and subsystem scopes are the
+        // exact objects the keys identify — attached membership, never
+        // a name re-filter.
+        let scoped: Vec<LocatedEntry> = match *reference {
+            ObjectRef::Product(product_index) => distribution.products()[product_index]
+                .entries
+                .iter()
+                .map(|entry| {
+                    distribution
+                        .entry(EntryKey {
+                            product_index,
+                            entry_id: entry.id,
+                        })
+                        .expect("an entry of the loaded distribution resolves")
+                })
+                .collect(),
+            ObjectRef::Image(key) => distribution
+                .entries_in_image(key)
+                .expect("object table keys resolve in the loaded distribution"),
+            ObjectRef::Subsystem(key) => distribution
+                .entries_in_subsystem(key)
+                .expect("object table keys resolve in the loaded distribution"),
         };
-        Ok(scoped
-            .into_iter()
-            .map(|entry| entry::entry_summary(product_id, entry))
-            .collect())
+        scoped
+            .iter()
+            .map(|located| {
+                // The owning product of the entry itself, which may
+                // legitimately differ from the product segment of the
+                // entry's qualified subsystem name.
+                let product_id = self.product_object_id(located.key.product_index)?;
+                Ok(entry::entry_summary(product_id, located.entry))
+            })
+            .collect()
     }
 
     pub(crate) fn search_entries(

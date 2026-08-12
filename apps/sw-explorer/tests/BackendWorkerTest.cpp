@@ -24,6 +24,7 @@ private slots:
     void commitAndDiscardWithoutCandidateAreHarmless();
     void commitEmitsCandidateCommitted();
     void detailQueriesRoundTripSnapshots();
+    void foreignHierarchyRoundTripsOwnersAndScopes();
     void detailQueryWithoutDistributionFails();
     void detailQueryWithBadIdFails();
     void detailQueryWithWrongKindFails();
@@ -117,6 +118,30 @@ bool writeGammaDist(QTemporaryDir &dir)
     }
     idb.write(
         "f 0755 root sys usr/bin/gamma src/gamma gamma.sw.unix sum(1) size(10) cmpsize(0)\n");
+    return true;
+}
+
+// Two products: `alpha` whose IDB names the *foreign* subsystem
+// beta.sw.unix (growing a synthetic beta.sw image inside alpha's
+// tree), and `beta` with its own beta.sw.unix record. Object ids:
+// 1 = alpha, 2 = beta.sw (under alpha), 3 = unix, 4 = beta,
+// 5 = beta.sw (under beta), 6 = unix.
+bool writeForeignDist(QTemporaryDir &dir)
+{
+    QFile alphaIdb(dir.filePath(QStringLiteral("alpha.idb")));
+    if (!alphaIdb.open(QIODevice::WriteOnly)) {
+        return false;
+    }
+    alphaIdb.write(
+        "f 0644 root sys usr/bin/foreign src/f beta.sw.unix sum(1) size(1) cmpsize(0)\n");
+    alphaIdb.close();
+
+    QFile betaIdb(dir.filePath(QStringLiteral("beta.idb")));
+    if (!betaIdb.open(QIODevice::WriteOnly)) {
+        return false;
+    }
+    betaIdb.write(
+        "f 0644 root sys usr/bin/actual-beta src/b beta.sw.unix sum(1) size(1) cmpsize(0)\n");
     return true;
 }
 
@@ -422,6 +447,60 @@ void BackendWorkerTest::detailQueriesRoundTripSnapshots()
     QCOMPARE(subsystem.flags.known, false);
     QCOMPARE(subsystem.rules.known, false);
     QCOMPARE(subsystem.autominirootKnown, false);
+}
+
+void BackendWorkerTest::foreignHierarchyRoundTripsOwnersAndScopes()
+{
+    QTemporaryDir dir;
+    QVERIFY(writeForeignDist(dir));
+
+    BackendWorker worker;
+    worker.openDistribution(dir.path());
+    worker.commitCandidate();
+
+    QSignalSpy imageSpy(&worker, &BackendWorker::imageDetailReady);
+    QSignalSpy subsystemSpy(&worker, &BackendWorker::subsystemDetailReady);
+    QSignalSpy entriesSpy(&worker, &BackendWorker::entriesReady);
+    QSignalSpy detailFailSpy(&worker, &BackendWorker::detailFailed);
+    QSignalSpy entriesFailSpy(&worker, &BackendWorker::entriesFailed);
+
+    // Object 2 is the synthetic beta.sw inside alpha's tree: the
+    // display name is the qualified media name, the containing
+    // product the actual owner — the two legitimately disagree.
+    worker.detailRequested(40, 2, HierarchyKind::Image);
+    QCOMPARE(detailFailSpy.count(), 0);
+    QCOMPARE(imageSpy.count(), 1);
+    const auto image = qvariant_cast<ImageDetailSnapshot>(imageSpy.first().at(1));
+    QCOMPARE(image.name, QStringLiteral("beta.sw"));
+    QCOMPARE(image.productName, QStringLiteral("alpha"));
+
+    worker.detailRequested(41, 3, HierarchyKind::Subsystem);
+    QCOMPARE(subsystemSpy.count(), 1);
+    const auto subsystem = qvariant_cast<SubsystemDetailSnapshot>(subsystemSpy.first().at(1));
+    QCOMPARE(subsystem.identity, QStringLiteral("beta.sw.unix"));
+    QCOMPARE(subsystem.productName, QStringLiteral("alpha"));
+    QCOMPARE(subsystem.imageName, QStringLiteral("beta.sw"));
+
+    // The two same-named images (2 under alpha, 5 under beta) are
+    // exact scopes: each lists only the records attached to it, and
+    // the rows name their owning product.
+    worker.entriesRequested(42, 2);
+    QCOMPARE(entriesFailSpy.count(), 0);
+    QCOMPARE(entriesSpy.count(), 1);
+    const auto alphaEntries = qvariant_cast<EntryListSnapshot>(entriesSpy.first().at(1));
+    QCOMPARE(alphaEntries.size(), 1);
+    QCOMPARE(alphaEntries.at(0).path, QStringLiteral("usr/bin/foreign"));
+    QCOMPARE(alphaEntries.at(0).productId, 1);
+
+    worker.entriesRequested(43, 5);
+    QCOMPARE(entriesSpy.count(), 2);
+    const auto betaEntries = qvariant_cast<EntryListSnapshot>(entriesSpy.at(1).at(1));
+    QCOMPARE(betaEntries.size(), 1);
+    QCOMPARE(betaEntries.at(0).path, QStringLiteral("usr/bin/actual-beta"));
+    QCOMPARE(betaEntries.at(0).productId, 4);
+
+    QCOMPARE(detailFailSpy.count(), 0);
+    QCOMPARE(entriesFailSpy.count(), 0);
 }
 
 void BackendWorkerTest::detailQueryWithoutDistributionFails()

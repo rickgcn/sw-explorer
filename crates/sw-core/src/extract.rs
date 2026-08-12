@@ -5,6 +5,7 @@
 //! directory. On top of that, [`host_path`] validates every component
 //! against the host filesystem's naming rules (which matter once IRIX
 //! file names meet Windows).
+use crate::distribution::{EntryKey, LocatedEntry};
 use crate::error::{Error, Result};
 use crate::idb::{Entry, FileType};
 use crate::image::PayloadResolution;
@@ -141,6 +142,15 @@ pub struct ExtractReport {
 /// everything immediately before writing; call this directly only to
 /// test the writer itself.
 ///
+/// Every key is resolved through the distribution the reader is bound
+/// to, which re-mints every [`LocatedEntry`] itself: an entry's
+/// identity and its metadata can never be mixed from two different
+/// distributions, and the reader opens the archive of the image the
+/// entry is actually attached to. Keys originating from another
+/// distribution are outside the API contract (see the stability
+/// contract on [`crate::distribution::EntryKey`]); one that does not
+/// resolve here is reported as a failure, not a panic.
+///
 /// Directories are created, regular files are written (decoding `.Z`
 /// payloads according to [`ExtractOptions::decode`]), and symbolic links
 /// are recreated on Unix. Permission bits are applied from the entry mode
@@ -149,16 +159,33 @@ pub struct ExtractReport {
 /// [`ExistingOutputPolicy::Refuse`], regular-file writes fail atomically
 /// instead of truncating an existing file, and symbolic links never
 /// replace an existing path under either policy.
-pub fn extract_unchecked(
-    reader: &mut ImageReader<'_>,
-    entries: &[&Entry],
+pub fn extract_unchecked<'a>(
+    reader: &mut ImageReader<'a>,
+    entries: &[EntryKey],
     out_dir: &Path,
     options: &ExtractOptions,
 ) -> ExtractReport {
     let mut report = ExtractReport::default();
 
-    for entry in entries {
-        match extract_one(reader, entry, out_dir, options) {
+    for &key in entries {
+        // The writer never accepts a caller-minted located entry: each
+        // key is resolved through the distribution the reader is bound
+        // to, so identity and metadata always come from the same
+        // authority.
+        let located = match reader.locate(key) {
+            Ok(located) => located,
+            Err(error) => {
+                report.failures.push(ExtractFailure {
+                    path: format!("{key:?}"),
+                    message: error.to_string(),
+                });
+                if !options.continue_on_error {
+                    break;
+                }
+                continue;
+            }
+        };
+        match extract_one(reader, located, out_dir, options) {
             Ok(ExtractOutcome::Written(recovery)) => {
                 report.extracted += 1;
                 if let Some(recovery) = recovery {
@@ -168,7 +195,7 @@ pub fn extract_unchecked(
             Ok(ExtractOutcome::Skipped) => report.skipped += 1,
             Err(error) => {
                 report.failures.push(ExtractFailure {
-                    path: entry.path.to_string(),
+                    path: located.entry.path.to_string(),
                     message: error.to_string(),
                 });
                 if !options.continue_on_error {
@@ -269,12 +296,13 @@ pub fn output_paths(entry: &Entry, options: &ExtractOptions) -> Result<Vec<PathB
     })
 }
 
-fn extract_one(
-    reader: &mut ImageReader<'_>,
-    entry: &Entry,
+fn extract_one<'a>(
+    reader: &mut ImageReader<'a>,
+    located: LocatedEntry<'a>,
     out_dir: &Path,
     options: &ExtractOptions,
 ) -> Result<ExtractOutcome> {
+    let entry = located.entry;
     let Some(relative) = resolve_relative(entry, &options.path_mode) else {
         return Ok(ExtractOutcome::Skipped);
     };
@@ -291,7 +319,7 @@ fn extract_one(
                 std::fs::create_dir_all(parent).map_err(|source| Error::io(parent, source))?;
             }
             let recovery = if entry.payload.is_some() {
-                let payload = reader.read(entry)?;
+                let payload = reader.read(located.key)?;
                 let recovery =
                     (payload.location.resolution != PayloadResolution::Exact).then(|| {
                         ExtractRecovery {

@@ -31,7 +31,7 @@
 //!
 //! let mut reader = dist.image_reader();
 //! for located in selection.selected {
-//!     if let Ok(payload) = reader.read(located.entry) {
+//!     if let Ok(payload) = reader.read(located.key) {
 //!         let bytes = payload.decode()?;
 //!         // ...
 //!     }

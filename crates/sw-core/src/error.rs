@@ -1,5 +1,6 @@
 //! Structured error type for all fallible `sw-core` operations.
 
+use crate::distribution::EntryKey;
 use std::path::PathBuf;
 
 /// Result alias used throughout the crate.
@@ -33,6 +34,19 @@ pub enum Error {
     ProductNotFound {
         /// Requested product name.
         name: String,
+    },
+
+    /// A canonical entry key does not identify any entry of the
+    /// distribution it was resolved against.
+    ///
+    /// Keys are session-local identities (see the stability contract on
+    /// [`EntryKey`]): a key minted by another distribution instance is
+    /// outside the API contract, and one whose numeric halves are out of
+    /// range simply resolves to nothing.
+    #[error("entry key does not resolve in this distribution: {key:?}")]
+    EntryNotFound {
+        /// The key that failed to resolve.
+        key: EntryKey,
     },
 
     /// An IDB line could not be parsed at all.

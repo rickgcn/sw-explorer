@@ -527,16 +527,18 @@ fn find_rejects_an_empty_query() {
 }
 
 /// Builds the ownership regression distribution: `alpha`'s IDB carries
-/// a record naming the *foreign* subsystem `beta.sw.unix`, while `beta`
-/// has its own record with the same entry id. The record belongs to
-/// alpha; the subsystem name is not an ownership boundary.
+/// a record naming the *foreign* subsystem `beta.sw.unix` (plus one
+/// record naming its own `alpha.sw.unix`), while `beta` has its own
+/// record in `beta.sw.unix`. The foreign record belongs to alpha; the
+/// subsystem name is not an ownership boundary.
 fn build_foreign_dist() -> PathBuf {
     let root = temp_dir("foreign");
     // Both records are explicitly empty regular files: no image
     // archive is needed for the extraction assertion below.
     std::fs::write(
         root.join("alpha.idb"),
-        "f 0755 root sys usr/bin/foreign src/f beta.sw.unix sum(1) size(0) mach(CPUBOARD=IP22)\n",
+        "f 0755 root sys usr/bin/foreign src/f beta.sw.unix sum(1) size(0) mach(CPUBOARD=IP22)\n\
+         f 0644 root sys usr/bin/own src/o alpha.sw.unix sum(2) size(0)\n",
     )
     .unwrap();
     std::fs::write(
@@ -584,6 +586,106 @@ fn extract_by_path_keeps_foreign_records_with_their_actual_owner() {
     assert_eq!(std::fs::read(out.join("usr/bin/foreign")).unwrap(), b"");
     // beta's same-id record was never in the requested scope.
     assert!(!out.join("usr/bin/beta").exists());
+    let _ = std::fs::remove_dir_all(&dist);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn tree_shows_foreign_image_under_its_actual_owner() {
+    // alpha's tree carries the synthetic foreign image beta.sw: the
+    // qualified media name differs from the container, and the tree
+    // shows both facts as they are.
+    let dist = build_foreign_dist();
+    let (code, stdout, _) = run(sw(&dist).args(["tree", "alpha"]));
+    assert_eq!(code, 0);
+    assert!(stdout.contains("alpha"), "{stdout}");
+    assert!(stdout.contains("beta.sw"), "{stdout}");
+    assert!(stdout.contains("beta.sw.unix"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dist);
+}
+
+#[test]
+fn show_ambiguous_image_fails_with_candidates() {
+    // Both alpha (synthetic, from the foreign IDB reference) and beta
+    // carry a logical beta.sw image: the name alone cannot pick one.
+    let dist = build_foreign_dist();
+    let (code, _, stderr) = run(sw(&dist).args(["show", "beta.sw"]));
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("image name is ambiguous: beta.sw"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("containing product alpha"), "{stderr}");
+    assert!(stderr.contains("containing product beta"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dist);
+}
+
+#[test]
+fn show_ambiguous_subsystem_fails_with_candidates() {
+    let dist = build_foreign_dist();
+    let (code, _, stderr) = run(sw(&dist).args(["show", "beta.sw.unix"]));
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("subsystem name is ambiguous: beta.sw.unix"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("containing product alpha"), "{stderr}");
+    assert!(stderr.contains("containing product beta"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dist);
+}
+
+#[test]
+fn extract_ambiguous_image_refuses_before_writing() {
+    let dist = build_foreign_dist();
+    // A path that does not exist yet: a refusal must not create it.
+    let out = temp_dir("out").join("refused");
+    let (code, _, stderr) = run(sw(&dist)
+        .args(["extract", "--image", "beta.sw", "-o"])
+        .arg(&out));
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("image name is ambiguous: beta.sw"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("containing product alpha"), "{stderr}");
+    assert!(stderr.contains("containing product beta"), "{stderr}");
+    assert!(!out.exists(), "a refused extraction writes nothing");
+    let _ = std::fs::remove_dir_all(&dist);
+}
+
+#[test]
+fn extract_ambiguous_subsystem_refuses_before_writing() {
+    let dist = build_foreign_dist();
+    let out = temp_dir("out").join("refused");
+    let (code, _, stderr) = run(sw(&dist)
+        .args(["extract", "--subsystem", "beta.sw.unix", "-o"])
+        .arg(&out));
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("subsystem name is ambiguous: beta.sw.unix"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("containing product alpha"), "{stderr}");
+    assert!(stderr.contains("containing product beta"), "{stderr}");
+    assert!(!out.exists(), "a refused extraction writes nothing");
+    let _ = std::fs::remove_dir_all(&dist);
+}
+
+#[test]
+fn extract_unique_image_and_subsystem_scopes_still_work() {
+    // alpha.sw / alpha.sw.unix exist only under alpha: unique lookups
+    // keep their behavior on unambiguous names.
+    let dist = build_foreign_dist();
+    let (code, stdout, _) = run(sw(&dist).args(["show", "alpha.sw.unix"]));
+    assert_eq!(code, 0);
+    assert!(stdout.contains("Subsystem: alpha.sw.unix"), "{stdout}");
+
+    let out = temp_dir("out");
+    let (code, _, stderr) = run(sw(&dist)
+        .args(["extract", "--subsystem", "alpha.sw.unix", "-o"])
+        .arg(&out));
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(std::fs::read(out.join("usr/bin/own")).unwrap(), b"");
     let _ = std::fs::remove_dir_all(&dist);
     let _ = std::fs::remove_dir_all(&out);
 }

@@ -120,7 +120,49 @@ fn write_descriptor(root: &Path, product: &str, subsystems: &[&str]) {
     std::fs::write(root.join(product), bytes).unwrap();
 }
 
-/// One raw rule range of a synthetic descriptor: a dotted target
+/// Writes a malformed-but-preserved descriptor for `product`: two
+/// image records both named `sw`, each carrying one `unix` subsystem
+/// record, so one product holds two logical images (and subsystems)
+/// with identical qualified names.
+fn write_duplicate_image_descriptor(root: &Path, product: &str) {
+    fn lp16(bytes: &mut Vec<u8>, s: &str) {
+        bytes.extend_from_slice(&(s.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(s.as_bytes());
+    }
+
+    let mut bytes = b"pd001V999P00\0".to_vec();
+    for word in [0x07c4u16, 0x0001, 0x07c3, 9] {
+        bytes.extend_from_slice(&word.to_be_bytes());
+    }
+    lp16(&mut bytes, product);
+    lp16(&mut bytes, "Test Product");
+    bytes.extend_from_slice(&0x0850u16.to_be_bytes()); // product flags
+    bytes.extend_from_slice(&1u32.to_be_bytes()); // stamp
+    bytes.extend_from_slice(&0u32.to_be_bytes()); // reserved
+    bytes.extend_from_slice(&0u16.to_be_bytes()); // metadata count
+    bytes.extend_from_slice(&2u16.to_be_bytes()); // image count
+
+    for _ in 0..2 {
+        bytes.extend_from_slice(&0x0858u16.to_be_bytes()); // image flags
+        lp16(&mut bytes, "sw");
+        lp16(&mut bytes, "System Software");
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // legacy field
+        bytes.extend_from_slice(&9999u16.to_be_bytes()); // order
+        bytes.extend_from_slice(&1u32.to_be_bytes()); // version
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // reserved
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // metadata count
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // subsystem count
+
+        bytes.extend_from_slice(&0x0852u16.to_be_bytes()); // flags
+        lp16(&mut bytes, "unix");
+        lp16(&mut bytes, "Subsystem Title");
+        lp16(&mut bytes, "ALL");
+        for _ in 0..9 {
+            bytes.extend_from_slice(&0u16.to_be_bytes()); // rule slots
+        }
+    }
+    std::fs::write(root.join(product), bytes).unwrap();
+}
 /// plus the raw wire bounds, so even the negated-low `follows`
 /// encoding can be written.
 struct RangeSpec {
@@ -542,6 +584,35 @@ fn hierarchy_includes_idb_only_objects() {
 }
 
 #[test]
+fn hierarchy_keeps_same_name_images_as_distinct_objects() {
+    let root = temp_root("same-name-hierarchy");
+    write_foreign_selection_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+    let nodes = backend.hierarchy().unwrap();
+
+    // alpha grows a synthetic beta.sw from its foreign IDB reference;
+    // beta carries its own beta.sw. Two logical images, one media
+    // name: distinct object ids, distinct parents, the same display
+    // name — the honest representation of the media facts.
+    let shapes: Vec<_> = nodes.iter().map(node_shape).collect();
+    assert_eq!(
+        shapes,
+        vec![
+            (1, 0, "product", "alpha".to_string(), 1, false, true),
+            (2, 1, "image", "beta.sw".to_string(), 1, false, true),
+            (3, 2, "subsystem", "unix".to_string(), 1, false, true),
+            (4, 0, "product", "beta".to_string(), 1, false, true),
+            (5, 4, "image", "beta.sw".to_string(), 1, false, true),
+            (6, 5, "subsystem", "unix".to_string(), 1, false, true),
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn failed_open_keeps_previous_hierarchy() {
     let root = temp_root("keep-hierarchy");
     write_idb(&root, "test", &[("test.sw.unix", "a")]);
@@ -938,6 +1009,37 @@ fn subsystem_detail_distinguishes_known_empty_from_unknown() {
 }
 
 #[test]
+fn detail_reports_the_containing_product_not_the_name_segment() {
+    let root = temp_root("foreign-detail");
+    write_foreign_selection_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // The synthetic beta.sw under alpha (object 2): the displayed
+    // name is the qualified media name, the containing product is the
+    // actual owner — the two legitimately disagree.
+    let image = backend.image_detail(2).unwrap();
+    assert_eq!(image.name, "beta.sw");
+    assert_eq!(image.product_name, "alpha");
+    let subsystem = backend.subsystem_detail(3).unwrap();
+    assert_eq!(subsystem.identity, "beta.sw.unix");
+    assert_eq!(subsystem.product_name, "alpha");
+    assert_eq!(subsystem.image_name, "beta.sw");
+
+    // beta's own beta.sw (object 5): name segment and container agree.
+    let image = backend.image_detail(5).unwrap();
+    assert_eq!(image.name, "beta.sw");
+    assert_eq!(image.product_name, "beta");
+    let subsystem = backend.subsystem_detail(6).unwrap();
+    assert_eq!(subsystem.identity, "beta.sw.unix");
+    assert_eq!(subsystem.product_name, "beta");
+    assert_eq!(subsystem.image_name, "beta.sw");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn failed_open_keeps_previous_detail_queryable() {
     let root = temp_root("detail-keep");
     write_rich_dist(&root);
@@ -1252,6 +1354,82 @@ fn subsystem_scope_keeps_idb_order_and_duplicate_paths() {
     let alpha = backend.entries(3).unwrap();
     let alpha_ids: Vec<u64> = alpha.iter().map(|row| row.entry_id).collect();
     assert_eq!(alpha_ids, vec![0, 3, 5, 6, 8, 9, 10]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn scopes_of_same_name_objects_use_exact_attachment() {
+    let root = temp_root("foreign-scopes");
+    write_foreign_selection_dist(&root);
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // Object 2 is alpha's synthetic beta.sw, object 5 beta's own: the
+    // scope of each is the attachment of that exact object, never a
+    // cross-product name filter.
+    let alpha_rows = backend.entries(2).unwrap();
+    assert_eq!(alpha_rows.len(), 1);
+    assert_eq!(alpha_rows[0].path, "usr/bin/foreign");
+    assert_eq!(alpha_rows[0].product_id, 1);
+    let beta_rows = backend.entries(5).unwrap();
+    assert_eq!(beta_rows.len(), 1);
+    assert_eq!(beta_rows[0].path, "usr/bin/actual-beta");
+    assert_eq!(beta_rows[0].product_id, 4);
+
+    // Subsystem scopes (3 = alpha's unix, 6 = beta's unix) likewise.
+    let alpha_rows = backend.entries(3).unwrap();
+    assert_eq!(alpha_rows.len(), 1);
+    assert_eq!(alpha_rows[0].path, "usr/bin/foreign");
+    let beta_rows = backend.entries(6).unwrap();
+    assert_eq!(beta_rows.len(), 1);
+    assert_eq!(beta_rows[0].path, "usr/bin/actual-beta");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn same_owner_duplicate_images_have_disjoint_scopes() {
+    let root = temp_root("dup-image-scopes");
+    write_duplicate_image_descriptor(&root, "dup");
+    write_raw_idb(
+        &root,
+        "dup",
+        "f 0644 root sys a.txt src/a dup.sw.unix sum(1) size(1) cmpsize(0)\n\
+         f 0644 root sys b.txt src/b dup.sw.unix sum(2) size(1) cmpsize(0)\n",
+    );
+
+    let mut backend = new_backend();
+    backend.open_distribution(root.to_str().unwrap()).unwrap();
+
+    // Object ids: 1 = dup, 2 = dup.sw #0, 3 = unix #0, 4 = dup.sw #1,
+    // 5 = unix #1. Attachment assigns both records to the first
+    // matching subsystem; the second image's scope stays empty — a
+    // name-based scope would list the records under both images.
+    let shapes: Vec<_> = backend
+        .hierarchy()
+        .unwrap()
+        .iter()
+        .map(node_shape)
+        .collect();
+    assert_eq!(
+        shapes,
+        vec![
+            (1, 0, "product", "dup".to_string(), 2, true, true),
+            (2, 1, "image", "dup.sw".to_string(), 2, true, true),
+            (3, 2, "subsystem", "unix".to_string(), 2, true, true),
+            (4, 1, "image", "dup.sw".to_string(), 0, true, false),
+            (5, 4, "subsystem", "unix".to_string(), 0, true, false),
+        ]
+    );
+
+    let first = backend.entries(2).unwrap();
+    let paths: Vec<&str> = first.iter().map(|row| row.path.as_str()).collect();
+    assert_eq!(paths, vec!["a.txt", "b.txt"]);
+    assert!(backend.entries(4).unwrap().is_empty());
+    assert_eq!(backend.entries(3).unwrap().len(), 2);
+    assert!(backend.entries(5).unwrap().is_empty());
 
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -6,9 +6,10 @@
 //! ```sh
 //! SW_EXPLORER_TEST_DIST="/path/to/IRIX 5.3/dist" cargo test -p sw-core --test real_dist
 //! ```
+use std::collections::HashMap;
 use std::path::PathBuf;
 use sw_core::diagnostic::Severity;
-use sw_core::distribution::Distribution;
+use sw_core::distribution::{Distribution, EntryKey, ImageKey, SubsystemKey};
 use sw_core::image::PayloadResolution;
 use sw_core::mach::eval::HardwareProfile;
 use sw_core::query::Query;
@@ -43,13 +44,19 @@ fn all_payloads_read_exact() {
     let mut recovered = Vec::new();
     let mut failed = Vec::new();
 
-    for product in dist.products() {
+    for (product_index, product) in dist.products().iter().enumerate() {
         for entry in &product.entries {
             if entry.payload.is_none() {
                 continue;
             }
             total += 1;
-            match reader.read(entry) {
+            let located = dist
+                .entry(EntryKey {
+                    product_index,
+                    entry_id: entry.id,
+                })
+                .expect("entry resolves");
+            match reader.read(located.key) {
                 Ok(payload) => match payload.location.resolution {
                     PayloadResolution::Exact => exact += 1,
                     other => recovered.push((entry.path.to_string(), other)),
@@ -88,12 +95,18 @@ fn decoded_sizes_match_idb() {
     let mut reader = dist.image_reader();
     let mut checked = 0usize;
 
-    for product in dist.products() {
+    for (product_index, product) in dist.products().iter().enumerate() {
         for entry in &product.entries {
             let (Some(_), Some(expected_size)) = (&entry.payload, entry.size()) else {
                 continue;
             };
-            let payload = reader.read(entry).expect("read payload");
+            let located = dist
+                .entry(EntryKey {
+                    product_index,
+                    entry_id: entry.id,
+                })
+                .expect("entry resolves");
+            let payload = reader.read(located.key).expect("read payload");
             let decoded = payload.decode().expect("decode payload");
             assert_eq!(
                 decoded.len() as u64,
@@ -134,6 +147,121 @@ fn query_and_selection_run() {
         selection.selected.len(),
         selection.conflicts.len()
     );
+}
+
+/// Hierarchy identity on real media: every image and subsystem key
+/// round-trips to its object, name lookups see exactly the objects a
+/// manual scan finds (in hierarchy order), and exact scopes contain
+/// exactly the attached entries. Duplicate names are reported, never
+/// assumed absent.
+#[test]
+fn hierarchy_keys_scopes_and_name_lookups_are_consistent() {
+    let Some(path) = dist_path() else {
+        eprintln!("SW_EXPLORER_TEST_DIST not set; skipping");
+        return;
+    };
+    let dist = Distribution::open(&path).expect("open distribution");
+
+    // Manual name counts: the ground truth the name lookups are
+    // checked against.
+    let mut image_counts: HashMap<sw_core::names::ImageName, usize> = HashMap::new();
+    let mut subsystem_counts: HashMap<sw_core::names::SubsystemName, usize> = HashMap::new();
+    for product in dist.products() {
+        for image in &product.images {
+            *image_counts.entry(image.name.clone()).or_default() += 1;
+            for subsystem in &image.subsystems {
+                *subsystem_counts.entry(subsystem.name.clone()).or_default() += 1;
+            }
+        }
+    }
+
+    for (product_index, product) in dist.products().iter().enumerate() {
+        for (image_index, image) in product.images.iter().enumerate() {
+            let image_key = ImageKey {
+                product_index,
+                image_index,
+            };
+            let located = dist.image(image_key).expect("image key resolves");
+            assert!(std::ptr::eq(located.image, image));
+
+            let named = dist.images_named(&image.name);
+            assert_eq!(named.len(), image_counts[&image.name]);
+            let keys: Vec<ImageKey> = named.iter().map(|l| l.key).collect();
+            assert!(keys.is_sorted(), "image name lookup keeps hierarchy order");
+
+            // The exact image scope is precisely the union of its
+            // subsystems' attachments, in IDB (entry id) order.
+            let mut expected: Vec<usize> = image
+                .subsystems
+                .iter()
+                .flat_map(|subsystem| subsystem.entry_ids.iter().map(|id| id.0))
+                .collect();
+            expected.sort_unstable();
+            let scoped = dist
+                .entries_in_image(image_key)
+                .expect("image scope resolves");
+            let actual: Vec<usize> = scoped.iter().map(|l| l.key.entry_id.0).collect();
+            assert_eq!(actual, expected, "image {}", image.name);
+            assert!(scoped.iter().all(|l| l.key.product_index == product_index));
+
+            for (subsystem_index, subsystem) in image.subsystems.iter().enumerate() {
+                let key = SubsystemKey {
+                    product_index,
+                    image_index,
+                    subsystem_index,
+                };
+                let located = dist.subsystem(key).expect("subsystem key resolves");
+                assert!(std::ptr::eq(located.subsystem, subsystem));
+
+                let named = dist.subsystems_named(&subsystem.name);
+                assert_eq!(named.len(), subsystem_counts[&subsystem.name]);
+                let keys: Vec<SubsystemKey> = named.iter().map(|l| l.key).collect();
+                assert!(
+                    keys.is_sorted(),
+                    "subsystem name lookup keeps hierarchy order"
+                );
+
+                let scoped = dist
+                    .entries_in_subsystem(key)
+                    .expect("subsystem scope resolves");
+                let actual: Vec<usize> = scoped.iter().map(|l| l.key.entry_id.0).collect();
+                let expected: Vec<usize> = subsystem.entry_ids.iter().map(|id| id.0).collect();
+                assert_eq!(actual, expected, "subsystem {}", subsystem.name);
+            }
+        }
+    }
+
+    // Real-media ambiguity report: names are media facts; uniqueness
+    // is never assumed.
+    let duplicate_images: Vec<_> = image_counts
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .collect();
+    let duplicate_subsystems: Vec<_> = subsystem_counts
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .collect();
+    eprintln!("duplicate ImageName groups: {}", duplicate_images.len());
+    for (name, _) in duplicate_images.iter().take(5) {
+        let owners: Vec<String> = dist
+            .images_named(name)
+            .iter()
+            .map(|l| dist.products()[l.key.product_index].name.to_string())
+            .collect();
+        eprintln!("  {name}: containing products {owners:?}");
+    }
+    eprintln!(
+        "duplicate SubsystemName groups: {}",
+        duplicate_subsystems.len()
+    );
+    for (name, _) in duplicate_subsystems.iter().take(5) {
+        let owners: Vec<String> = dist
+            .subsystems_named(name)
+            .iter()
+            .map(|l| dist.products()[l.key.product_index].name.to_string())
+            .collect();
+        eprintln!("  {name}: containing products {owners:?}");
+    }
 }
 
 /// Closure invariant: every image archive must be covered from byte 13 to
