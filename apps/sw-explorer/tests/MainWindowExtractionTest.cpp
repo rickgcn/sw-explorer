@@ -154,7 +154,7 @@ QToolButton *hardwareButtonOf(MainWindow &window)
 
 void loadDistribution(MainWindow &window, const QString &path)
 {
-    window.openDistributionRequested(path);
+    window.openDistribution(path);
     QTRY_VERIFY(treeOf(window)->model()->rowCount() > 0);
     QTRY_VERIFY(treeOf(window)->isEnabled());
 }

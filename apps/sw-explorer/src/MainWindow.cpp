@@ -36,9 +36,8 @@ MainWindow::MainWindow()
     QMenu *fileMenu = menuBar()->addMenu(tr("&File"));
     fileMenu->addAction(m_openAction);
 
-    // Extract shares the action between menu and toolbar; it is only
-    // enabled with visible Files rows and no open/commit/extraction
-    // in flight (updateExtractAction()).
+    // Extract shares the action between menu and toolbar; its
+    // availability is computed in refreshUiState().
     m_extractAction = new QAction(tr("Extract..."), this);
     m_extractAction->setObjectName(QStringLiteral("extractAction"));
     connect(m_extractAction, &QAction::triggered, this, &MainWindow::openExtractionDialog);
@@ -73,8 +72,6 @@ MainWindow::MainWindow()
     m_searchEdit->setPlaceholderText(tr("Search paths..."));
     m_searchEdit->setClearButtonEnabled(true);
     m_searchEdit->setFixedWidth(280);
-    // No distribution yet: nothing to search.
-    m_searchEdit->setEnabled(false);
     toolbar->addWidget(m_searchEdit);
 
     // The standard Find shortcut focuses the search box.
@@ -129,10 +126,8 @@ MainWindow::MainWindow()
             this,
             &MainWindow::onTreeSelectionChanged);
     connect(m_treeView, &QTreeView::clicked, this, &MainWindow::onTreeClicked);
-    connect(m_model, &QAbstractItemModel::modelReset, this, &MainWindow::clearSelection);
+    connect(m_model, &QAbstractItemModel::modelReset, this, &MainWindow::clearBrowsePanes);
     connect(m_entries, &EntryBrowserWidget::entrySelected, this, &MainWindow::onEntrySelected);
-
-    statusBar()->showMessage(tr("No distribution loaded."));
 
     // Backend worker thread: the Rust backend is owned and used only
     // by the worker; results come back as queued signals.
@@ -141,12 +136,9 @@ MainWindow::MainWindow()
     m_worker->moveToThread(m_workerThread);
     connect(m_workerThread, &QThread::finished, m_worker, &QObject::deleteLater);
     connect(this,
-            &MainWindow::openDistributionRequested,
+            &MainWindow::backendOpenRequested,
             m_worker,
             &BackendWorker::openDistribution);
-    // The hardware lockdown rides along with every open request,
-    // including ones not coming from the file dialog.
-    connect(this, &MainWindow::openDistributionRequested, this, &MainWindow::onOpenStarted);
     connect(this,
             &MainWindow::candidateAccepted,
             m_worker,
@@ -243,7 +235,8 @@ MainWindow::MainWindow()
             &MainWindow::onExtractionFailed);
     m_workerThread->start();
 
-    updateExtractAction();
+    refreshUiState();
+    refreshPersistentStatus();
 }
 
 MainWindow::~MainWindow()
@@ -252,59 +245,103 @@ MainWindow::~MainWindow()
     m_workerThread->wait();
 }
 
+void MainWindow::refreshUiState()
+{
+    const bool idle = m_session.openPhase() == OpenPhase::Idle;
+    const bool extracting = m_session.extractionRunning();
+    const bool hasDistribution = m_session.hasDistribution();
+
+    // The whole open transaction — Opening and Committing alike —
+    // locks Open and the hardware profile, so no profile change or
+    // nested open can straddle the candidate/commit window.
+    m_openAction->setEnabled(idle && !extracting);
+    m_hardwareButton->setEnabled(idle && !extracting);
+
+    // The old committed hierarchy stays browsable while a candidate
+    // loads; only the commit window and extractions lock the tree.
+    m_treeView->setEnabled(m_session.openPhase() != OpenPhase::Committing && !extracting);
+    m_entries->setEnabled(!extracting);
+
+    // Searching needs a committed distribution and a quiet session:
+    // no open transaction, no extraction.
+    m_searchEdit->setEnabled(hasDistribution && idle && !extracting);
+
+    // With a hardware profile the selection must be Ready before the
+    // dialog opens; the planner re-evaluates it authoritatively anyway,
+    // so this only keeps the user from writing while the UI itself
+    // reports the selection as unresolved.
+    const bool selectionReady =
+        m_session.profile().isEmpty() || m_session.selectionPhase() == SelectionPhase::Ready;
+    m_extractAction->setEnabled(hasDistribution && m_entries->hasVisibleEntries() && idle
+                                && !extracting && selectionReady);
+}
+
+void MainWindow::refreshPersistentStatus()
+{
+    // The persistent line: the displayed distribution summary plus the
+    // hardware selection state, both read from the session. Transient
+    // messages (loading, detail/entries errors) overwrite it directly;
+    // the next successful render restores it here.
+    QString text;
+    const std::optional<DistributionSummary> summary = m_session.displayedDistributionSummary();
+    if (summary.has_value()) {
+        text = tr("Loaded %1 products").arg(summary->productCount);
+        if (summary->diagnosticCount > 0) {
+            text += tr(" · %1 diagnostics").arg(summary->diagnosticCount);
+        }
+    } else {
+        text = tr("No distribution loaded.");
+    }
+    switch (m_session.selectionPhase()) {
+    case SelectionPhase::Inactive:
+        break;
+    case SelectionPhase::Pending:
+        text += tr(" · Evaluating hardware profile...");
+        break;
+    case SelectionPhase::Ready:
+        text += tr(" · %1 selected records · %2 conflict groups")
+                    .arg(m_session.selectedRecordCount())
+                    .arg(m_session.conflictGroupCount());
+        break;
+    case SelectionPhase::Error:
+        text += tr(" · Hardware selection unavailable: %1").arg(m_session.selectionError());
+        break;
+    }
+    statusBar()->showMessage(text);
+}
+
 void MainWindow::chooseDistribution()
 {
     const QString path = QFileDialog::getExistingDirectory(this, tr("Open Distribution"));
-    if (path.isEmpty()) {
-        return;
+    if (!path.isEmpty()) {
+        openDistribution(path);
     }
-
-    setOpenInProgress(true);
-    statusBar()->showMessage(tr("Loading..."));
-    emit openDistributionRequested(path);
 }
 
-void MainWindow::onOpenStarted()
+void MainWindow::openDistribution(const QString &path)
 {
-    // No profile change may straddle the candidate/commit window;
-    // the button unlocks when the open resolves (commit, rejection
-    // or failure).
-    m_hardwareButton->setEnabled(false);
+    // Second-line state protection: the action is disabled across
+    // open/commit/extraction windows, and a programmatic call must
+    // not start a nested candidate transaction either.
+    if (m_session.openPhase() != OpenPhase::Idle || m_session.extractionRunning()) {
+        return;
+    }
+    m_session.beginOpen();
+    refreshUiState();
+    statusBar()->showMessage(tr("Loading..."));
+    emit backendOpenRequested(path);
 }
 
 void MainWindow::openHardwareProfileDialog()
 {
     HardwareProfileDialog dialog(this);
-    dialog.setCandidates(m_candidates);
-    dialog.setProfile(m_profile);
+    dialog.setCandidates(m_session.candidates());
+    dialog.setProfile(m_session.profile());
     connect(&dialog,
             &HardwareProfileDialog::profileApplied,
             this,
             &MainWindow::applyHardwareProfile);
     dialog.exec();
-}
-
-void MainWindow::updateExtractAction()
-{
-    // With a hardware profile the selection must be Ready before the
-    // dialog opens; the planner re-evaluates it authoritatively anyway,
-    // so this only keeps the user from writing while the UI itself
-    // reports the selection as unresolved.
-    const bool selectionReady = m_profile.isEmpty() || m_selectionState == SelectionState::Ready;
-    m_extractAction->setEnabled(m_hasDistribution && m_entries->hasVisibleEntries()
-                                && !m_openInProgress && !m_commitInProgress
-                                && !m_extractionInProgress && selectionReady);
-}
-
-void MainWindow::setExtractionInProgress(bool inProgress)
-{
-    m_extractionInProgress = inProgress;
-    m_openAction->setEnabled(!inProgress && !m_openInProgress);
-    m_treeView->setEnabled(!inProgress);
-    m_entries->setEnabled(!inProgress);
-    m_searchEdit->setEnabled(!inProgress && m_hasDistribution && !m_openInProgress);
-    m_hardwareButton->setEnabled(!inProgress);
-    updateExtractAction();
 }
 
 void MainWindow::openExtractionDialog()
@@ -322,7 +359,7 @@ void MainWindow::openExtractionDialog()
         selectedPath = m_entries->currentEntryPath();
     }
     dialog.setScope(m_entries->entryKeys(), selected, selectedPath);
-    dialog.setHardwareProfile(m_profile);
+    dialog.setHardwareProfile(m_session.profile());
     connect(&dialog,
             &ExtractionDialog::preflightRequested,
             this,
@@ -343,27 +380,31 @@ void MainWindow::openExtractionDialog()
 
 void MainWindow::onExtractionPreflightRequested(const ExtractionRequestSnapshot &request)
 {
-    ++m_activeExtractionRequestId;
-    emit planExtractionRequested(m_activeExtractionRequestId, request);
+    // A preflight does not enter the global extraction lock: the
+    // modal dialog's own Checking state covers the interaction.
+    const quint64 requestId = m_session.requests().issue(RequestFamily::Extraction);
+    emit planExtractionRequested(requestId, request);
 }
 
 void MainWindow::onExtractionRequested(const ExtractionRequestSnapshot &request)
 {
-    ++m_activeExtractionRequestId;
-    setExtractionInProgress(true);
-    emit extractEntriesRequested(m_activeExtractionRequestId, request);
+    const quint64 requestId = m_session.requests().issue(RequestFamily::Extraction);
+    m_session.beginExtraction();
+    refreshUiState();
+    emit extractEntriesRequested(requestId, request);
 }
 
 void MainWindow::onExtractionInvalidated()
 {
     // The request changed after (or during) a preflight, or the dialog
     // was closed mid-check: anything in flight for it is stale.
-    ++m_activeExtractionRequestId;
+    m_session.requests().invalidate(RequestFamily::Extraction);
 }
 
 void MainWindow::onExtractionPlanReady(quint64 requestId, const ExtractionPlanSnapshot &plan)
 {
-    if (requestId != m_activeExtractionRequestId || m_extractionDialog == nullptr) {
+    if (!m_session.requests().accepts(RequestFamily::Extraction, requestId)
+        || m_extractionDialog == nullptr) {
         // A preflight the user has already moved on from: dropped.
         return;
     }
@@ -372,7 +413,8 @@ void MainWindow::onExtractionPlanReady(quint64 requestId, const ExtractionPlanSn
 
 void MainWindow::onExtractionPlanFailed(quint64 requestId, const QString &message)
 {
-    if (requestId != m_activeExtractionRequestId || m_extractionDialog == nullptr) {
+    if (!m_session.requests().accepts(RequestFamily::Extraction, requestId)
+        || m_extractionDialog == nullptr) {
         return;
     }
     m_extractionDialog->showPlanFailure(message);
@@ -380,10 +422,11 @@ void MainWindow::onExtractionPlanFailed(quint64 requestId, const QString &messag
 
 void MainWindow::onExtractionFinished(quint64 requestId, const ExtractionReportSnapshot &report)
 {
-    if (requestId != m_activeExtractionRequestId) {
+    if (!m_session.requests().accepts(RequestFamily::Extraction, requestId)) {
         return;
     }
-    setExtractionInProgress(false);
+    m_session.endExtraction();
+    refreshUiState();
     if (m_extractionDialog != nullptr) {
         m_extractionDialog->showReport(report);
     }
@@ -391,10 +434,11 @@ void MainWindow::onExtractionFinished(quint64 requestId, const ExtractionReportS
 
 void MainWindow::onExtractionFailed(quint64 requestId, const QString &message)
 {
-    if (requestId != m_activeExtractionRequestId) {
+    if (!m_session.requests().accepts(RequestFamily::Extraction, requestId)) {
         return;
     }
-    setExtractionInProgress(false);
+    m_session.endExtraction();
+    refreshUiState();
     if (m_extractionDialog != nullptr) {
         m_extractionDialog->showExtractionFailure(message);
     }
@@ -402,52 +446,47 @@ void MainWindow::onExtractionFailed(quint64 requestId, const QString &message)
 
 void MainWindow::applyHardwareProfile(const HardwareProfileSnapshot &profile)
 {
-    m_profile = profile;
-    updateHardwareButton();
+    // Second-line state protection: no profile change may straddle
+    // the candidate/commit window or a running extraction; the button
+    // is disabled there already, this guards programmatic calls.
+    if (m_session.openPhase() != OpenPhase::Idle || m_session.extractionRunning()) {
+        return;
+    }
 
     // A new profile invalidates the selection in flight and the
     // overlay on screen; the Files rows, search results and the
-    // inspector are not reloaded for a profile change.
-    ++m_activeSelectionRequestId;
+    // inspector are not reloaded for a profile change. The candidate
+    // suggestions belong to the distribution, not the profile, and
+    // stay.
+    m_session.requests().invalidate(RequestFamily::Selection);
     m_entries->clearSelectionOverlay();
-    m_selectedRecordCount = 0;
-    m_conflictGroupCount = 0;
-    m_selectionError.clear();
+    m_session.applyProfile(profile);
+    updateHardwareButton();
+    refreshUiState();
+    refreshPersistentStatus();
 
-    if (m_profile.isEmpty()) {
-        m_selectionState = SelectionState::Inactive;
-        updateExtractAction();
-        restoreLoadedStatus();
-        return;
+    // A non-empty profile with a committed distribution is evaluated
+    // at once; without one it is simply stored and evaluated as soon
+    // as a distribution is committed.
+    if (m_session.selectionPhase() == SelectionPhase::Pending) {
+        const quint64 requestId = m_session.requests().issue(RequestFamily::Selection);
+        emit selectionRequested(requestId, m_session.profile());
     }
-    if (m_hasDistribution) {
-        m_selectionState = SelectionState::Pending;
-        updateExtractAction();
-        restoreLoadedStatus();
-        emit selectionRequested(m_activeSelectionRequestId, m_profile);
-        return;
-    }
-    // No distribution yet: the profile is stored and evaluated as
-    // soon as one is committed.
-    m_selectionState = SelectionState::Inactive;
-    updateExtractAction();
-    restoreLoadedStatus();
 }
 
 void MainWindow::onCandidateReady(quint64 productCount,
                                   quint64 diagnosticCount,
                                   const HierarchySnapshot &hierarchy)
 {
-    setOpenInProgress(false);
-
     QString error;
     if (!m_model->setHierarchy(hierarchy, &error)) {
         // The snapshot violates the model's invariants. Reject the
         // candidate: the worker drops it and keeps the previously
         // committed backend, which still matches the tree on screen.
+        m_session.rejectCandidate();
         emit candidateRejected();
-        m_hardwareButton->setEnabled(true);
-        restoreLoadedStatus();
+        refreshUiState();
+        refreshPersistentStatus();
         QMessageBox::critical(this,
                               tr("Failed to Open Distribution"),
                               tr("The backend returned an invalid hierarchy: %1").arg(error));
@@ -457,12 +496,12 @@ void MainWindow::onCandidateReady(quint64 productCount,
     // The tree now shows the candidate; commit it so the backend
     // serves the very object ids the tree carries.
     //
-    // The model reset above cleared the selection (and with it the
-    // inspector). Between accepting the candidate and the worker's
-    // candidateCommitted() the committed backend still holds the old
-    // distribution while the tree already carries the new object ids,
-    // so tree interaction is locked until the commit lands: no
-    // inspector request may be issued in that window.
+    // The model reset above cleared the browse panes. Between
+    // accepting the candidate and the worker's candidateCommitted()
+    // the committed backend still holds the old distribution while
+    // the tree already carries the new object ids, so tree
+    // interaction is locked until the commit lands: no inspector
+    // request may be issued in that window.
     //
     // Only now — with the candidate validated and accepted — is the
     // old distribution's search state cleared; a failed or rejected
@@ -470,74 +509,54 @@ void MainWindow::onCandidateReady(quint64 productCount,
     //
     // The hardware profile survives, but everything derived from the
     // old distribution dies with it: the selection overlay, the
-    // selection request in flight and the candidate suggestions. The
-    // hardware button stays locked until the commit lands.
+    // selection request in flight and the candidate suggestions.
     exitSearch();
-    ++m_activeSelectionRequestId;
-    ++m_activeHardwareCandidatesRequestId;
     m_entries->clearSelectionOverlay();
-    m_candidates.clear();
-    m_selectionError.clear();
-    m_selectedRecordCount = 0;
-    m_conflictGroupCount = 0;
-    m_selectionState =
-        m_profile.isEmpty() ? SelectionState::Inactive : SelectionState::Pending;
-    m_treeView->setEnabled(false);
-    m_searchEdit->setEnabled(false);
-    m_commitInProgress = true;
-    updateExtractAction();
+    m_session.requests().invalidate(RequestFamily::Selection);
+    m_session.requests().invalidate(RequestFamily::HardwareCandidates);
+    m_session.acceptCandidate({productCount, diagnosticCount});
+    refreshUiState();
+    refreshPersistentStatus();
     emit candidateAccepted();
-
-    QString text = tr("Loaded %1 products").arg(productCount);
-    if (diagnosticCount > 0) {
-        text += tr(" · %1 diagnostics").arg(diagnosticCount);
-    }
-
-    m_hasDistribution = true;
-    m_loadedStatusText = text;
-    statusBar()->showMessage(text);
 }
 
 void MainWindow::onDistributionOpenFailed(const QString &message)
 {
-    setOpenInProgress(false);
-    m_hardwareButton->setEnabled(true);
     // The backend kept the previously loaded distribution; the GUI
     // must keep showing it too — tree, entries, inspector, hardware
     // profile, selection overlay and suggestions included.
-    restoreLoadedStatus();
+    m_session.openFailed();
+    refreshUiState();
+    refreshPersistentStatus();
     QMessageBox::critical(this, tr("Failed to Open Distribution"), message);
 }
 
 void MainWindow::onCandidateCommitted()
 {
-    // The backend now serves the object ids the tree carries.
-    m_commitInProgress = false;
-    m_treeView->setEnabled(true);
-    m_searchEdit->setEnabled(true);
-    m_hardwareButton->setEnabled(true);
+    // The backend now serves the object ids the tree carries: the
+    // pending distribution becomes the committed one.
+    m_session.candidateCommitted();
 
     // Fresh hardware candidate suggestions for the newly committed
     // distribution.
-    ++m_activeHardwareCandidatesRequestId;
-    emit hardwareCandidatesRequested(m_activeHardwareCandidatesRequestId);
+    const quint64 candidatesId = m_session.requests().issue(RequestFamily::HardwareCandidates);
+    emit hardwareCandidatesRequested(candidatesId);
 
     // A stored profile is evaluated against the new distribution;
     // until the result arrives, no stale overlay is shown.
-    if (!m_profile.isEmpty()) {
-        m_selectionState = SelectionState::Pending;
-        ++m_activeSelectionRequestId;
-        emit selectionRequested(m_activeSelectionRequestId, m_profile);
+    if (!m_session.profile().isEmpty()) {
+        const quint64 selectionId = m_session.requests().issue(RequestFamily::Selection);
+        emit selectionRequested(selectionId, m_session.profile());
     }
-    updateExtractAction();
-    restoreLoadedStatus();
+    refreshUiState();
+    refreshPersistentStatus();
 }
 
 void MainWindow::onTreeSelectionChanged(const QModelIndex &current, const QModelIndex &previous)
 {
     Q_UNUSED(previous);
     if (!current.isValid()) {
-        clearSelection();
+        clearBrowsePanes();
         return;
     }
     // Picking a hierarchy scope always leaves search mode: tree scope
@@ -553,7 +572,7 @@ void MainWindow::onTreeClicked(const QModelIndex &index)
     // search mode and restore the scope. A click on any other row
     // arrives together with currentChanged, which handles it — the
     // guard keeps the two paths from issuing duplicate requests.
-    if (!m_searchActive || index != m_treeView->currentIndex()) {
+    if (!m_session.searchActive() || index != m_treeView->currentIndex()) {
         return;
     }
     exitSearch();
@@ -570,30 +589,30 @@ void MainWindow::activateHierarchySelection(const QModelIndex &index)
     // A hierarchy selection drives both panes at once: the inspector
     // shows the object detail, the entry browser lists the scope's
     // IDB records. Each family gets its own fresh request id.
-    ++m_activeInspectorRequestId;
+    const quint64 detailId = m_session.requests().issue(RequestFamily::Inspector);
     m_inspector->showLoading();
-    emit detailRequested(m_activeInspectorRequestId, objectId, kind);
+    emit detailRequested(detailId, objectId, kind);
 
-    ++m_activeEntriesRequestId;
+    const quint64 entriesId = m_session.requests().issue(RequestFamily::Entries);
     m_entries->showLoading(
         m_model->data(m_model->index(index.row(), DistributionTreeModel::NameColumn, index.parent()))
             .toString());
     // While the scope loads, the Files view is not an extraction
     // scope.
-    updateExtractAction();
-    emit entriesRequested(m_activeEntriesRequestId, objectId);
+    refreshUiState();
+    emit entriesRequested(entriesId, objectId);
 }
 
 void MainWindow::onSearchTextChanged(const QString &text)
 {
     if (text.isEmpty()) {
-        if (!m_searchActive) {
+        if (!m_session.searchActive()) {
             return;
         }
         // An empty field means browsing mode, never a "match
         // everything" search: drop the pending search and fall back
         // to the scope the tree still has selected.
-        m_searchActive = false;
+        m_session.leaveSearch();
         m_searchDebounce->stop();
         restoreHierarchyScope();
         return;
@@ -603,14 +622,14 @@ void MainWindow::onSearchTextChanged(const QString &text)
     // request families, so a late response of an older query can
     // never flash its results; the debounce turns the keystrokes into
     // one request once the user pauses.
-    m_searchActive = true;
-    ++m_activeEntriesRequestId;
-    ++m_activeInspectorRequestId;
+    m_session.enterSearch();
+    m_session.requests().invalidate(RequestFamily::Entries);
+    m_session.requests().invalidate(RequestFamily::Inspector);
     m_inspector->showEmpty();
     m_entries->showLoading(tr("Search: %1").arg(text));
     // While the search loads, the Files view is not an extraction
     // scope.
-    updateExtractAction();
+    refreshUiState();
     m_searchDebounce->start();
 }
 
@@ -628,16 +647,16 @@ void MainWindow::onSearchReturnPressed()
 
 void MainWindow::startSearch(const QString &query)
 {
-    if (query.isEmpty() || !m_searchActive) {
+    if (query.isEmpty() || !m_session.searchActive()) {
         return;
     }
-    ++m_activeEntriesRequestId;
-    emit searchEntriesRequested(m_activeEntriesRequestId, query);
+    const quint64 requestId = m_session.requests().issue(RequestFamily::Entries);
+    emit searchEntriesRequested(requestId, query);
 }
 
 void MainWindow::exitSearch()
 {
-    if (!m_searchActive && m_searchEdit->text().isEmpty()) {
+    if (!m_session.searchActive() && m_searchEdit->text().isEmpty()) {
         return;
     }
     // Programmatic clears must not re-enter the search state machine
@@ -645,7 +664,7 @@ void MainWindow::exitSearch()
     const QSignalBlocker blocker(m_searchEdit);
     m_searchEdit->clear();
     m_searchDebounce->stop();
-    m_searchActive = false;
+    m_session.leaveSearch();
 }
 
 void MainWindow::restoreHierarchyScope()
@@ -654,70 +673,60 @@ void MainWindow::restoreHierarchyScope()
     if (current.isValid()) {
         activateHierarchySelection(current);
     } else {
-        clearSelection();
+        clearBrowsePanes();
     }
 }
 
-void MainWindow::clearSelection()
+void MainWindow::clearBrowsePanes()
 {
     // Invalidate the pending requests: a late response must never
     // overwrite the cleared panes.
-    ++m_activeInspectorRequestId;
-    ++m_activeEntriesRequestId;
+    m_session.requests().invalidate(RequestFamily::Inspector);
+    m_session.requests().invalidate(RequestFamily::Entries);
     m_inspector->showEmpty();
     m_entries->showEmpty();
-    updateExtractAction();
+    refreshUiState();
 }
 
 void MainWindow::onEntrySelected(quint64 productId, quint64 entryId)
 {
     // An entry pick replaces only the inspector content; the entry
     // list the user is browsing stays untouched.
-    ++m_activeInspectorRequestId;
+    const quint64 requestId = m_session.requests().issue(RequestFamily::Inspector);
     m_inspector->showLoading();
-    emit entryDetailRequested(m_activeInspectorRequestId, productId, entryId);
-}
-
-void MainWindow::setOpenInProgress(bool inProgress)
-{
-    m_openInProgress = inProgress;
-    m_openAction->setEnabled(!inProgress);
-    // No search while an open is in flight; a failed open hands the
-    // previous distribution's search box back.
-    m_searchEdit->setEnabled(!inProgress && m_hasDistribution);
-    updateExtractAction();
+    emit entryDetailRequested(requestId, productId, entryId);
 }
 
 void MainWindow::onProductDetailReady(quint64 requestId, const ProductDetailSnapshot &detail)
 {
-    if (requestId != m_activeInspectorRequestId) {
+    if (!m_session.requests().accepts(RequestFamily::Inspector, requestId)) {
         return;
     }
     m_inspector->showProduct(detail);
-    restoreLoadedStatus();
+    refreshPersistentStatus();
 }
 
 void MainWindow::onImageDetailReady(quint64 requestId, const ImageDetailSnapshot &detail)
 {
-    if (requestId != m_activeInspectorRequestId) {
+    if (!m_session.requests().accepts(RequestFamily::Inspector, requestId)) {
         return;
     }
     m_inspector->showImage(detail);
-    restoreLoadedStatus();
+    refreshPersistentStatus();
 }
 
 void MainWindow::onSubsystemDetailReady(quint64 requestId, const SubsystemDetailSnapshot &detail)
 {
-    if (requestId != m_activeInspectorRequestId) {
+    if (!m_session.requests().accepts(RequestFamily::Inspector, requestId)) {
         return;
     }
     m_inspector->showSubsystem(detail);
-    restoreLoadedStatus();
+    refreshPersistentStatus();
 }
 
 void MainWindow::onDetailFailed(quint64 requestId, const QString &message)
 {
-    if (requestId != m_activeInspectorRequestId) {
+    if (!m_session.requests().accepts(RequestFamily::Inspector, requestId)) {
         // Stale failure: the user has moved on; stay silent.
         return;
     }
@@ -727,16 +736,16 @@ void MainWindow::onDetailFailed(quint64 requestId, const QString &message)
 
 void MainWindow::onEntryDetailReady(quint64 requestId, const EntryDetailSnapshot &detail)
 {
-    if (requestId != m_activeInspectorRequestId) {
+    if (!m_session.requests().accepts(RequestFamily::Inspector, requestId)) {
         return;
     }
     m_inspector->showEntry(detail);
-    restoreLoadedStatus();
+    refreshPersistentStatus();
 }
 
 void MainWindow::onEntriesReady(quint64 requestId, const EntryListSnapshot &entries)
 {
-    if (requestId != m_activeEntriesRequestId) {
+    if (!m_session.requests().accepts(RequestFamily::Entries, requestId)) {
         // A scope or query the user has already left: drop it
         // silently.
         return;
@@ -744,86 +753,58 @@ void MainWindow::onEntriesReady(quint64 requestId, const EntryListSnapshot &entr
     m_entries->showEntries(entries);
     // A successful render also clears any earlier entries or search
     // error from the status bar, back to the distribution state.
-    updateExtractAction();
-    restoreLoadedStatus();
+    refreshUiState();
+    refreshPersistentStatus();
 }
 
 void MainWindow::onEntriesFailed(quint64 requestId, const QString &message)
 {
-    if (requestId != m_activeEntriesRequestId) {
+    if (!m_session.requests().accepts(RequestFamily::Entries, requestId)) {
         return;
     }
     m_entries->showError(message);
-    updateExtractAction();
+    refreshUiState();
     statusBar()->showMessage(tr("Unable to load entries: %1").arg(message));
-}
-
-void MainWindow::restoreLoadedStatus()
-{
-    // A successful render clears any earlier detail or entries error
-    // from the status bar, back to the distribution state — including
-    // the current hardware selection state, which survives ordinary
-    // renders until the next profile change or distribution commit.
-    QString text =
-        m_hasDistribution ? m_loadedStatusText : tr("No distribution loaded.");
-    switch (m_selectionState) {
-    case SelectionState::Inactive:
-        break;
-    case SelectionState::Pending:
-        text += tr(" · Evaluating hardware profile...");
-        break;
-    case SelectionState::Ready:
-        text += tr(" · %1 selected records · %2 conflict groups")
-                    .arg(m_selectedRecordCount)
-                    .arg(m_conflictGroupCount);
-        break;
-    case SelectionState::Error:
-        text += tr(" · Hardware selection unavailable: %1").arg(m_selectionError);
-        break;
-    }
-    statusBar()->showMessage(text);
 }
 
 void MainWindow::onSelectionReady(quint64 requestId, const SelectionSnapshot &selection)
 {
-    if (requestId != m_activeSelectionRequestId) {
+    if (!m_session.requests().accepts(RequestFamily::Selection, requestId)) {
         // A profile the user has already replaced: drop it silently.
         return;
     }
-    m_selectionState = SelectionState::Ready;
-    m_selectedRecordCount = static_cast<quint64>(selection.selected.size());
-    m_conflictGroupCount = static_cast<quint64>(selection.conflicts.size());
+    m_session.selectionSucceeded(static_cast<quint64>(selection.selected.size()),
+                                 static_cast<quint64>(selection.conflicts.size()));
     m_entries->setSelectionOverlay(selection);
-    updateExtractAction();
-    restoreLoadedStatus();
+    refreshUiState();
+    refreshPersistentStatus();
 }
 
 void MainWindow::onSelectionFailed(quint64 requestId, const QString &message)
 {
-    if (requestId != m_activeSelectionRequestId) {
+    if (!m_session.requests().accepts(RequestFamily::Selection, requestId)) {
         return;
     }
     // The profile stays applied and the overlay stays cleared; the
     // error is reflected in the status bar until the state changes.
-    m_selectionState = SelectionState::Error;
-    m_selectionError = message;
-    updateExtractAction();
-    restoreLoadedStatus();
+    m_session.selectionFailed(message);
+    refreshUiState();
+    refreshPersistentStatus();
 }
 
 void MainWindow::onHardwareCandidatesReady(quint64 requestId,
                                            const HardwareCandidatesSnapshot &candidates)
 {
-    if (requestId != m_activeHardwareCandidatesRequestId) {
+    if (!m_session.requests().accepts(RequestFamily::HardwareCandidates, requestId)) {
         return;
     }
-    m_candidates = candidates;
+    m_session.setCandidates(candidates);
 }
 
 void MainWindow::onHardwareCandidatesFailed(quint64 requestId, const QString &message)
 {
     Q_UNUSED(message);
-    if (requestId != m_activeHardwareCandidatesRequestId) {
+    if (!m_session.requests().accepts(RequestFamily::HardwareCandidates, requestId)) {
         return;
     }
     // Suggestions are a convenience, never a gate: the profile
@@ -833,7 +814,8 @@ void MainWindow::onHardwareCandidatesFailed(quint64 requestId, const QString &me
 
 void MainWindow::updateHardwareButton()
 {
-    if (m_profile.isEmpty()) {
+    const HardwareProfileSnapshot &profile = m_session.profile();
+    if (profile.isEmpty()) {
         m_hardwareButton->setText(tr("Hardware: Off"));
         m_hardwareButton->setToolTip(
             tr("No hardware profile applied. Every IDB record is shown without a "
@@ -846,9 +828,9 @@ void MainWindow::updateHardwareButton()
     // attribute=value list verbatim, one pair per line.
     QStringList values;
     QStringList lines;
-    values.reserve(m_profile.size());
-    lines.reserve(m_profile.size());
-    for (const HardwareValueSnapshot &pair : m_profile) {
+    values.reserve(profile.size());
+    lines.reserve(profile.size());
+    for (const HardwareValueSnapshot &pair : profile) {
         values.append(pair.value.isEmpty() ? tr("(empty)") : pair.value);
         lines.append(QStringLiteral("%1=%2").arg(pair.attribute, pair.value));
     }

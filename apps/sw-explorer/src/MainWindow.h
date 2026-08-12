@@ -5,6 +5,7 @@
 #include "HardwareSnapshot.h"
 #include "HierarchySnapshot.h"
 #include "InspectorSnapshot.h"
+#include "SessionState.h"
 
 #include <QMainWindow>
 
@@ -28,11 +29,23 @@ class InspectorWidget;
 // entry browser in the middle and the inspector on the right, split
 // by a QSplitter. All backend work runs on the BackendWorker thread.
 //
-// Inspector, entry-list, hardware and extraction requests each carry
-// their own monotonically increasing requestId; only the response
-// matching the newest request of its family is accepted, everything
-// older is dropped silently. Selection changes, model resets and
-// newly opened distributions all invalidate the pending requests.
+// The ownership split:
+//
+//   BackendWorker owns backend execution state.
+//   SessionState owns GUI session facts and request generations.
+//   MainWindow owns widgets, user actions, backend signal routing,
+//   and rendering SessionState into the UI.
+//
+// SessionState is an explicit value state machine: the open
+// transaction phases (Idle/Opening/Committing), the committed and
+// pending distribution summaries, the browse mode, the hardware
+// profile/selection lifecycle, the extraction lock and the five
+// request generations. Only the response matching the newest request
+// of its family is accepted, everything older is dropped silently.
+//
+// Top-level interaction availability is computed in exactly one
+// place, refreshUiState(), from session facts plus widget facts; the
+// persistent status bar text likewise in refreshPersistentStatus().
 //
 // The toolbar search box switches the entry browser between two
 // exclusive content sources: a non-empty query is a global path
@@ -63,7 +76,9 @@ public:
     ~MainWindow() override;
 
 signals:
-    void openDistributionRequested(const QString &path);
+    // Routed 1:1 onto the BackendWorker; emitted only by the
+    // openDistribution() command, never connected back into the GUI.
+    void backendOpenRequested(const QString &path);
     void candidateAccepted();
     void candidateRejected();
     void detailRequested(quint64 requestId, quint64 objectId, HierarchyKind kind);
@@ -76,21 +91,23 @@ signals:
     void extractEntriesRequested(quint64 requestId, const ExtractionRequestSnapshot &request);
 
 public slots:
+    // The only programmatic open command. Owns the whole transaction
+    // precondition — no nested candidate transactions while an open
+    // or an extraction is in flight — starts the Opening phase and
+    // emits the backend request. The file dialog only picks the path.
+    void openDistribution(const QString &path);
     // Applies a hardware profile: stores it, refreshes the toolbar
     // summary and issues a selection request against the committed
     // distribution. An empty profile disables the hardware overlay.
     // With no distribution loaded the profile is simply stored and
-    // evaluated once one is committed.
+    // evaluated once one is committed. Ignored while an open or an
+    // extraction is in flight.
     void applyHardwareProfile(const HardwareProfileSnapshot &profile);
 
 private slots:
     void chooseDistribution();
     void openHardwareProfileDialog();
     void openExtractionDialog();
-    // Lockdown at the start of every open, whoever triggered it: the
-    // hardware profile must not change across the candidate/commit
-    // window.
-    void onOpenStarted();
     void onCandidateReady(quint64 productCount,
                           quint64 diagnosticCount,
                           const HierarchySnapshot &hierarchy);
@@ -125,30 +142,18 @@ private slots:
     void onExtractionFailed(quint64 requestId, const QString &message);
 
 private:
-    // The lifecycle of the hardware selection overlay.
-    enum class SelectionState {
-        // No profile applied.
-        Inactive,
-        // A selection request is in flight; no overlay is shown.
-        Pending,
-        // A selection result is overlaid on the entry table.
-        Ready,
-        // The last selection request failed; the profile is kept.
-        Error,
-    };
-
-    void setOpenInProgress(bool inProgress);
-    // Locks (or releases) every interaction while an extraction runs:
-    // Open, the tree, the Files pane, search, hardware and the Extract
-    // action itself. The modal dialog blocks most input anyway; this
-    // keeps the state explicit.
-    void setExtractionInProgress(bool inProgress);
-    // Recomputes the Extract action's enabled state: a distribution,
-    // at least one visible Files row, no open/commit/extraction in
-    // flight, and — with a hardware profile — a Ready selection.
-    void updateExtractAction();
-    void clearSelection();
-    void restoreLoadedStatus();
+    // The single authority for top-level interaction availability:
+    // Open, Extract, the tree, the Files pane, the search box and the
+    // hardware button, computed from session facts plus the widget
+    // fact EntryBrowserWidget::hasVisibleEntries().
+    void refreshUiState();
+    // The single authority for the persistent status bar text: the
+    // displayed distribution summary plus the hardware selection
+    // suffix, read from session facts only.
+    void refreshPersistentStatus();
+    // Empties the inspector and the Files pane and invalidates their
+    // request families; never touches the hardware selection state.
+    void clearBrowsePanes();
     // Issues the detail and entries requests for one hierarchy index.
     void activateHierarchySelection(const QModelIndex &index);
     // Leaves search mode without re-entering the textChanged handler:
@@ -174,49 +179,14 @@ private:
 
     QLineEdit *m_searchEdit = nullptr;
     QTimer *m_searchDebounce = nullptr;
-    // Whether the entry browser shows search results rather than a
-    // hierarchy scope; never inferred from the pane contents.
-    bool m_searchActive = false;
 
-    // The newest inspector request (object detail or entry detail);
-    // responses with any other id are stale and dropped.
-    quint64 m_activeInspectorRequestId = 0;
-    // The newest entry-list request (scope listing or search
-    // results); a separate family, so a slow entry list never
-    // invalidates a quick entry detail.
-    quint64 m_activeEntriesRequestId = 0;
-    // The newest hardware selection request; a separate family, so
-    // re-profiling never invalidates the entry list or the
-    // inspector.
-    quint64 m_activeSelectionRequestId = 0;
-    // The newest hardware candidate suggestion request.
-    quint64 m_activeHardwareCandidatesRequestId = 0;
-    // The newest extraction request (preflight or execution); a
-    // separate family, so extraction never collides with browsing.
-    quint64 m_activeExtractionRequestId = 0;
+    // Every GUI session fact and the request generations. Kept in
+    // sync with the committed backend: a failed open or a rejected
+    // snapshot leaves both sides showing the old distribution.
+    SessionState m_session;
 
-    // The applied hardware profile: facts about the simulated target
-    // machine. Kept for the whole run, across distributions.
-    HardwareProfileSnapshot m_profile;
-    // The value suggestions of the committed distribution.
-    HardwareCandidatesSnapshot m_candidates;
-    SelectionState m_selectionState = SelectionState::Inactive;
-    QString m_selectionError;
-    quint64 m_selectedRecordCount = 0;
-    quint64 m_conflictGroupCount = 0;
-
-    // Last successfully loaded state, kept in sync with the committed
-    // backend: a failed open or a rejected snapshot must leave both
-    // sides showing the old distribution.
-    bool m_hasDistribution = false;
-    QString m_loadedStatusText;
-
-    bool m_openInProgress = false;
-    // Between accepting a candidate and the commit landing, tree
-    // interaction is locked.
-    bool m_commitInProgress = false;
-    bool m_extractionInProgress = false;
-    // The live extraction dialog, while one is exec'd.
+    // The live extraction dialog, while one is exec'd; widget
+    // lifetime, not session state.
     ExtractionDialog *m_extractionDialog = nullptr;
 
     QThread *m_workerThread = nullptr;

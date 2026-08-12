@@ -143,7 +143,7 @@ HardwareProfileSnapshot ip22Profile()
 // the tree carries the new hierarchy and interaction is unlocked.
 void loadDistribution(MainWindow &window, const QString &path)
 {
-    window.openDistributionRequested(path);
+    window.openDistribution(path);
     QTRY_VERIFY(treeOf(window)->model()->rowCount() > 0);
     QTRY_VERIFY(treeOf(window)->isEnabled());
 }
@@ -515,7 +515,7 @@ void MainWindowHardwareTest::failedOpenKeepsTheWholeHardwareState()
     });
     closer.start();
 
-    window.openDistributionRequested(QStringLiteral("/definitely/missing/distribution"));
+    window.openDistribution(QStringLiteral("/definitely/missing/distribution"));
     QTRY_VERIFY(dialogSeen);
     closer.stop();
 
@@ -548,7 +548,7 @@ void MainWindowHardwareTest::successfulReopenKeepsProfileAndReselects()
     // suggestions; the stored profile is re-evaluated after commit.
     // (Wait for B's own tree shape: "any rows" and "enabled" are
     // both already true while A is still up.)
-    window.openDistributionRequested(dirB.path());
+    window.openDistribution(dirB.path());
     QTRY_COMPARE(treeOf(window)->model()->rowCount(), 1);
     QTRY_VERIFY(treeOf(window)->isEnabled());
     waitForOverlay(window);
@@ -574,7 +574,7 @@ void MainWindowHardwareTest::hardwareButtonLocksDuringOpen()
 
     // The lock lands with the request itself, ahead of any worker
     // roundtrip.
-    window.openDistributionRequested(dir.path());
+    window.openDistribution(dir.path());
     QVERIFY(!button->isEnabled());
 
     // Commit unlocks it again.

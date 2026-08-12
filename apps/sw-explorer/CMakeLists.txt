@@ -241,6 +241,7 @@ qt_add_executable(sw-explorer
     src/HardwareProfileDialog.cpp
     src/ExtractionDialog.h
     src/ExtractionDialog.cpp
+    src/SessionState.h
     src/MainWindow.h
     src/MainWindow.cpp
     src/BackendWorker.h
@@ -461,6 +462,7 @@ add_executable(MainWindowSearchTest
     src/HardwareProfileDialog.cpp
     src/ExtractionDialog.h
     src/ExtractionDialog.cpp
+    src/SessionState.h
     src/MainWindow.h
     src/MainWindow.cpp
     src/BackendWorker.h
@@ -516,6 +518,7 @@ add_executable(MainWindowHardwareTest
     src/HardwareProfileDialog.cpp
     src/ExtractionDialog.h
     src/ExtractionDialog.cpp
+    src/SessionState.h
     src/MainWindow.h
     src/MainWindow.cpp
     src/BackendWorker.h
@@ -595,6 +598,7 @@ add_executable(MainWindowExtractionTest
     src/HardwareProfileDialog.cpp
     src/ExtractionDialog.h
     src/ExtractionDialog.cpp
+    src/SessionState.h
     src/MainWindow.h
     src/MainWindow.cpp
     src/BackendWorker.h

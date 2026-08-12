@@ -115,7 +115,7 @@ QStackedWidget *stackOf(QWidget *widget)
 // the tree carries the new hierarchy and interaction is unlocked.
 void loadDistribution(MainWindow &window, const QString &path)
 {
-    window.openDistributionRequested(path);
+    window.openDistribution(path);
     QTRY_VERIFY(treeOf(window)->model()->rowCount() > 0);
     QTRY_VERIFY(treeOf(window)->isEnabled());
     QTRY_VERIFY(searchEditOf(window)->isEnabled());
@@ -512,7 +512,7 @@ void MainWindowSearchTest::failedOpenKeepsSearchState()
     });
     closer.start();
 
-    window.openDistributionRequested(QStringLiteral("/definitely/missing/distribution"));
+    window.openDistribution(QStringLiteral("/definitely/missing/distribution"));
     QTRY_VERIFY(dialogSeen);
     closer.stop();
 
@@ -552,7 +552,7 @@ void MainWindowSearchTest::successfulReopenClearsSearchState()
     // The accepted candidate replaces the browsing state wholesale:
     // the search field clears without re-triggering a scope restore,
     // both panes empty, and the new hierarchy arrives.
-    window.openDistributionRequested(dirB.path());
+    window.openDistribution(dirB.path());
     QTRY_COMPARE(treeOf(window)->model()->rowCount(), 1);
     QTRY_VERIFY(treeOf(window)->isEnabled());
     QTRY_VERIFY(search->isEnabled());
